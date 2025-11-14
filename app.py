@@ -1,64 +1,59 @@
 import os
 import json
+import logging
 from flask import Flask, request, jsonify
 
-# -------- 环境变量 --------
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")  # 暂时可以留空
-ENABLE_LIVE_TRADING = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
+# ---------- 环境变量 ----------
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+ENABLE_LIVE_TRADING = os.environ.get("ENABLE_LIVE_TRADING", "false").lower() == "true"
 
+# ---------- 日志 ----------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+# ---------- Flask app ----------
 app = Flask(__name__)
 
-# -------- 健康检查 --------
-@app.get("/")
-def health():
-    mode = "LIVE" if ENABLE_LIVE_TRADING else "LOG ONLY"
-    return f"Apex Python bot is running ({mode})"
+
+@app.route("/", methods=["GET"])
+def health_check():
+    """健康检查"""
+    return "apex-bot-py is running", 200
 
 
-# -------- TradingView Webhook --------
-@app.post("/tv-webhook")
+@app.route("/tv-webhook", methods=["POST"])
 def tv_webhook():
-    print("📩 Incoming request: POST /tv-webhook")
+    """接收 TradingView 警报"""
+    logging.info("📩 Incoming request: /tv-webhook")
+    logging.info("Headers: %s", dict(request.headers))
 
     try:
         payload = request.get_json(force=True, silent=False) or {}
     except Exception as e:
-        print("❌ Error parsing JSON:", e)
+        logging.error("❌ Failed to parse JSON body: %s", e)
         return jsonify({"ok": False, "error": "invalid json"}), 400
 
-    print("📦 Body from TradingView:", json.dumps(payload, ensure_ascii=False))
+    logging.info("Body from TradingView: %s", json.dumps(payload, ensure_ascii=False))
 
-    # 1) 可选：校验 secret（你将来可以在 TV 的 JSON 里加 "secret"）
+    # --- 校验 secret（如果你在 TV 里有写 "secret"） ---
     if WEBHOOK_SECRET:
-        if payload.get("secret") != WEBHOOK_SECRET:
-            print("❌ Invalid webhook secret, ignoring alert")
+        tv_secret = str(payload.get("secret", ""))
+        if tv_secret != WEBHOOK_SECRET:
+            logging.warning("⚠️ Invalid webhook secret, ignoring alert.")
             return jsonify({"ok": False, "error": "invalid secret"}), 401
 
-    # 2) 解析基础字段
-    bot_id = payload.get("bot_id", "BOT_1")
-    symbol = payload.get("symbol", "ZECUSDT")
-    side = (payload.get("side") or "").lower()
-    position_size = float(payload.get("position_size", 0) or 0)
-    order_type = payload.get("order_type", "market")
-    leverage = int(payload.get("leverage", 1) or 1)
-    signal_type = (payload.get("signal_type") or "").lower()
+    # --- 这里只是 LOG 模式，不真下单 ---
+    if not ENABLE_LIVE_TRADING:
+        logging.info("🟡 ENABLE_LIVE_TRADING = False, LOG ONLY 模式，不会发送真实订单。")
+        return jsonify({"ok": True, "mode": "log_only"}), 200
 
-    print(f"🧠 Parsed alert: bot_id={bot_id}, symbol={symbol}, side={side}, "
-          f"size={position_size}, type={order_type}, lev={leverage}, signal={signal_type}")
+    # === 将来你要走官方 Python SDK 真正下单，就在这里写 ===
+    logging.info("🟢 ENABLE_LIVE_TRADING = True，本来可以在这里调用 ApeX 官方 SDK 下单。")
+    # TODO: 调用 ApeX SDK 下单代码（以后再补）
 
-    # 不合法就忽略
-    if not side or position_size <= 0:
-        print("⚠️ side 为空 或 position_size <= 0，忽略")
-        return jsonify({"ok": True, "msg": "ignored"}), 200
-
-    # 现在先只 LOG，不下单
-    print("🟡 ENABLE_LIVE_TRADING =", ENABLE_LIVE_TRADING, "（目前只打印，不真实下单）")
-
-    return jsonify({"ok": True, "mode": "log_only"}), 200
+    return jsonify({"ok": True, "mode": "live_trading"}), 200
 
 
-# -------- 本地调试入口 --------
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8080"))
-    print(f"🚀 Apex Python bot listening on port {port}")
+    # DO 会提供 PORT 环境变量，这里优先用 PORT，默认 8080
+    port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
