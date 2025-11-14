@@ -1,59 +1,87 @@
-import os
-import json
-import logging
-from flask import Flask, request, jsonify
+import time
+import decimal
 
-# ---------- 环境变量 ----------
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
-ENABLE_LIVE_TRADING = os.environ.get("ENABLE_LIVE_TRADING", "false").lower() == "true"
+from apexomni.constants import NETWORKID_TEST, APEX_OMNI_HTTP_TEST
+from apexomni.http_private_sign import HttpPrivateSign
 
-# ---------- 日志 ----------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+print("Hello, Apex omni")
 
-# ---------- Flask app ----------
-app = Flask(__name__)
+# -----------------------------
+# 你的注册 V3 得到的 Key
+# -----------------------------
+key = "your-apiKey-key"
+secret = "your-apiKey-secret"
+passphrase = "your-apiKey-passphrase"
 
+seeds = "your-zk-seeds"
+l2Key = "your-l2Key-seeds"
 
-@app.route("/", methods=["GET"])
-def health_check():
-    """健康检查"""
-    return "apex-bot-py is running", 200
+# -----------------------------
+# 初始化 Client（测试网）
+# -----------------------------
+client = HttpPrivateSign(
+    APEX_OMNI_HTTP_TEST,
+    network_id=NETWORKID_TEST,
+    zk_seeds=seeds,
+    zk_l2Key=l2Key,
+    api_key_credentials={
+        "key": key,
+        "secret": secret,
+        "passphrase": passphrase
+    }
+)
 
+# 读取账户信息
+configs = client.configs_v3()
+accountData = client.get_account_v3()
+print("Account:", accountData)
 
-@app.route("/tv-webhook", methods=["POST"])
-def tv_webhook():
-    """接收 TradingView 警报"""
-    logging.info("📩 Incoming request: /tv-webhook")
-    logging.info("Headers: %s", dict(request.headers))
+# -----------------------------
+# Sample 1: MARKET 市价单
+# -----------------------------
+currentTime = time.time()
+createOrderRes = client.create_order_v3(
+    symbol="BTC-USDT",
+    side="SELL",
+    type="MARKET",
+    size="0.001",
+    timestampSeconds=currentTime,
+    price="60000"   # MARKET 订单也需要随便传个 price
+)
+print("Market Order:", createOrderRes)
 
-    try:
-        payload = request.get_json(force=True, silent=False) or {}
-    except Exception as e:
-        logging.error("❌ Failed to parse JSON body: %s", e)
-        return jsonify({"ok": False, "error": "invalid json"}), 400
+# -----------------------------
+# Sample 2: LIMIT + TP/SL 单
+# -----------------------------
+slippage = decimal.Decimal("-0.1")
+slPrice = decimal.Decimal("58000") * (decimal.Decimal("1") + slippage)
+tpPrice = decimal.Decimal("79000") * (decimal.Decimal("1") - slippage)
 
-    logging.info("Body from TradingView: %s", json.dumps(payload, ensure_ascii=False))
+createOrderRes = client.create_order_v3(
+    symbol="BTC-USDT",
+    side="BUY",
+    type="LIMIT",
+    size="0.01",
+    price="65000",
 
-    # --- 校验 secret（如果你在 TV 里有写 "secret"） ---
-    if WEBHOOK_SECRET:
-        tv_secret = str(payload.get("secret", ""))
-        if tv_secret != WEBHOOK_SECRET:
-            logging.warning("⚠️ Invalid webhook secret, ignoring alert.")
-            return jsonify({"ok": False, "error": "invalid secret"}), 401
+    # 开启 TP / SL
+    isOpenTpslOrder=True,
 
-    # --- 这里只是 LOG 模式，不真下单 ---
-    if not ENABLE_LIVE_TRADING:
-        logging.info("🟡 ENABLE_LIVE_TRADING = False, LOG ONLY 模式，不会发送真实订单。")
-        return jsonify({"ok": True, "mode": "log_only"}), 200
+    # SL 参数
+    isSetOpenSl=True,
+    slPrice=slPrice,
+    slSide="SELL",
+    slSize="0.01",
+    slTriggerPrice="58000",
 
-    # === 将来你要走官方 Python SDK 真正下单，就在这里写 ===
-    logging.info("🟢 ENABLE_LIVE_TRADING = True，本来可以在这里调用 ApeX 官方 SDK 下单。")
-    # TODO: 调用 ApeX SDK 下单代码（以后再补）
+    # TP 参数
+    isSetOpenTp=True,
+    tpPrice=tpPrice,
+    tpSide="SELL",
+    tpSize="0.01",
+    tpTriggerPrice="79000",
+)
 
-    return jsonify({"ok": True, "mode": "live_trading"}), 200
+print("TP/SL Order:", createOrderRes)
 
-
-if __name__ == "__main__":
-    # DO 会提供 PORT 环境变量，这里优先用 PORT，默认 8080
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+print("end, apexomni")
