@@ -93,3 +93,11 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
     # host 一定要 0.0.0.0 才能被 DO 访问到
     app.run(host="0.0.0.0", port=port)
+from flask import Flask, request, jsonify
+app = Flask(__name__)
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    data = request.get_json()
+    print("📩 Received Webhook:", data)
+    return jsonify({"status": "success", "message": "Webhook received"}), 200
