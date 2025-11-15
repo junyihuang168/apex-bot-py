@@ -1,5 +1,5 @@
 apexomni
 web3
-ecdsa==0.18.1
+ecdsa          # ✅ 推荐：不指定版本
 flask==3.0.0
 requests==2.32.3
