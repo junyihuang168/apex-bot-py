@@ -2,99 +2,94 @@ import os
 import time
 import decimal
 
+from flask import Flask, jsonify
 from apexomni.constants import NETWORKID_TEST, APEX_OMNI_HTTP_TEST
 from apexomni.http_private_sign import HttpPrivateSign
 
-print("Hello, Apex omni")
+app = Flask(__name__)
 
 # --------------------------------------------------
-# 从环境变量读取在 DO 里配置好的 Key
+# 读取 DigitalOcean 环境变量 & 创建 Apex Client
 # --------------------------------------------------
-key        = os.getenv("APEX_API_KEY")
-secret     = os.getenv("APEX_API_SECRET")
-passphrase = os.getenv("APEX_API_PASSPHRASE")
-l2key      = os.getenv("APEX_L2KEY_SEEDS")
+def make_client():
+    key        = os.getenv("APEX_API_KEY")
+    secret     = os.getenv("APEX_API_SECRET")
+    passphrase = os.getenv("APEX_API_PASSPHRASE")
+    l2key      = os.getenv("APEX_L2KEY_SEEDS")
 
-# 简单检查一下有没有读到（True 就代表有值）
-print("Loaded env variables:")
-print("API_KEY:",    bool(key))
-print("API_SECRET:", bool(secret))
-print("PASS:",       bool(passphrase))
-print("L2KEY:",      bool(l2key))
+    print("Loaded env variables:")
+    print("API_KEY:",    bool(key))
+    print("API_SECRET:", bool(secret))
+    print("PASS:",       bool(passphrase))
+    print("L2KEY:",      bool(l2key))
 
-# --------------------------------------------------
-# 初始化 Client
-# --------------------------------------------------
-client = HttpPrivateSign(
-    APEX_OMNI_HTTP_TEST,
-    network_id=NETWORKID_TEST,
+    if not all([key, secret, passphrase, l2key]):
+        raise RuntimeError("Missing one or more APEX_* environment variables")
 
-    # 让 SDK 自动处理 zk_seeds，不自己写
-    zk_seeds=None,
-    zk_l2Key=l2key,
-
-    api_key_credentials={
-        "key": key,
-        "secret": secret,
-        "passphrase": passphrase,
-    },
-)
-
-# --------------------------------------------------
-# 读取账户 / 配置信息
-# --------------------------------------------------
-configs = client.configs_v3()
-accountData = client.get_account_v3()
-print("Configs:", configs)
-print("Account:", accountData)
+    client = HttpPrivateSign(
+        APEX_OMNI_HTTP_TEST,
+        network_id=NETWORKID_TEST,
+        # 让 SDK 处理 zk_seeds
+        zk_seeds=None,
+        zk_l2Key=l2key,
+        api_key_credentials={
+            "key": key,
+            "secret": secret,
+            "passphrase": passphrase,
+        },
+    )
+    return client
 
 # --------------------------------------------------
-# Sample 1: MARKET 市价单
+# 路由 1：健康检查（DO 默认会请求 /）
 # --------------------------------------------------
-currentTime = time.time()
-createOrderRes = client.create_order_v3(
-    symbol="BTC-USDT",
-    side="SELL",
-    type="MARKET",
-    size="0.001",
-    timestampSeconds=currentTime,
-    price="60000",  # MARKET 单这里的 price 其实不会真正用到
-)
-print("Market Order:", createOrderRes)
+@app.route("/")
+def health():
+    return "ok", 200
 
 # --------------------------------------------------
-# Sample 2: LIMIT + TP/SL 单
+# 路由 2：测试连 Apex + 可选下单
 # --------------------------------------------------
-slippage = decimal.Decimal("0.1")  # 10% 滑点示例
+@app.route("/test")
+def test():
+    client = make_client()
 
-slPrice = decimal.Decimal("58000") * (decimal.Decimal("1") + slippage)
-tpPrice = decimal.Decimal("79000") * (decimal.Decimal("1") - slippage)
+    # 获取配置信息和账户信息
+    configs = client.configs_v3()
+    account = client.get_account_v3()
 
-createOrderRes = client.create_order_v3(
-    symbol="BTC-USDT",
-    side="BUY",
-    type="LIMIT",
-    size="0.01",
-    price="65000",
+    # 下一个很小的 MARKET 订单作为测试（你也可以先注释掉）
+    current_time = time.time()
+    try:
+        order = client.create_order_v3(
+            symbol="BTC-USDT",
+            side="SELL",
+            type="MARKET",
+            size="0.001",
+            timestampSeconds=current_time,
+            price="60000",
+        )
+    except Exception as e:
+        # 如果下单失败，不要让服务挂掉，返回错误信息即可
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+            "configs": configs,
+            "account": account,
+        }), 500
 
-    # 开启 TP / SL
-    isOpenTpslOrder=True,
+    return jsonify({
+        "status": "ok",
+        "configs": configs,
+        "account": account,
+        "order": order,
+    }), 200
 
-    # SL 参数
-    isSetOpenSl=True,
-    slPrice=str(slPrice),
-    slSide="SELL",
-    slSize="0.01",
-    slTriggerPrice="58000",
-
-    # TP 参数
-    isSetOpenTp=True,
-    tpPrice=str(tpPrice),
-    tpSide="SELL",
-    tpSize="0.01",
-    tpTriggerPrice="79000",
-)
-
-print("TP/SL Order:", createOrderRes)
-
-print("end, apexomni")
+# --------------------------------------------------
+# 主入口：启动 Flask
+# --------------------------------------------------
+if __name__ == "__main__":
+    # DO 会把端口传到环境变量 PORT（也可以默认 8080）
+    port = int(os.getenv("PORT", "8080"))
+    # host 一定要 0.0.0.0 才能被 DO 访问到
+    app.run(host="0.0.0.0", port=port)
