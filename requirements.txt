@@ -1,6 +1,6 @@
-apexomni 
-web3 
-ecdsa 
-mpmath 
-flask==3.0.0 
+apexomni
+web3
+ecdsa==0.18.0
+mpmath
+flask==3.0.0
 requests==2.32.3
