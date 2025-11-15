@@ -1,4 +1,5 @@
 apexomni
-web3          # 新增这一行
+web3
+ecdsa==0.18.0
 flask==3.0.0
 requests==2.32.3
