@@ -1,3 +1,4 @@
 apexomni
+web3          # 新增这一行
 flask==3.0.0
 requests==2.32.3
