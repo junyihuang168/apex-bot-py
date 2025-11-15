@@ -3,5 +3,6 @@ web3
 ecdsa
 sympy==1.12
 mpmath==1.3.0
+numpy==1.26.4
 flask==3.0.0
 requests==2.32.3
