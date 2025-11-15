@@ -1,7 +1,3 @@
 apexomni
-web3
-ecdsa
-mpmath
-sympy          # 新增
 flask==3.0.0
 requests==2.32.3
