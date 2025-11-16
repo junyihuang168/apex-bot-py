@@ -17,12 +17,15 @@ def make_client():
     secret     = os.getenv("APEX_API_SECRET")
     passphrase = os.getenv("APEX_API_PASSPHRASE")
     l2key      = os.getenv("APEX_L2KEY_SEEDS")
+    # 如果你有单独存 zk seeds，就用 APEX_ZK_SEEDS；没有就先留空也行
+    zk_seeds   = os.getenv("APEX_ZK_SEEDS")
 
     print("Loaded env variables:")
     print("API_KEY:",    bool(key))
     print("API_SECRET:", bool(secret))
     print("PASS:",       bool(passphrase))
     print("L2KEY:",      bool(l2key))
+    print("ZK_SEEDS:",   bool(zk_seeds))
 
     if not all([key, secret, passphrase, l2key]):
         raise RuntimeError("Missing one or more APEX_* environment variables")
@@ -30,7 +33,7 @@ def make_client():
     client = HttpPrivateSign(
         APEX_OMNI_HTTP_TEST,          # 目前用 TEST 网络
         network_id=NETWORKID_TEST,
-        zk_seeds=None,
+        zk_seeds=zk_seeds,
         zk_l2Key=l2key,
         api_key_credentials={
             "key": key,
@@ -38,32 +41,33 @@ def make_client():
             "passphrase": passphrase,
         },
     )
+
+    # ★★★ 关键：按照官方示例，先加载 configs 和 account，让内部的 accountv3 等字段准备好
+    try:
+        client.configs_v3()
+        print("configs_v3 ok")
+    except Exception as e:
+        print("⚠️ configs_v3 failed:", e)
+
+    try:
+        acc = client.get_account_v3()
+        print("get_account_v3 ok")
+        # 想的话可以再打印一点信息
+        # print(acc)
+    except Exception as e:
+        print("⚠️ get_account_v3 failed:", e)
+
     return client
 
-
 # --------------------------------------------------
-# 工具函数：检查是否开启“真实下单”
-#   DO 里把 ENABLE_LIVE_TRADING 设置为 true / false（字符串）
-# --------------------------------------------------
-def is_live_trading_enabled() -> bool:
-    raw = os.getenv("ENABLE_LIVE_TRADING", "false")
-    print("ENABLE_LIVE_TRADING raw =", repr(raw))
-    normalized = str(raw).strip().lower()
-    print("ENABLE_LIVE_TRADING normalized =", normalized)
-    return normalized == "true"
-
-
-# --------------------------------------------------
-# 路由 1：健康检查（DO 默认会请求 /）
+# 路由 1：健康检查
 # --------------------------------------------------
 @app.route("/")
 def health():
     return "ok", 200
 
-
 # --------------------------------------------------
 # 路由 2：手动测试连 Apex + 下一个小单
-#   手动在浏览器打开 https://你的域名/test 才会触发
 # --------------------------------------------------
 @app.route("/test")
 def test():
@@ -73,31 +77,14 @@ def test():
         print("❌ make_client() failed in /test:", e)
         return jsonify({"status": "error", "where": "make_client", "error": str(e)}), 500
 
-    # 先看是否允许真实下单
-    if not is_live_trading_enabled():
-        print("ℹ️ /test 被调用，但 ENABLE_LIVE_TRADING != 'true' -> 只测试连接，不下单")
-        try:
-            configs = client.configs_v3()
-            account = client.get_account_v3()
-        except Exception as e:
-            return jsonify({
-                "status": "error",
-                "where": "configs_or_account",
-                "error": str(e),
-            }), 500
-
-        return jsonify({
-            "status": "ok",
-            "mode": "dry_run",
-            "message": "live trading disabled, only fetched configs/account",
-            "configs": configs,
-            "account": account,
-        }), 200
-
-    # 允许真实下单
-    # 获取配置信息和账户信息
-    configs = client.configs_v3()
-    account = client.get_account_v3()
+    # 再拉一次也无所谓，主要是给你看
+    configs = {}
+    account = {}
+    try:
+        configs = client.configs_v3()
+        account = client.get_account_v3()
+    except Exception as e:
+        print("⚠️ configs/account error in /test:", e)
 
     current_time = int(time.time())
     try:
@@ -121,12 +108,10 @@ def test():
 
     return jsonify({
         "status": "ok",
-        "mode": "live",
         "configs": configs,
         "account": account,
         "order": order,
     }), 200
-
 
 # --------------------------------------------------
 # 小工具：把 TV 的 symbol 转成 Apex 的格式
@@ -145,7 +130,6 @@ def normalize_symbol(sym: str) -> str:
         return f"{base}-{quote}"
     return sym
 
-
 # --------------------------------------------------
 # 路由 3：TradingView Webhook 接收 + 下单
 # --------------------------------------------------
@@ -155,16 +139,21 @@ def webhook():
     print("📩 Incoming webhook:", data)
 
     # ---------- 1) 校验 Webhook Secret ----------
-    env_secret = os.getenv("WEBHOOK_SECRET", "")
+    env_secret = os.getenv("WEBHOOK_SECRET")
     req_secret = str(data.get("secret", "")) if data.get("secret") is not None else ""
     if env_secret:
         if req_secret != env_secret:
-            print(f"❌ Webhook secret mismatch (env={env_secret}, req={req_secret})")
+            print("❌ Webhook secret mismatch (env=%s, req=%s)" % (env_secret, req_secret))
             return jsonify({"status": "error", "message": "webhook secret mismatch"}), 403
 
     # ---------- 2) 检查是否允许真实交易 ----------
-    if not is_live_trading_enabled():
-        print("ℹ️ ENABLE_LIVE_TRADING != 'true' -> 只记录，不真实下单")
+    raw_flag = os.getenv("ENABLE_LIVE_TRADING", "false")
+    print("ENABLE_LIVE_TRADING raw =", repr(raw_flag))
+    live_flag = (raw_flag or "").strip().lower() == "true"
+    print("ENABLE_LIVE_TRADING normalized =", live_flag)
+
+    if not live_flag:
+        print("ℹ️ ENABLE_LIVE_TRADING != 'true' -> 只记录, 不真实下单")
         return jsonify({
             "status": "ok",
             "mode": "dry_run",
@@ -173,9 +162,9 @@ def webhook():
         }), 200
 
     # ---------- 3) 解析 TradingView 传来的字段 ----------
-    side_raw        = str(data.get("side", "")).lower()          # 'buy' / 'sell'
-    symbol_raw      = str(data.get("symbol", "")).upper()        # 例如 ZECUSDT
-    size_raw        = data.get("position_size", 0)               # 仓位大小
+    side_raw        = str(data.get("side", "")).lower()   # 'buy' / 'sell'
+    symbol_raw      = str(data.get("symbol", "")).upper() # 例如 ZECUSDT
+    size_raw        = data.get("position_size", 0)        # 由 Pine 传进来的仓位大小
     order_type_raw  = str(data.get("order_type", "market")).lower()  # 'market'/'limit'
     signal_type     = str(data.get("signal_type", "entry")).lower()  # 'entry'/'exit'
 
@@ -185,7 +174,7 @@ def webhook():
     symbol = normalize_symbol(symbol_raw)
     print(f"✅ Normalized symbol: {symbol_raw} -> {symbol}")
 
-    # 这里假设 TV 传来的 position_size 已经是 Apex 需要的 size（张数或币数量）
+    # 这里假设 TV 传来的 position_size 已经是 Apex 需要的 size
     try:
         size_dec = Decimal(str(size_raw))
         if size_dec <= 0:
@@ -194,10 +183,8 @@ def webhook():
         print("❌ invalid position_size:", e)
         return jsonify({"status": "error", "message": "invalid position_size", "data": data}), 400
 
-    side_api = side_raw.upper()  # BUY / SELL
-    type_api = order_type_raw.upper()
-    if type_api not in ["MARKET", "LIMIT"]:
-        type_api = "MARKET"
+    side_api  = side_raw.upper()       # BUY / SELL
+    type_api  = order_type_raw.upper() # MARKET / LIMIT
 
     # LIMIT 单需要价格，这里先给一个兜底
     price_raw = data.get("price", None)
@@ -241,9 +228,8 @@ def webhook():
             "error": str(e),
         }), 500
 
-
 # --------------------------------------------------
-# 主入口：本地运行时使用（DO 上会用 gunicorn / 自己的方式启动）
+# 主入口：本地运行时使用
 # --------------------------------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
