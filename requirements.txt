@@ -1,4 +1,4 @@
-apexomni
+apexomni==0.x.y
 web3
 ecdsa
 sympy==1.12
