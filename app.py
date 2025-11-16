@@ -4,37 +4,32 @@ from decimal import Decimal
 
 from flask import Flask, request, jsonify
 from apexomni.constants import NETWORKID_TEST, APEX_OMNI_HTTP_TEST
-from apexomni.http_private_v3 import HttpPrivateSign  # ✅ 一定要是 http_private_v3
+from apexomni.http_private_sign import HttpPrivateSign  # ✅ 关键：用 http_private_sign
 
 app = Flask(__name__)
 
 # --------------------------------------------------
-# 工具函数：创建 Apex Client（用 DO 环境变量，V3 版本）
+# 创建 Apex Omni Client（用 DO 环境变量）
 # --------------------------------------------------
 def make_client():
     key        = os.getenv("APEX_API_KEY")
     secret     = os.getenv("APEX_API_SECRET")
     passphrase = os.getenv("APEX_API_PASSPHRASE")
-    seeds      = os.getenv("APEX_ZK_SEEDS")      # 建议 DO 里新建这个变量
     l2key      = os.getenv("APEX_L2KEY_SEEDS")
 
     print("Loaded env variables in app.py:")
-    print("API_KEY :", bool(key))
-    print("API_SECRET :", bool(secret))
-    print("PASS :", bool(passphrase))
-    print("SEEDS :", bool(seeds))
-    print("L2KEY :", bool(l2key))
+    print("API_KEY:", bool(key))
+    print("API_SECRET:", bool(secret))
+    print("PASS:", bool(passphrase))
+    print("L2KEY:", bool(l2key))
 
-    if not all([key, secret, passphrase]):
-        raise RuntimeError("Missing one or more APEX_API_* env vars")
-
-    if not seeds or not l2key:
-        print("⚠️ WARNING: zk_seeds 或 l2Key 没有设置，create_order_v3 可能会失败")
+    if not all([key, secret, passphrase, l2key]):
+        raise RuntimeError("Missing one or more APEX_* environment variables")
 
     client = HttpPrivateSign(
-        APEX_OMNI_HTTP_TEST,
+        APEX_OMNI_HTTP_TEST,             # 现在先用 TEST 网
         network_id=NETWORKID_TEST,
-        zk_seeds=seeds,
+        zk_seeds=None,
         zk_l2Key=l2key,
         api_key_credentials={
             "key": key,
@@ -42,24 +37,17 @@ def make_client():
             "passphrase": passphrase,
         },
     )
-
-    # 和官方示例一样，下单前先拉一次配置 & 账户
-    configs = client.configs_v3()
-    account = client.get_account_v3()
-    print("configs_v3 ok")
-    print("get_account_v3 ok")
-
     return client
 
 # --------------------------------------------------
-# 路由 1：健康检查（DO 默认会请求 /）
+# 健康检查
 # --------------------------------------------------
 @app.route("/")
 def health():
     return "ok", 200
 
 # --------------------------------------------------
-# 路由 2：手动测试下单（浏览器打开 https://你的域名/test 才会触发）
+# 手动测试： configs + account + 下 0.001 BTC 测试单
 # --------------------------------------------------
 @app.route("/test")
 def test():
@@ -70,27 +58,49 @@ def test():
         return jsonify({"status": "error", "where": "make_client", "error": str(e)}), 500
 
     try:
-        current_time = int(time.time())
+        configs = client.configs_v3()
+        print("configs_v3 ok")
+    except Exception as e:
+        print("❌ configs_v3 failed:", e)
+        configs = str(e)
+
+    try:
+        account = client.get_account_v3()
+        print("get_account_v3 ok")
+    except Exception as e:
+        print("❌ get_account_v3 failed:", e)
+        account = str(e)
+
+    try:
+        now = int(time.time())
         order = client.create_order_v3(
             symbol="BTC-USDT",
             side="SELL",
             type="MARKET",
             size="0.001",
-            timestampSeconds=current_time,
+            timestampSeconds=now,
             price="60000",
         )
-        print("✅ /test create_order_v3 ok:", order)
-        return jsonify({"status": "ok", "order": order}), 200
+        print("create_order_v3 ok:", order)
     except Exception as e:
         print("❌ create_order_v3 failed in /test:", e)
         return jsonify({
             "status": "error",
             "where": "create_order_v3",
             "error": str(e),
+            "configs": configs,
+            "account": account,
         }), 500
 
+    return jsonify({
+        "status": "ok",
+        "configs": configs,
+        "account": account,
+        "order": order,
+    }), 200
+
 # --------------------------------------------------
-# 小工具：把 TV 的 symbol 转成 Apex 格式，比如 ZECUSDT -> ZEC-USDT
+# 工具：把 ZECUSDT -> ZEC-USDT
 # --------------------------------------------------
 def normalize_symbol(sym: str) -> str:
     if not sym:
@@ -105,14 +115,14 @@ def normalize_symbol(sym: str) -> str:
     return sym
 
 # --------------------------------------------------
-# 路由 3：TradingView Webhook 接收 + 真正下单
+# TradingView Webhook
 # --------------------------------------------------
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json(silent=True) or {}
     print("📩 Incoming webhook:", data)
 
-    # ---------- 1) 校验 Webhook Secret ----------
+    # 1) 校验 Webhook Secret
     env_secret = os.getenv("WEBHOOK_SECRET")
     req_secret = str(data.get("secret", "")) if data.get("secret") is not None else ""
     if env_secret:
@@ -120,14 +130,14 @@ def webhook():
             print(f"❌ Webhook secret mismatch (env={env_secret}, req={req_secret})")
             return jsonify({"status": "error", "message": "webhook secret mismatch"}), 403
 
-    # ---------- 2) 检查是否允许真实交易 ----------
-    live_flag_raw = os.getenv("ENABLE_LIVE_TRADING", "false")
-    live_flag = live_flag_raw.strip().lower() == "true"
-    print("ENABLE_LIVE_TRADING raw =", repr(live_flag_raw))
+    # 2) 是否允许真实交易
+    live_raw = os.getenv("ENABLE_LIVE_TRADING", "false")
+    print("ENABLE_LIVE_TRADING raw =", repr(live_raw))
+    live_flag = live_raw.lower() == "true"
     print("ENABLE_LIVE_TRADING normalized =", live_flag)
 
     if not live_flag:
-        print("ℹ️ ENABLE_LIVE_TRADING != 'true' -> 只记录，不真实下单")
+        print("ℹ️ ENABLE_LIVE_TRADING != 'true' -> 只记录, 不真实下单")
         return jsonify({
             "status": "ok",
             "mode": "dry_run",
@@ -135,14 +145,14 @@ def webhook():
             "data": data,
         }), 200
 
-    # ---------- 3) 解析 TradingView 传来的字段 ----------
-    side_raw       = str(data.get("side", "")).lower()          # 'buy' / 'sell'
-    symbol_raw     = str(data.get("symbol", "")).upper()        # 例如 'ZECUSDT'
-    size_raw       = data.get("position_size", 0)               # TV 传来的仓位大小
-    order_type_raw = str(data.get("order_type", "market")).lower()  # 'market' / 'limit'
-    signal_type    = str(data.get("signal_type", "entry")).lower()  # 'entry' / 'exit'
+    # 3) 解析 TradingView JSON
+    side_raw       = str(data.get("side", "")).lower()           # buy / sell
+    symbol_raw     = str(data.get("symbol", "")).upper()         # ZECUSDT
+    size_raw       = data.get("position_size", 0)                # USDT 数量 -> size
+    order_type_raw = str(data.get("order_type", "market")).lower()
+    signal_type    = str(data.get("signal_type", "entry")).lower()
 
-    if side_raw not in ["buy", "sell"]:
+    if side_raw not in ("buy", "sell"):
         return jsonify({"status": "error", "message": "invalid side", "data": data}), 400
 
     symbol = normalize_symbol(symbol_raw)
@@ -156,8 +166,8 @@ def webhook():
         print("❌ invalid position_size:", e)
         return jsonify({"status": "error", "message": "invalid position_size", "data": data}), 400
 
-    side_api = side_raw.upper()        # BUY / SELL
-    type_api = order_type_raw.upper()  # MARKET / LIMIT
+    side_api = side_raw.upper()             # BUY / SELL
+    type_api = order_type_raw.upper()       # MARKET / LIMIT
 
     price_raw = data.get("price", None)
     price_str = "0"
@@ -167,24 +177,23 @@ def webhook():
         except Exception:
             price_str = "0"
 
-    # ---------- 4) 创建 Apex client ----------
+    # 4) 调用 Apex Omni 下单
     try:
         client = make_client()
     except Exception as e:
         print("❌ make_client() failed in /webhook:", e)
         return jsonify({"status": "error", "where": "make_client", "error": str(e)}), 500
 
-    # ---------- 5) 真正调用 create_order_v3 ----------
     ts = int(time.time())
 
     try:
         order = client.create_order_v3(
             symbol=symbol,
-            side=side_api,          # BUY / SELL
-            type=type_api,          # MARKET / LIMIT
-            size=str(size_dec),     # 仓位大小
+            side=side_api,
+            type=type_api,
+            size=str(size_dec),
             timestampSeconds=ts,
-            price=price_str,        # MARKET 会被忽略
+            price=price_str,
         )
         print("✅ create_order_v3 ok:", order)
         return jsonify({
@@ -201,9 +210,6 @@ def webhook():
             "error": str(e),
         }), 500
 
-# --------------------------------------------------
-# 本地跑 Flask 时用，DO 上会用自己的方式启动
-# --------------------------------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
