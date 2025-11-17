@@ -3,14 +3,14 @@
 
 import os
 
-# -----------------------------
-# 尝试多种路径导入 HttpPrivateSign
-# -----------------------------
+# -------------------------------------------------
+# 多路径兼容导入 HttpPrivateSign，适配不同版本 apexomni
+# -------------------------------------------------
 HttpPrivateSign = None
 _import_errors = []
 
 try:
-    # 新版 SDK 示例写法
+    # 新版 SDK 推荐写法
     from apexomni.http_private_v3 import HttpPrivateSign as _HttpPrivateSign
 
     HttpPrivateSign = _HttpPrivateSign
@@ -18,7 +18,7 @@ try:
 except Exception as e:
     _import_errors.append(f"apexomni.http_private_v3: {e}")
     try:
-        # 文档里常见的旧写法
+        # 有的版本在这个模块里
         from apexomni.http_private_sign import HttpPrivateSign as _HttpPrivateSign
 
         HttpPrivateSign = _HttpPrivateSign
@@ -26,7 +26,7 @@ except Exception as e:
     except Exception as e2:
         _import_errors.append(f"apexomni.http_private_sign: {e2}")
         try:
-            # 最老的一种写法：直接从 apexomni 根导入
+            # 最老的写法：直接从 apexomni 根导入
             from apexomni import HttpPrivateSign as _HttpPrivateSign
 
             HttpPrivateSign = _HttpPrivateSign
@@ -35,7 +35,6 @@ except Exception as e:
             _import_errors.append(f"apexomni: {e3}")
 
 if HttpPrivateSign is None:
-    # 所有路径都失败，就给出清晰一点的错误信息
     raise ImportError(
         "Could not import HttpPrivateSign from apexomni.\n"
         "Tried:\n"
@@ -45,11 +44,13 @@ if HttpPrivateSign is None:
         f"Errors: {_import_errors}"
     )
 
-# 常量：测试网 / 主网 endpoint + network_id
+# -------------------------------------------------
+# 常量：TEST / MAINNET endpoint + network_id
+# -------------------------------------------------
 from apexomni.constants import (
     APEX_OMNI_HTTP_TEST,
     APEX_OMNI_HTTP_MAIN,
-    NETWORKID_OMNI_TEST_BNB,
+    NETWORKID_TEST,
     NETWORKID_OMNI_MAIN_ARB,
 )
 
@@ -61,9 +62,8 @@ def make_client():
     secret = os.getenv("APEX_API_SECRET")
     passphrase = os.getenv("APEX_API_PASSPHRASE")
 
-    # ZK seeds：用 Omni Key Seed；可以先留空调试
+    # ZK seeds：用 Omni Key Seed；L2Key 可以先留空
     seeds = os.getenv("APEX_ZK_SEEDS", "")
-    # L2Key 可以为空字符串
     l2key = os.getenv("APEX_L2KEY_SEEDS", "")
 
     print("Loaded env variables in make_client():")
@@ -83,7 +83,7 @@ def make_client():
         network_id = NETWORKID_OMNI_MAIN_ARB
     else:
         endpoint = APEX_OMNI_HTTP_TEST
-        network_id = NETWORKID_OMNI_TEST_BNB
+        network_id = NETWORKID_TEST
 
     print("Using endpoint:", endpoint)
     print("Using network_id:", network_id)
@@ -96,21 +96,21 @@ def make_client():
         api_key_credentials={"key": key, "secret": secret, "passphrase": passphrase},
     )
 
-    # 打印一下含有 account 的属性名（方便后面 /webhook 排查）
+    # 创建完客户端先看一下它自带的 account 相关属性（调试用）
     acct_attrs = [a for a in dir(client) if "account" in a.lower()]
     print("Client attributes containing 'account':", acct_attrs)
 
     return client
 
 
-# 本文件直接运行时做一个简单自检（本地调试用）
+# 本文件单独运行时，用来本地自检（在 DO 上不会走这里）
 if __name__ == "__main__":
-    from pprint import pprint
+    import pprint
 
     c = make_client()
     cfg = c.configs_v3()
     acc = c.get_account_v3()
     print("configs_v3:")
-    pprint(cfg)
+    pprint.pp(cfg)
     print("account_v3:")
-    pprint(acc)
+    pprint.pp(acc)
