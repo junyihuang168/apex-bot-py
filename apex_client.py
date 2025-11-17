@@ -2,51 +2,51 @@ import os
 import time
 
 from apexomni.http_private_sign import HttpPrivateSign
-from apexomni.constants import APEX_OMNI_HTTP_TEST, NETWORKID_TEST
-
-# 主网常量如果当前版本没有，就忽略
-try:
-    from apexomni.constants import APEX_OMNI_HTTP_MAIN, NETWORKID_OMNI_MAIN_ARB
-except ImportError:
-    APEX_OMNI_HTTP_MAIN = None
-    NETWORKID_OMNI_MAIN_ARB = None
+from apexomni.constants import (
+    APEX_OMNI_HTTP_TEST,
+    APEX_OMNI_HTTP_MAIN,
+    NETWORKID_TEST,
+    NETWORKID_MAIN,
+)
 
 
-def make_client():
-    """
-    从环境变量创建 HttpPrivateSign 客户端。
+def _str2bool(value: str, default: bool = False) -> bool:
+    if value is None:
+        return default
+    v = value.strip().lower()
+    return v in ("1", "true", "yes", "y", "on")
 
-    必须有：
-      - APEX_API_KEY
-      - APEX_API_SECRET
-      - APEX_API_PASSPHRASE
-      - APEX_L2KEY_SEEDS
 
-    可选：
-      - APEX_ZK_SEEDS   （没有也没关系，SDK 会根据 l2key 推导）
-      - APEX_USE_MAINNET = "true" 时走主网，否则 TEST 网
-    """
+def make_client() -> HttpPrivateSign:
+    """从环境变量创建 HttpPrivateSign 客户端"""
+
     key = os.getenv("APEX_API_KEY")
     secret = os.getenv("APEX_API_SECRET")
     passphrase = os.getenv("APEX_API_PASSPHRASE")
-    seeds = os.getenv("APEX_ZK_SEEDS")          # 可选
-    l2key = os.getenv("APEX_L2KEY_SEEDS")
+
+    # zk 签名材料
+    seeds = os.getenv("APEX_ZK_SEEDS")
+    # 官方文档说 l2Key 可以为空字符串，所以这里允许为空
+    l2key = os.getenv("APEX_L2KEY_SEEDS", "")
 
     print("Loaded env variables in make_client():")
     print("API_KEY:", bool(key))
     print("API_SECRET:", bool(secret))
     print("PASS:", bool(passphrase))
-    print("SEEDS(optional):", bool(seeds))
+    print("SEEDS:", bool(seeds))
     print("L2KEY:", bool(l2key))
 
-    # 只强制检查 key / secret / passphrase / l2key
-    if not all([key, secret, passphrase, l2key]):
-        raise RuntimeError("Missing one or more mandatory APEX_* environment variables")
+    # seeds 是必须的，否则 create_order_v3 根本没法签名
+    if not all([key, secret, passphrase, seeds]):
+        raise RuntimeError(
+            "Missing one or more required APEX_* environment variables "
+            "(APEX_API_KEY / APEX_API_SECRET / APEX_API_PASSPHRASE / APEX_ZK_SEEDS)"
+        )
 
-    use_mainnet = os.getenv("APEX_USE_MAINNET", "false").lower() == "true"
-    if use_mainnet and APEX_OMNI_HTTP_MAIN and NETWORKID_OMNI_MAIN_ARB:
+    use_mainnet = _str2bool(os.getenv("APEX_USE_MAINNET", "false"), default=False)
+    if use_mainnet:
         endpoint = APEX_OMNI_HTTP_MAIN
-        network_id = NETWORKID_OMNI_MAIN_ARB
+        network_id = NETWORKID_MAIN
     else:
         endpoint = APEX_OMNI_HTTP_TEST
         network_id = NETWORKID_TEST
@@ -57,74 +57,30 @@ def make_client():
     client = HttpPrivateSign(
         endpoint,
         network_id=network_id,
-        zk_seeds=seeds,      # 可以是 None
+        zk_seeds=seeds,
         zk_l2Key=l2key,
-        api_key_credentials={
-            "key": key,
-            "secret": secret,
-            "passphrase": passphrase,
-        },
+        api_key_credentials={"key": key, "secret": secret, "passphrase": passphrase},
     )
-
-    # ---------- 兼容补丁：补上 accountV3 / account_v3 / accountv3 ----------
-    acct_obj = None
-    source_name = None
-
-    for name in ("accountV3", "account_v3", "account"):
-        attr = getattr(client, name, None)
-        if attr is None:
-            continue
-        source_name = name
-
-        # 可能是一个方法，尝试调用一次拿到真正的对象
-        if callable(attr):
-            try:
-                acct_obj = attr()
-            except TypeError:
-                acct_obj = attr
-        else:
-            acct_obj = attr
-
-        if acct_obj is not None:
-            break
-
-    if acct_obj is not None:
-        for alias in ("accountV3", "account_v3", "accountv3"):
-            if not hasattr(client, alias):
-                setattr(client, alias, acct_obj)
-                print(f"Patched client.{alias} from client.{source_name}")
-    else:
-        print("Warning: could not determine account client; create_order_v3 may fail.")
-
-    acct_attrs = [a for a in dir(client) if "account" in a.lower()]
-    print("Client attributes containing 'account':", acct_attrs)
 
     return client
 
 
-def self_test():
-    """本地 /test 用：简单自测一下"""
-    client = make_client()
-
-    configs = client.configs_v3()
-    account = client.get_account_v3()
-    print("Configs:", configs)
-    print("Account:", account)
+# 仅本地手动测试时用：在 DO 上不会执行
+if __name__ == "__main__":
+    print("Running apex_client.py self-test...")
+    c = make_client()
+    cfg = c.configs_v3()
+    acc = c.get_account_v3()
+    print("configs_v3:", cfg)
+    print("account_v3:", acc)
 
     now = int(time.time())
-    try:
-        order = client.create_order_v3(
-            symbol="BTC-USDT",
-            side="SELL",
-            type="MARKET",
-            size="0.001",
-            timestampSeconds=now,
-            price="60000",
-        )
-        print("Test order result:", order)
-    except Exception as e:
-        print("✗ create_order_v3 failed in apex_client.py:", e)
-
-
-if __name__ == "__main__":
-    self_test()
+    order_res = c.create_order_v3(
+        symbol="BTC-USDT",
+        side="SELL",
+        type="MARKET",
+        size="0.001",
+        timestampSeconds=now,
+        price="60000",
+    )
+    print("test order:", order_res)
