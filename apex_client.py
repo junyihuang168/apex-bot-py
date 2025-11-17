@@ -1,7 +1,7 @@
 import os
 import time
 
-from apexomni import HttpPrivateSign
+from apexomni.http_private_sign import HttpPrivateSign
 from apexomni.constants import NETWORKID_TEST, APEX_OMNI_HTTP_TEST
 
 
@@ -34,7 +34,7 @@ def make_client():
         network_id=NETWORKID_TEST,
         # 让 SDK 自己根据 l2key 推导 zk_seeds
         zk_seeds=None,
-        zk_l2key=l2key,
+        zk_l2Key=l2key,
         api_key_credentials={
             "key": key,
             "secret": secret,
