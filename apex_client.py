@@ -1,11 +1,10 @@
 import os
 import time
 
-# 用之前证明可用的导入方式
 from apexomni.http_private_sign import HttpPrivateSign
 from apexomni.constants import APEX_OMNI_HTTP_TEST, NETWORKID_TEST
 
-# 主网常量可能在当前版本没有，所以用 try/except 包一层
+# 主网常量如果当前版本没有，就忽略
 try:
     from apexomni.constants import APEX_OMNI_HTTP_MAIN, NETWORKID_OMNI_MAIN_ARB
 except ImportError:
@@ -16,34 +15,36 @@ except ImportError:
 def make_client():
     """
     从环境变量创建 HttpPrivateSign 客户端。
-    依赖环境变量：
+
+    必须有：
       - APEX_API_KEY
       - APEX_API_SECRET
       - APEX_API_PASSPHRASE
-      - APEX_ZK_SEEDS
       - APEX_L2KEY_SEEDS
-      - APEX_USE_MAINNET   (可选，"true" 则走主网，否则 TEST)
+
+    可选：
+      - APEX_ZK_SEEDS   （没有也没关系，SDK 会根据 l2key 推导）
+      - APEX_USE_MAINNET = "true" 时走主网，否则 TEST 网
     """
     key = os.getenv("APEX_API_KEY")
     secret = os.getenv("APEX_API_SECRET")
     passphrase = os.getenv("APEX_API_PASSPHRASE")
-    seeds = os.getenv("APEX_ZK_SEEDS")
+    seeds = os.getenv("APEX_ZK_SEEDS")          # 可选
     l2key = os.getenv("APEX_L2KEY_SEEDS")
 
     print("Loaded env variables in make_client():")
     print("API_KEY:", bool(key))
     print("API_SECRET:", bool(secret))
     print("PASS:", bool(passphrase))
-    print("SEEDS:", bool(seeds))
+    print("SEEDS(optional):", bool(seeds))
     print("L2KEY:", bool(l2key))
 
-    if not all([key, secret, passphrase, seeds]):
-        raise RuntimeError("Missing one or more APEX_* environment variables")
+    # 只强制检查 key / secret / passphrase / l2key
+    if not all([key, secret, passphrase, l2key]):
+        raise RuntimeError("Missing one or more mandatory APEX_* environment variables")
 
     use_mainnet = os.getenv("APEX_USE_MAINNET", "false").lower() == "true"
-    if use_mainnet:
-        if APEX_OMNI_HTTP_MAIN is None or NETWORKID_OMNI_MAIN_ARB is None:
-            raise RuntimeError("This apexomni version has no mainnet constants")
+    if use_mainnet and APEX_OMNI_HTTP_MAIN and NETWORKID_OMNI_MAIN_ARB:
         endpoint = APEX_OMNI_HTTP_MAIN
         network_id = NETWORKID_OMNI_MAIN_ARB
     else:
@@ -56,7 +57,7 @@ def make_client():
     client = HttpPrivateSign(
         endpoint,
         network_id=network_id,
-        zk_seeds=seeds,
+        zk_seeds=seeds,      # 可以是 None
         zk_l2Key=l2key,
         api_key_credentials={
             "key": key,
@@ -69,19 +70,17 @@ def make_client():
     acct_obj = None
     source_name = None
 
-    # 尝试从现有的属性里找一个真正的「账户客户端」对象
     for name in ("accountV3", "account_v3", "account"):
         attr = getattr(client, name, None)
         if attr is None:
             continue
         source_name = name
 
-        # 可能是一个方法，需要调用一次拿到真正的 client 对象
+        # 可能是一个方法，尝试调用一次拿到真正的对象
         if callable(attr):
             try:
-                acct_obj = attr()   # account()
+                acct_obj = attr()
             except TypeError:
-                # 如果调用失败，就直接当成对象用
                 acct_obj = attr
         else:
             acct_obj = attr
@@ -104,7 +103,7 @@ def make_client():
 
 
 def self_test():
-    """本地调试用：/test 时可以调用"""
+    """本地 /test 用：简单自测一下"""
     client = make_client()
 
     configs = client.configs_v3()
