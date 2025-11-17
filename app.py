@@ -9,7 +9,7 @@ app = Flask(__name__)
 
 
 # ----------------------------------------
-# 工具函数：把 BTCUSDT -> BTC-USDT
+# 小工具：把 BTCUSDT -> BTC-USDT
 # ----------------------------------------
 def normalize_symbol(sym: str) -> str:
     if not sym:
@@ -38,7 +38,7 @@ def health():
 
 
 # ----------------------------------------
-# 路由 1：手动测试 - 直接在浏览器打开 /test
+# 路由 1：手动测试  /test  （浏览器打开）
 # ----------------------------------------
 @app.route("/test")
 def test():
@@ -51,8 +51,8 @@ def test():
     try:
         configs = client.configs_v3()
         account = client.get_account_v3()
-        print("configs_v3 ok")
-        print("get_account_v3 ok")
+        print("configs_v3 ok in /test")
+        print("get_account_v3 ok in /test")
     except Exception as e:
         print("❌ configs_v3/get_account_v3 failed in /test:", e)
         return (
@@ -98,6 +98,7 @@ def test():
 # ----------------------------------------
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    # 1) 解析 JSON
     try:
         data = request.get_json(force=True, silent=False)
     except Exception as e:
@@ -106,13 +107,14 @@ def webhook():
 
     print("📩 Incoming webhook:", data)
 
-    # 1) 校验 secret（TradingView 那边要和 env 里一致）
+    # 2) 校验 secret（和 TradingView 里的保持一致）
     recv_secret = data.get("secret")
     expected_secret = os.getenv("WEBHOOK_SECRET", "")
     if expected_secret and recv_secret != expected_secret:
         print("❌ Invalid webhook secret")
         return "invalid secret", 403
 
+    # 3) 读取交易参数
     raw_symbol = data.get("symbol", "")
     side = data.get("side", "buy").upper()
     position_size = str(data.get("position_size", "1"))
@@ -127,7 +129,7 @@ def webhook():
     symbol = normalize_symbol(raw_symbol)
     print("✅ Normalized symbol:", raw_symbol, "->", symbol)
 
-    # 如果只想测试流程，不真正下单，可以把 ENABLE_LIVE_TRADING 设成 false
+    # 4) 如果只是想测试流程，不真正下单，可以把 ENABLE_LIVE_TRADING 设成 false
     if not enable_live:
         print("⚠️ Live trading disabled, skip create_order_v3")
         return (
@@ -144,24 +146,32 @@ def webhook():
             200,
         )
 
-    # 真正下单
+    # 5) 创建 client
     try:
         client = make_client()
     except Exception as e:
         print("❌ make_client() failed in /webhook:", e)
         return "make_client failed", 500
 
-    current_time = int(time.time())
+    # 🔴 关键修复：必须先调用 configs_v3() 和 get_account_v3()
+    try:
+        configs = client.configs_v3()
+        account = client.get_account_v3()
+        print("configs_v3/get_account_v3 ok in /webhook")
+    except Exception as e:
+        print("❌ configs_v3/get_account_v3 failed in /webhook:", e)
+        return "configs_or_account failed", 500
 
-    # 市价单 price 可以写 "0"（SDK 内部会按要求处理）
-    price = "0"
+    # 6) 真正下单
+    current_time = int(time.time())
+    price = "0"  # 市价单随便填一个 price，SDK 内部会处理
 
     try:
         order = client.create_order_v3(
             symbol=symbol,
             side=side,
-            type=order_type,         # "MARKET" / "LIMIT" ...
-            size=str(position_size), # 这里直接用机器人传来的数量
+            type=order_type,
+            size=str(position_size),
             timestampSeconds=current_time,
             price=price,
         )
@@ -186,5 +196,5 @@ def webhook():
 
 
 if __name__ == "__main__":
-    # 本地调试用，DO 上不会走这里
+    # 本地调试用，DO 上不会走到这里
     app.run(host="0.0.0.0", port=8080, debug=True)
