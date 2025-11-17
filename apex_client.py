@@ -28,7 +28,7 @@ def make_client():
     if not all([key, secret, passphrase, l2key]):
         raise RuntimeError("Missing one or more APEX_* environment variables")
 
-    # 创建 HttpPrivateSign 客户端（目前仍然是 TEST 网）
+    # 目前仍然用 TEST 网
     client = HttpPrivateSign(
         APEX_OMNI_HTTP_TEST,
         network_id=NETWORKID_TEST,
@@ -42,15 +42,15 @@ def make_client():
         },
     )
 
-    # ---- 兼容补丁：给 SDK 补上 accountv3 属性 ----
-    # 部分版本的 HttpPrivateSign 在 create_order_v3 里会用 self.accountv3，
-    # 但实例上只有 .account 属性，所以这里帮它做个 alias。
-    if not hasattr(client, "accountv3"):
-        if hasattr(client, "account"):
-            setattr(client, "accountv3", client.account)
-            print("Patched client.accountv3 from client.account")
-        else:
-            print("Warning: HttpPrivateSign has no 'account' attribute to patch accountv3")
+    # ---- 兼容补丁：给 SDK 补上 accountV3 / account_v3 / accountv3 属性 ----
+    acct_source = getattr(client, "account", None)
+    if acct_source is not None:
+        for alias in ("accountV3", "account_v3", "accountv3"):
+            if not hasattr(client, alias):
+                setattr(client, alias, acct_source)
+                print(f"Patched client.{alias} from client.account")
+    else:
+        print("Warning: HttpPrivateSign has no 'account' attribute; cannot patch aliases")
 
     # 打印一下有哪些 account 相关的属性（调试用）
     acct_attrs = [a for a in dir(client) if "account" in a.lower()]
