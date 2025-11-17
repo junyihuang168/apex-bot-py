@@ -1,214 +1,281 @@
+# app.py
 import os
 import time
-from typing import Any, Dict, Iterable, Optional
+from collections.abc import Mapping
 
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify, request
 
 from apex_client import make_client
 
 app = Flask(__name__)
 
 
-# ----------------- 小工具函数 -----------------
-def str_to_bool(val: Optional[str], default: bool = False) -> bool:
-    if val is None:
-        return default
-    return str(val).strip().lower() in ("1", "true", "yes", "y", "on")
-
-
-def normalize_symbol(sym: Optional[str]) -> Optional[str]:
-    """把 TV 里的 BTCUSDT 之类，转成 Apex 需要的 BTC-USDT"""
+# --------------------------------------------------
+# 小工具函数
+# --------------------------------------------------
+def normalize_symbol(sym: str) -> str:
+    """
+    把 TradingView 的 BTCUSDT / ZECUSDT 之类，
+    转成 Apex 需要的 BTC-USDT / ZEC-USDT。
+    """
     if not sym:
         return sym
-    s = sym.upper()
-    if "-" in s:
-        return s
-    if s.endswith("USDT") and len(s) > 4:
-        base = s[:-4]
-        return f"{base}-USDT"
-    return s
+    sym = sym.upper()
+    if "-" in sym:
+        return sym
+    if len(sym) > 4:
+        base = sym[:-4]
+        quote = sym[-4:]
+        return f"{base}-{quote}"
+    return sym
 
 
-def _find_account_id_in_obj(obj: Any) -> Optional[str]:
-    """在任意嵌套的 dict/list 里递归寻找 accountId 字段"""
-    target_keys = {"accountId", "account_id", "accountid", "accountID"}
+def _extract_account_id(obj):
+    """
+    递归地从任意 dict/list 里尽量找出 accountId。
+    """
+    visited = set()
 
-    def _search(o: Any) -> Optional[str]:
-        if isinstance(o, dict):
-            for k, v in o.items():
-                if k in target_keys and isinstance(v, (str, int)):
-                    return str(v)
-                res = _search(v)
-                if res is not None:
-                    return res
-        elif isinstance(o, list):
-            for item in o:
-                res = _search(item)
-                if res is not None:
-                    return res
+    def _inner(value):
+        if isinstance(value, Mapping):
+            obj_id = id(value)
+            if obj_id in visited:
+                return None
+            visited.add(obj_id)
+
+            for key in ("accountId", "account_id", "zkAccountId", "zk_account_id", "id"):
+                if key in value:
+                    v = value[key]
+                    if isinstance(v, (str, int)) and str(v).strip():
+                        return str(v)
+
+            for v in value.values():
+                result = _inner(v)
+                if result:
+                    return result
+
+        elif isinstance(value, list):
+            for item in value:
+                result = _inner(item)
+                if result:
+                    return result
+
         return None
 
-    return _search(obj)
+    return _inner(obj)
 
 
-def ensure_account_id(client: Any, account_raw: Any) -> Optional[str]:
+def ensure_account_ready(client):
     """
-    尝试从 client 和 get_account_v3() 的返回里找出 accountId，
-    找到后设置到 client.accountId，返回字符串，否则返回 None。
+    调用 configs_v3 / get_account_v3，尽量找出 accountId。
+
+    返回 (account_id, account_raw, configs_raw)
     """
-    print("Account raw passed into ensure_account_id:", account_raw)
+    configs = None
+    account = None
 
-    # 1) 客户端上本来就有？
-    for attr in ("accountId", "account_id", "accountid"):
-        if hasattr(client, attr):
-            val = getattr(client, attr)
-            if val:
-                setattr(client, "accountId", str(val))
-                print(f"Found existing client.{attr} =", val)
-                return str(val)
+    try:
+        configs = client.configs_v3()
+    except Exception as e:
+        print("⚠ configs_v3 failed in helper:", e)
 
-    # 2) 如果是自定义对象，先尝试转成 dict
-    if account_raw is not None and not isinstance(account_raw, (dict, list)):
-        if hasattr(account_raw, "__dict__"):
-            account_raw = account_raw.__dict__
+    try:
+        account = client.get_account_v3()
+    except Exception as e:
+        print("⚠ get_account_v3 failed in helper:", e)
 
-    # 3) 递归在返回结果里找 accountId
-    account_id = None
-    if account_raw is not None:
-        account_id = _find_account_id_in_obj(account_raw)
+    print("configs_v3/get_account_v3 ok in helper (可能有空值)")
+    print("Raw get_account_v3() in helper:", account)
 
-    if account_id:
-        setattr(client, "accountId", str(account_id))
-        print("Set client.accountId from account_raw:", account_id)
-        return str(account_id)
+    # 尽量把账户信息挂在 client 上，兼容不同 SDK 版本
+    try:
+        if isinstance(account, dict):
+            setattr(client, "accountV3", account)
+            if getattr(client, "account", None) is None:
+                setattr(client, "account", account)
+    except Exception as e:
+        print("⚠ Unable to attach account data on client:", e)
 
-    print("Still unable to determine accountId.")
-    return None
+    account_id = _extract_account_id(account)
+
+    if not account_id and isinstance(configs, Mapping):
+        account_id = _extract_account_id(configs)
+
+    if not account_id:
+        # 最后再从 client 的属性里找一圈
+        try:
+            for attr_name in dir(client):
+                if "account" not in attr_name.lower():
+                    continue
+                value = getattr(client, attr_name)
+                if isinstance(value, Mapping):
+                    candidate = _extract_account_id(value)
+                    if candidate:
+                        account_id = candidate
+                        print(f"Found accountId on client.{attr_name}: {account_id}")
+                        break
+        except Exception as e:
+            print("⚠ Error scanning client attributes for accountId:", e)
+
+    print("AccountId resolved in helper:", account_id)
+    return account_id, account, configs
 
 
-# ----------------- 基本路由 -----------------
+# --------------------------------------------------
+# 路由：健康检查
+# --------------------------------------------------
 @app.route("/")
-def root():
-    return "ok", 200
-
-
-@app.route("/health")
 def health():
     return "ok", 200
 
 
+# --------------------------------------------------
+# 路由：手动测试下单（会真下一个很小的 TEST 单）
+# --------------------------------------------------
 @app.route("/test")
 def test():
-    """手动测试：/test 用浏览器打开看 configs / account / accountId"""
     try:
         client = make_client()
     except Exception as e:
         print("❌ make_client() failed in /test:", e)
         return jsonify({"status": "error", "where": "make_client", "error": str(e)}), 500
 
+    account_id, account, configs = ensure_account_ready(client)
+
+    if not account_id:
+        print("❌ Unable to determine accountId in /test")
+        return jsonify(
+            {
+                "status": "error",
+                "where": "account",
+                "error": "Unable to determine accountId from get_account_v3",
+                "account_raw": account,
+            }
+        ), 500
+
+    now_ts = int(time.time())
     try:
-        configs = client.configs_v3()
-        account_raw = client.get_account_v3()
-        print("configs_v3/get_account_v3 ok in /test")
-        print("Raw get_account_v3() in /test:", account_raw)
-    except Exception as e:
-        print("❌ configs_v3/get_account_v3 failed in /test:", e)
-        return (
-            jsonify({"status": "error", "where": "configs_or_account", "error": str(e)}),
-            500,
+        order = client.create_order_v3(
+            symbol="BTC-USDT",
+            side="SELL",
+            type="MARKET",
+            size="0.001",
+            timestampSeconds=now_ts,
+            price="60000",
         )
-
-    account_id = ensure_account_id(client, account_raw)
-
-    return (
-        jsonify(
+        print("✅ create_order_v3 ok in /test:", order)
+        return jsonify(
             {
                 "status": "ok",
-                "account_id": account_id,
-                "account_raw": account_raw,
                 "configs": configs,
+                "account": account,
+                "accountId": account_id,
+                "order": order,
             }
-        ),
-        200,
-    )
+        ), 200
+    except Exception as e:
+        print("❌ create_order_v3 failed in /test:", e)
+        return jsonify(
+            {"status": "error", "where": "create_order_v3", "error": str(e)}
+        ), 500
 
 
-# ----------------- TradingView Webhook 下单 -----------------
+# --------------------------------------------------
+# 路由：TradingView Webhook 下单
+# --------------------------------------------------
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    payload = request.get_json(force=True, silent=True) or {}
-    print("📩 Incoming webhook:", payload)
+    data = request.get_json(silent=True) or {}
+    print("📩 Incoming webhook:", data)
 
     # 校验 secret
     expected_secret = os.getenv("WEBHOOK_SECRET")
-    if not expected_secret:
-        print("⚠️ WEBHOOK_SECRET not set in env")
-    incoming_secret = payload.get("secret")
-    if expected_secret and incoming_secret != expected_secret:
-        print("❌ Invalid WEBHOOK secret:", incoming_secret)
-        return "forbidden", 403
+    if expected_secret:
+        if data.get("secret") != expected_secret:
+            print("❌ Invalid WEBHOOK secret")
+            return (
+                jsonify({"status": "error", "where": "auth", "error": "invalid secret"}),
+                403,
+            )
 
-    # 是否真的下单
-    enable_live_raw = os.getenv("ENABLE_LIVE_TRADING", "false")
-    print("ENABLE_LIVE_TRADING raw =", repr(enable_live_raw))
-    enable_live = str_to_bool(enable_live_raw, False)
+    enable_raw = os.getenv("ENABLE_LIVE_TRADING", "false")
+    enable_live = enable_raw.lower() == "true"
+    print("ENABLE_LIVE_TRADING raw =", enable_raw)
     print("ENABLE_LIVE_TRADING normalized =", enable_live)
 
-    # 解析 TV 传进来的字段
-    tv_symbol = payload.get("symbol")          # 例如 BTCUSDT / ZECUSDT
-    side = (payload.get("side") or "").upper() # BUY / SELL
-    order_type = (payload.get("order_type") or "market").upper()  # MARKET / LIMIT
-    position_size = payload.get("position_size")  # 建议在 TV 里就填字符串
-    signal_type = payload.get("signal_type", "entry")  # entry / exit 等
+    symbol_raw = data.get("symbol") or data.get("ticker")
+    side_raw = (data.get("side") or "").upper()
+    order_type_raw = (data.get("order_type") or "market").upper()
+    position_size = str(data.get("position_size") or "0")
+    leverage = data.get("leverage")
+    signal_type = data.get("signal_type") or "entry"
 
-    norm_symbol = normalize_symbol(tv_symbol)
-    print(f"✅ Normalized symbol: {tv_symbol} -> {norm_symbol}")
+    symbol = normalize_symbol(symbol_raw)
+    print("✅ Normalized symbol:", symbol_raw, "->", symbol)
 
-    # 创建 Apex 客户端
     try:
         client = make_client()
     except Exception as e:
         print("❌ make_client() failed in /webhook:", e)
-        return "error", 500
+        return jsonify({"status": "error", "where": "make_client", "error": str(e)}), 500
 
-    # 先拉 configs & account，再从返回里解析 accountId
-    try:
-        configs = client.configs_v3()
-        account_raw = client.get_account_v3()
-        print("configs_v3/get_account_v3 ok in /webhook")
-        print("Raw get_account_v3() in /webhook:", account_raw)
-    except Exception as e:
-        print("❌ configs_v3/get_account_v3 failed in /webhook:", e)
-        return "error", 500
+    account_id, account, configs = ensure_account_ready(client)
 
-    account_id = ensure_account_id(client, account_raw)
     if not account_id:
-        print("⚠️ Could not determine accountId; create_order_v3 may still fail.")
+        print("❌ Unable to determine accountId in /webhook，停止下单")
+        return jsonify(
+            {
+                "status": "error",
+                "where": "account",
+                "error": "Unable to determine accountId from get_account_v3; please double-check Omni zk seeds (APEX_ZK_SEEDS) and l2Key (APEX_L2KEY_SEEDS).",
+                "account_raw": account,
+            }
+        ), 500
 
-    # 如果只是纸上谈兵，就不真正下单
     if not enable_live:
-        print("🚫 ENABLE_LIVE_TRADING is false; skip real order, only log.")
-        return "ok (paper)", 200
+        print("🧪 ENABLE_LIVE_TRADING=false，只做模拟打印，不真实下单")
+        return jsonify(
+            {
+                "status": "ok",
+                "mode": "dry-run",
+                "symbol": symbol,
+                "side": side_raw,
+                "position_size": position_size,
+                "signal_type": signal_type,
+                "accountId": account_id,
+            }
+        ), 200
 
-    # Apex 要求所有数字用字符串
-    size_str = str(position_size)
-    now_ts = int(time.time())
+    # 真正下单
+    side = side_raw or "BUY"
+    order_type = "MARKET" if order_type_raw == "MARKET" else order_type_raw
+    size = position_size
+    ts = int(time.time())
 
     try:
         order = client.create_order_v3(
-            symbol=norm_symbol,
+            symbol=symbol,
             side=side,
             type=order_type,
-            size=size_str,
-            timestampSeconds=now_ts,
+            size=size,
+            timestampSeconds=ts,
+            price="0",  # 市价单，价格字段会被忽略
         )
         print("✅ create_order_v3 ok in /webhook:", order)
-        return "ok", 200
+        return jsonify(
+            {
+                "status": "ok",
+                "accountId": account_id,
+                "order": order,
+            }
+        ), 200
     except Exception as e:
         print("❌ create_order_v3 failed in /webhook:", e)
-        return "error", 500
+        return jsonify(
+            {"status": "error", "where": "create_order_v3", "error": str(e)}
+        ), 500
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8080"))
+    port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
