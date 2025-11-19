@@ -1,84 +1,109 @@
-# app.py
-# ------------------------------------------------------------
-# Flask Webhook 接收 TradingView 信号，转发至 ApeX 主网
-# ------------------------------------------------------------
-
 import os
+import json
 from flask import Flask, request, jsonify
 
-from apex_client import create_market_order
+from apex_client import (
+    create_market_order,
+    create_limit_order,
+    get_account,
+)
 
 app = Flask(__name__)
 
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 ENABLE_LIVE_TRADING = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
 
+@app.route("/")
+def index():
+    return "Apex bot is running", 200
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    print("=" * 30, "WEBHOOK", "=" * 30)
+    print("================================ WEBHOOK ================================")
 
     try:
-        data = request.get_json(force=True)
+        data = request.get_json(force=True, silent=True) or {}
     except Exception as e:
-        print("[WEBHOOK] invalid JSON:", e)
-        return jsonify({"status": "error", "msg": "invalid json"}), 400
+        print("[WEBHOOK] failed to parse JSON:", repr(e))
+        return jsonify({"status": "error", "message": "invalid json"}), 400
 
     print("[WEBHOOK] raw body:", data)
 
-    # 1. 校验 secret
-    tv_secret = data.get("secret")
-    print("[WEBHOOK] secret from TV:", tv_secret)
+    # 1) 校验 secret
+    secret_from_tv = data.get("secret")
+    print("[WEBHOOK] secret from TV:", secret_from_tv)
     print("[WEBHOOK] expected secret:", WEBHOOK_SECRET)
 
-    if WEBHOOK_SECRET and tv_secret != WEBHOOK_SECRET:
-        print("[WEBHOOK] secret mismatch, ignore")
-        return jsonify({"status": "ignored", "msg": "bad secret"}), 401
+    if WEBHOOK_SECRET and secret_from_tv != WEBHOOK_SECRET:
+        print("[WEBHOOK] invalid secret, reject")
+        return jsonify({"status": "error", "message": "invalid secret"}), 403
 
-    # 2. 提取字段
-    symbol = data.get("symbol")
-    side = data.get("side")  # "BUY" / "SELL"
-    size = data.get("size")
-    price = data.get("price", None)
+    # 2) 解析 TradingView payload
+    bot_id      = data.get("bot_id")
+    action      = data.get("action")          # "open" / "close"
+    symbol      = data.get("symbol")          # 例如 "ZEC-USDT"
+    side        = data.get("side")            # "BUY" / "SELL"
+    size        = data.get("size")            # 数量(字符串)
+    order_type  = str(data.get("type", "MARKET")).upper()    # "MARKET" / "LIMIT"
+    leverage    = data.get("leverage")
+    client_id   = data.get("client_id")
+    reduce_only = bool(data.get("reduce_only", False))
+    signal_type = data.get("signal_type")     # "entry" / "exit"
+    live_flag   = bool(data.get("live", True))
+    price       = data.get("price")          # ★★ 新增：从 TV 直接拿当前价字符串
 
-    # 有些人会把 "None" 当字符串传，这里顺手处理一下
-    if price in ("None", "", "null"):
-        price = None
-
-    # payload 日志
-    payload_view = {
-        "symbol": symbol,
-        "side": side,
-        "size": str(size) if size is not None else None,
-        "price": price,
-        "live": ENABLE_LIVE_TRADING,
-    }
-    print("[WEBHOOK] payload OK:", payload_view)
+    print(f"[WEBHOOK] payload OK: {{'symbol': '{symbol}', 'side': '{side}', "
+          f"'size': '{size}', 'type': '{order_type}', 'price': '{price}', "
+          f"'reduce_only': {reduce_only}, 'signal_type': '{signal_type}'}}")
 
     if not ENABLE_LIVE_TRADING:
-        print("[WEBHOOK] ENABLE_LIVE_TRADING = false, simulate only")
-        return jsonify({"status": "ok", "live": False, "order": payload_view}), 200
+        print("[WEBHOOK] ENABLE_LIVE_TRADING = false -> 只打印，不真实下单")
+        return jsonify({"status": "ok", "live": False})
 
-    # 3. 真正下单
+    # live_flag 允许你以后从 Pine 里做一个开关
+    live = ENABLE_LIVE_TRADING and live_flag
+
+    # 3) 调用 Apex SDK 下单
     try:
-        resp = create_market_order(
-            symbol=symbol,
-            side=side,
-            size=size,
-            price=price,  # 这里如果是 None，apex_client 里面会自动不传给 Apex
-        )
-        print("[WEBHOOK] apex response:", resp)
-        return jsonify({"status": "ok", "live": True, "apex": resp}), 200
+        if order_type == "LIMIT":
+            res = create_limit_order(
+                symbol=symbol,
+                side=side,
+                size=size,
+                price=price,
+                reduce_only=reduce_only,
+                client_id=client_id,
+                live=live,
+            )
+        else:
+            # MARKET 单也必须带 price（Omni 要求 price 是 Decimal 字符串）
+            res = create_market_order(
+                symbol=symbol,
+                side=side,
+                size=size,
+                price=price,
+                reduce_only=reduce_only,
+                client_id=client_id,
+                live=live,
+            )
+
+        print("[WEBHOOK] order response from Apex:", res)
+        return jsonify({"status": "ok", "live": live, "apex": res}), 200
+
     except Exception as e:
         print("[WEBHOOK] error when sending order to Apex:", repr(e))
-        return jsonify({"status": "error", "msg": str(e)}), 500
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 
-@app.route("/", methods=["GET"])
-def index():
-    return "Apex bot running", 200
+@app.route("/account", methods=["GET"])
+def account():
+    try:
+        acc = get_account()
+        return jsonify({"status": "ok", "account": acc}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 
 if __name__ == "__main__":
-    # 本地测试用；DO 上不会跑到这里
+    # 方便本地测试；DO 上会由 gunicorn / buildpack 启动
     app.run(host="0.0.0.0", port=8080, debug=True)
