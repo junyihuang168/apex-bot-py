@@ -153,5 +153,4 @@ def webhook():
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
-    # 线上其实可以不开 debug；你现在 DO 日志里显示 debug on，是没关系的
     app.run(host="0.0.0.0", port=port)
