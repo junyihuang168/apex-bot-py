@@ -21,7 +21,7 @@ from apexomni.constants import (
 # 1. 环境变量读取 & 主网保护开关
 # ----------------------------------------------------------------------
 
-# 你 DO 里已经有这个变量，我们拿来当“主网确认开关”
+# DO 环境里：APEX_USE_MAINNET=true 才允许连主网
 APEX_USE_MAINNET = os.getenv("APEX_USE_MAINNET", "false").lower() == "true"
 
 if not APEX_USE_MAINNET:
