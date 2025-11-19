@@ -8,3 +8,4 @@ websockets
 web3
 ecdsa
 mpmath
+sympy
