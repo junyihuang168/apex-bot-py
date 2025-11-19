@@ -1,9 +1,10 @@
 apexomni>=3.0.8
 flask>=3.0.0
 
-# apex omni SDK 运行时需要的依赖
+# apex omni SDK 运行所需依赖
 requests
 websocket-client
 websockets
 web3
 ecdsa
+mpmath
