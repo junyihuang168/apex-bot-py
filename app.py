@@ -1,79 +1,157 @@
+# app.py
+# Flask Webhook 服务：
+# - GET  /        -> "OK"
+# - GET  /health  -> 测试 ApeX 连接（get_account）
+# - POST /webhook -> 接收 TradingView Webhook，下单到 ApeX
+
 import os
-import json
+from typing import Any, Dict
+
 from flask import Flask, request, jsonify
 
-# -------------------------------------------------
-# 创建 Flask 应用
-# -------------------------------------------------
+from apex_client import create_market_order, get_account
+
 app = Flask(__name__)
 
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+ENABLE_LIVE_TRADING = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
+DEFAULT_ORDER_SIZE = os.getenv("APEX_DEFAULT_ORDER_SIZE", "0.001")
 
-# -------------------------------------------------
-# 基础路由：根路径 + 健康检查
-# -------------------------------------------------
+
+# ----------------------------------------------------------------------
+# 根路由：简单健康检查
+# ----------------------------------------------------------------------
 @app.route("/", methods=["GET"])
-def index():
-    return jsonify({"status": "ok", "msg": "apex-bot webhook listener running"}), 200
+def root() -> tuple[str, int]:
+    return "OK", 200
 
 
+# ----------------------------------------------------------------------
+# /health：调用 get_account，看 ApeX 是否连通
+# ----------------------------------------------------------------------
 @app.route("/health", methods=["GET"])
 def health():
-    """
-    DigitalOcean / 本地自测用：返回简单的健康状态
-    """
-    return jsonify({"status": "ok"}), 200
+    try:
+        acc = get_account()
+        return jsonify({
+            "status": "ok",
+            "account": acc.get("data", {}),
+        }), 200
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+        }), 500
 
 
-# -------------------------------------------------
-# TradingView Webhook 路由（本地 + DO 通用）
-# -------------------------------------------------
+# ----------------------------------------------------------------------
+# /webhook：TradingView Webhook 入口
+# ----------------------------------------------------------------------
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """
-    接收 TradingView 警报：
-    - TradingView 那边填的 Webhook URL:  https://xxx.ngrok-free.dev/webhook  或 DO 的地址
-    - Pine 代码里 alert() 发送的是 JSON 字符串
-    这里统一当成 text 读进来，再自己 json.loads 解析
-    """
-
-    print("=" * 30, "WEBHOOK", "=" * 30)
-
-    # 1. 不管 Content-Type，先把原始 body 拿出来
+    # 1. 打印原始 body，方便 debug
     raw_body = request.get_data(as_text=True)
+    print("=" * 30, "WEBHOOK", "=" * 30)
     print("[WEBHOOK] raw body:", raw_body)
 
-    # 2. 尝试把 body 当成 JSON 解析（TradingView 一般是 text/plain + JSON 字符串）
+    # 2. 解析 JSON
+    data = request.get_json(silent=True)
+    if not data:
+        print("[WEBHOOK] error: invalid or empty JSON")
+        return jsonify({"error": "Invalid or empty JSON"}), 400
+
+    # 3. 校验 secret
+    incoming_secret = str(data.get("secret", ""))
+    print("[WEBHOOK] secret from TV:", incoming_secret)
+    print("[WEBHOOK] expected secret :", WEBHOOK_SECRET)
+
+    if WEBHOOK_SECRET and incoming_secret != WEBHOOK_SECRET:
+        print("[WEBHOOK] error: invalid secret")
+        return jsonify({"error": "Invalid secret"}), 403
+
+    # 4. 读取 symbol
+    symbol = data.get("symbol")
+    if not symbol:
+        print("[WEBHOOK] error: missing symbol")
+        return jsonify({"error": "Missing 'symbol' in payload"}), 400
+
+    # 5. 读取 side（优先用 side，没有就用 direction 推断）
+    side = data.get("side")
+    if not side:
+        direction = str(data.get("direction", "")).lower()
+        if direction in ("long", "buy"):
+            side = "BUY"
+        elif direction in ("short", "sell"):
+            side = "SELL"
+
+    if side not in ("BUY", "SELL"):
+        print("[WEBHOOK] error: invalid side/direction ->", side)
+        return jsonify({"error": "Missing or invalid 'side'/'direction'"}), 400
+
+    # 6. 读取 size
+    size_raw = data.get("size", DEFAULT_ORDER_SIZE)
     try:
-        payload = json.loads(raw_body)
+        size = str(float(size_raw))
+    except Exception:
+        print("[WEBHOOK] error: invalid size ->", size_raw)
+        return jsonify({"error": f"Invalid size value: {size_raw}"}), 400
+
+    # 7. 读取 price（可选，市价单可以不传）
+    price = data.get("price")
+    if price is not None:
+        try:
+            price = str(float(price))
+        except Exception:
+            print("[WEBHOOK] warn: invalid price ->", price, " -> treat as MARKET")
+            price = None
+
+    # 8. 组装本地订单信息，打印出来
+    order_payload: Dict[str, Any] = {
+        "symbol": symbol,
+        "side": side,
+        "size": size,
+        "price": price,
+        "live": ENABLE_LIVE_TRADING,
+    }
+    print("[WEBHOOK] payload OK:", order_payload)
+
+    # 9. 如果没开实盘，只模拟返回
+    if not ENABLE_LIVE_TRADING:
+        print("[WEBHOOK] ENABLE_LIVE_TRADING = false, simulate only")
+        return jsonify({
+            "status": "simulated",
+            "order": order_payload,
+        }), 200
+
+    # 10. 真正下单到 ApeX
+    try:
+        res = create_market_order(
+            symbol=symbol,
+            side=side,
+            size=size,
+            price=price,
+        )
+        print("[WEBHOOK] apex response:", res)
+
+        return jsonify({
+            "status": "ok",
+            "order": order_payload,
+            "apex_response": res,
+        }), 200
     except Exception as e:
-        print("[WEBHOOK] JSON parse error:", e)
-        # 解析失败，返回 400
-        return jsonify({"error": "bad json"}), 400
-
-    # 3. 校验 secret（Pine 输入框 & 服务器环境变量 WEBHOOK_SECRET 必须一致）
-    expected_secret = os.environ.get("WEBHOOK_SECRET")
-    recv_secret = payload.get("secret")
-
-    print("[WEBHOOK] secret from TV:", recv_secret)
-    print("[WEBHOOK] expected secret :", expected_secret)
-
-    if expected_secret and recv_secret != expected_secret:
-        print("[WEBHOOK] secret mismatch -> reject")
-        return jsonify({"error": "invalid secret"}), 400
-
-    # 4. 打印完整 payload（现在是 Demo 模式，不真正下单）
-    print("[WEBHOOK] payload OK:", payload)
-
-    # 👉 以后你想真正下单，再在这里解析 action / side / size，调用 Apex API 即可
-    #    目前只返回 200，说明收到了
-    return jsonify({"status": "ok"}), 200
+        print("[WEBHOOK] error when sending order to Apex:", e)
+        return jsonify({
+            "status": "error",
+            "order": order_payload,
+            "error": str(e),
+        }), 500
 
 
-# -------------------------------------------------
-# 启动方式（本地 & DO 通用）
-# -------------------------------------------------
+# ----------------------------------------------------------------------
+# 本地测试：python app.py
+# DO 上通常用 gunicorn app:app
+# ----------------------------------------------------------------------
 if __name__ == "__main__":
-    # DO 会给一个 PORT 环境变量，本地没有时默认 5000
-    port = int(os.environ.get("PORT", "5000"))
-    # 监听 0.0.0.0，方便本地 + DO + ngrok 都能访问
-    app.run(host="0.0.0.0", port=port, debug=True)
+    port = int(os.getenv("PORT", "8080"))
+    # 线上其实可以不开 debug；你现在 DO 日志里显示 debug on，是没关系的
+    app.run(host="0.0.0.0", port=port)
