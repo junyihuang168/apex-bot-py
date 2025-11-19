@@ -102,12 +102,14 @@ def get_market_price(symbol: str, side: str, size: str) -> str:
     side = side.upper()
     size_str = str(size)
 
+    # 调用官方 get_worst_price_v3
     res = http_v3_client.get_worst_price_v3(
         symbol=symbol,
         size=size_str,
         side=side,
     )
 
+    # 返回结构一般是: {'worstPrice': '123.00', 'bidOnePrice': '...', 'askOnePrice': '...'}
     price = None
     if isinstance(res, dict):
         if "worstPrice" in res:
@@ -127,7 +129,7 @@ def create_market_order(
     symbol: str,
     side: str,
     size: str,
-    reduce_only: bool = False,
+    reduce_only: bool = False,   # 先保留在我们自己这一层，不直接传给 SDK
     client_id: str | None = None,
 ):
     """
@@ -136,7 +138,7 @@ def create_market_order(
     - symbol: 例如 'BNB-USDT'
     - side: 'BUY' 或 'SELL'
     - size: 数量（字符串或数字）
-    - reduce_only: True 表示只减仓（用于平仓信号）
+    - reduce_only: True 表示只减仓（目前只体现在日志里，不直接传给 SDK）
     - client_id: 你从 TradingView 传来的 client_id；如果为空会自动生成一个。
     """
     client = get_client()
@@ -144,7 +146,7 @@ def create_market_order(
     side = side.upper()
     size_str = str(size)
 
-    # ★ 核心：先用官方 API 拿 worstPrice，当作市价单的 price
+    # ★ 先用官方 API 拿 worstPrice，当作市价单的 price
     price_str = get_market_price(symbol, side, size_str)
 
     ts = int(time.time())
@@ -166,6 +168,7 @@ def create_market_order(
         },
     )
 
+    # 关键：这里 **不再传 reduce_only**，否则 SDK 会报 TypeError
     order = client.create_order_v3(
         symbol=symbol,
         side=side,
@@ -173,7 +176,6 @@ def create_market_order(
         size=size_str,
         timestampSeconds=ts,
         price=price_str,
-        reduce_only=reduce_only,
         clientOrderId=client_id,
     )
 
