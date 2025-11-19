@@ -6,3 +6,4 @@ requests
 websocket-client
 websockets
 web3
+ecdsa
