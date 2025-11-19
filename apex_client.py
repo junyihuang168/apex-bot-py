@@ -51,6 +51,11 @@ def get_client() -> HttpPrivateSign:
     """
     返回带 zk 签名的 HttpPrivateSign 客户端，
     用于真正的下单（create_order_v3）。
+
+    这里模仿官方 demo：
+        1) new HttpPrivateSign(...)
+        2) client.configs_v3()
+        3) client.get_account_v3()
     """
     base_url, network_id = _get_base_and_network()
     api_creds = _get_api_credentials()
@@ -66,9 +71,17 @@ def get_client() -> HttpPrivateSign:
         api_key_credentials=api_creds,
     )
 
-    # ⚠ 很多官方 demo 都会先拉一次账户，把 accountV3 填进去
+    # ① 先拉 configs_v3，初始化 client.configV3
     try:
-        client.get_account_v3()
+        cfg = client.configs_v3()
+        print("[apex_client] configs_v3 ok:", cfg)
+    except Exception as e:
+        print("[apex_client] WARNING configs_v3 error:", e)
+
+    # ② 再拉 account_v3，初始化 client.accountV3
+    try:
+        acc = client.get_account_v3()
+        print("[apex_client] get_account_v3 ok:", acc)
     except Exception as e:
         print("[apex_client] WARNING get_account_v3 error:", e)
 
@@ -147,6 +160,19 @@ def create_market_order(
     - client_id: 你从 TradingView 传来的 client_id；如果为空会自动生成一个。
     """
     client = get_client()
+
+    # 再保险：如果某些版本没有提前创建属性，就在这里兜底一下
+    if not hasattr(client, "configV3"):
+        try:
+            client.configs_v3()
+        except Exception as e:
+            print("[apex_client] fallback configs_v3 error:", e)
+
+    if not hasattr(client, "accountV3"):
+        try:
+            client.get_account_v3()
+        except Exception as e:
+            print("[apex_client] fallback get_account_v3 error:", e)
 
     side = side.upper()
     size_str = str(size)
