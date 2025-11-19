@@ -1,4 +1,8 @@
-apexomni
-requests
+apexomni>=3.0.8
 flask>=3.0.0
-gunicorn
+
+# apex omni SDK 运行时需要的依赖
+requests
+websocket-client
+websockets
+web3
