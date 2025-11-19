@@ -3,42 +3,48 @@ import os
 import time
 import logging
 
-from apexomni.http_private_v3 import HttpPrivateSign
 from apexomni.constants import (
-    NETWORKID_MAIN,
     NETWORKID_TEST,
-    APEX_OMNI_HTTP_MAIN,
+    NETWORKID_MAIN,
     APEX_OMNI_HTTP_TEST,
+    APEX_OMNI_HTTP_MAIN,
 )
+from apexomni.http_private_v3 import HttpPrivate_v3  # 关键：用 HttpPrivate_v3，而不是 HttpPrivateSign
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# TEST 或 MAIN，通过 DO 的环境变量控制，不设默认 TEST
+APEX_ENV = os.getenv("APEX_ENV", "TEST").upper()
 
-# ---------- 创建底层 Http 客户端 ----------
-def _build_http_client():
-    use_mainnet = os.getenv("APEX_USE_MAINNET", "false").lower() == "true"
 
-    api_url = APEX_OMNI_HTTP_MAIN if use_mainnet else APEX_OMNI_HTTP_TEST
-    network_id = NETWORKID_MAIN if use_mainnet else NETWORKID_TEST
+def _build_client() -> HttpPrivate_v3:
+    """从环境变量里创建一个 HttpPrivate_v3 客户端"""
 
-    api_key = os.environ["APEX_API_KEY"]
-    api_secret = os.environ["APEX_API_SECRET"]
-    api_passphrase = os.environ["APEX_API_PASSPHRASE"]
-    zk_seeds = os.environ["APEX_ZK_SEEDS"]
-    zk_l2 = os.getenv("APEX_L2KEY_SEEDS", "")
+    api_key = os.getenv("APEX_API_KEY", "")
+    api_secret = os.getenv("APEX_API_SECRET", "")
+    api_passphrase = os.getenv("APEX_API_PASSPHRASE", "")
+    zk_seeds = os.getenv("APEX_ZK_SEEDS", "")
 
-    logger.info(
-        "[apex_client] init HttpPrivateSign use_mainnet=%s, api_url=%s",
-        use_mainnet,
-        api_url,
-    )
+    if not (api_key and api_secret and api_passphrase and zk_seeds):
+        raise RuntimeError(
+            "Missing Apex credentials: APEX_API_KEY / APEX_API_SECRET / "
+            "APEX_API_PASSPHRASE / APEX_ZK_SEEDS"
+        )
 
-    client = HttpPrivateSign(
-        api_url,
+    if APEX_ENV == "MAIN":
+        base_url = APEX_OMNI_HTTP_MAIN
+        network_id = NETWORKID_MAIN
+    else:
+        base_url = APEX_OMNI_HTTP_TEST
+        network_id = NETWORKID_TEST
+
+    logger.info("Init HttpPrivate_v3: env=%s, base_url=%s", APEX_ENV, base_url)
+
+    client = HttpPrivate_v3(
+        base_url,
         network_id=network_id,
         zk_seeds=zk_seeds,
-        zk_l2Key=zk_l2 if zk_l2 else None,
         api_key_credentials={
             "key": api_key,
             "secret": api_secret,
@@ -48,88 +54,62 @@ def _build_http_client():
     return client
 
 
-_http_client = None
+def get_account():
+    """给 app.py 调试用：返回账户信息"""
+    client = _build_client()
+    return client.get_account()
 
 
-def _get_client():
-    global _http_client
-    if _http_client is None:
-        _http_client = _build_http_client()
-    return _http_client
-
-
-# ---------- 小工具：把 TV 的符号改成 Apex 的 ----------
-def _normalize_symbol(symbol: str) -> str:
-    # TV 通常是 BNBUSDT，Apex 是 BNB-USDT
-    if "-" not in symbol and symbol.endswith("USDT"):
-        return symbol[:-4] + "-USDT"
-    return symbol
-
-
-# ---------- 下单（统一走 MARKET） ----------
-def create_market_order(
+def create_order(
     symbol: str,
     side: str,
+    order_type: str,
     size,
     price=None,
-    leverage: float = 1.0,
     reduce_only: bool = False,
-    client_id: str | None = None,
 ):
     """
-    使用 Apex omni http 私有接口创建市价单。
-    - symbol: 来自 TradingView 的 symbol（会自动转成 BNB-USDT 这种格式）
-    - side: 'BUY' or 'SELL'
-    - size: 你传过来的数量（我们会转成字符串）
-    - price: 从 TradingView JSON 里拿的 price（字符串或数字，允许为 None）
-    - leverage: 杠杆
-    - reduce_only: 是否只减仓
-    - client_id: 你从 TV 传过来的 client_id
+    通用下单封装，直接调用 HttpPrivate_v3.create_order(...)
+    symbol:  'BTC-USDT' / 'BNB-USDT' 之类
+    side:    'BUY' / 'SELL'
+    order_type: 'MARKET' / 'LIMIT'
+    size:    下单数量（字符串或数字）
+    price:   限价单价格（字符串或数字，市价单可以为 None）
     """
 
-    client = _get_client()
+    client = _build_client()
+
     ts = int(time.time())
-
-    symbol_norm = _normalize_symbol(symbol)
-    side_up = side.upper()
-
-    params = {
-        "symbol": symbol_norm,
-        "side": side_up,          # BUY / SELL
-        "type": "MARKET",
+    kwargs = {
+        "symbol": symbol,
+        "side": side.upper(),
+        "type": order_type.upper(),   # MARKET / LIMIT
         "size": str(size),
         "timestampSeconds": ts,
     }
 
-    # 只有有价格才传，避免 Decimal ConversionSyntax
-    if price not in (None, ""):
-        params["price"] = str(price)
+    if price is not None and order_type.upper() == "LIMIT":
+        kwargs["price"] = str(price)
 
-    params["reduceOnly"] = bool(reduce_only)
-    params["leverage"] = str(leverage)
-    params["clientId"] = client_id or f"tv-{symbol_norm}-{ts}"
+    # 有些版本支持 reduceOnly，有些不支持，如果不支持会在响应里报错，到时再看日志
+    if reduce_only:
+        kwargs["reduceOnly"] = True
 
-    logger.info("[apex_client] create_order params: %s", params)
-
-    # 兼容不同版本 SDK：优先用 create_order_v3，没有就退回 create_order
-    fn = getattr(client, "create_order_v3", None)
-    if fn is None:
-        fn = getattr(client, "create_order", None)
-    if fn is None:
-        raise AttributeError(
-            "Apex Http client has no 'create_order_v3' or 'create_order'"
-        )
-
-    return fn(**params)
+    logger.info("Sending order to Apex: %s", kwargs)
+    resp = client.create_order(**kwargs)
+    logger.info("Apex response: %s", resp)
+    return resp
 
 
-def get_account():
-    client = _get_client()
-    fn = getattr(client, "get_account_v3", None)
-    if fn is None:
-        fn = getattr(client, "get_account", None)
-    if fn is None:
-        raise AttributeError(
-            "Apex Http client has no 'get_account_v3' or 'get_account'"
-        )
-    return fn()
+def create_market_order(symbol: str, side: str, size, reduce_only: bool = False):
+    """
+    给 app.py 用的简单封装：统一走市价单。
+    """
+    return create_order(
+        symbol=symbol,
+        side=side,
+        order_type="MARKET",
+        size=size,
+        price=None,
+        reduce_only=reduce_only,
+    )
