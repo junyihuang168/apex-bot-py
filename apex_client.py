@@ -21,10 +21,14 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def _get_base_and_network():
-    """根据环境变量决定用 mainnet 还是 testnet。"""
+    """
+    根据环境变量决定用 mainnet 还是 testnet。
+
+    - APEX_USE_MAINNET=true 切到主网
+    - 或者 APEX_ENV=main / mainnet / prod / production 也视为主网
+    """
     use_mainnet = _env_bool("APEX_USE_MAINNET", False)
 
-    # 兼容你额外加的 APEX_ENV=main
     env_name = os.getenv("APEX_ENV", "").lower()
     if env_name in ("main", "mainnet", "prod", "production"):
         use_mainnet = True
@@ -44,7 +48,7 @@ def _get_api_credentials():
 
 
 # ---------------------------
-# 创建 ApeX 客户端
+# 创建 ApeX 客户端（带 zk 签名，用于真实下单）
 # ---------------------------
 
 def get_client() -> HttpPrivateSign:
@@ -90,7 +94,7 @@ def get_market_price(symbol: str, side: str, size: str) -> str:
     base_url, network_id = _get_base_and_network()
     api_creds = _get_api_credentials()
 
-    # 这里不用 zk 签名，只需要 API key，所以用 HttpPrivate_v3。
+    # 注意：这里用的是 HttpPrivate_v3（仅 API Key，不需要 zk）
     from apexomni.http_private_v3 import HttpPrivate_v3
 
     http_v3_client = HttpPrivate_v3(
@@ -102,14 +106,12 @@ def get_market_price(symbol: str, side: str, size: str) -> str:
     side = side.upper()
     size_str = str(size)
 
-    # 调用官方 get_worst_price_v3
     res = http_v3_client.get_worst_price_v3(
         symbol=symbol,
         size=size_str,
         side=side,
     )
 
-    # 返回结构一般是: {'worstPrice': '123.00', 'bidOnePrice': '...', 'askOnePrice': '...'}
     price = None
     if isinstance(res, dict):
         if "worstPrice" in res:
@@ -121,7 +123,9 @@ def get_market_price(symbol: str, side: str, size: str) -> str:
         raise RuntimeError(f"[apex_client] get_worst_price_v3 返回异常: {res}")
 
     price_str = str(price)
-    print(f"[apex_client] worst price for {symbol} {side} size={size_str}: {price_str}")
+    print(
+        f"[apex_client] worst price for {symbol} {side} size={size_str}: {price_str}"
+    )
     return price_str
 
 
@@ -129,7 +133,7 @@ def create_market_order(
     symbol: str,
     side: str,
     size: str,
-    reduce_only: bool = False,   # 先保留在我们自己这一层，不直接传给 SDK
+    reduce_only: bool = False,   # 目前只是记录在日志，不传给 Apex
     client_id: str | None = None,
 ):
     """
@@ -138,15 +142,15 @@ def create_market_order(
     - symbol: 例如 'BNB-USDT'
     - side: 'BUY' 或 'SELL'
     - size: 数量（字符串或数字）
-    - reduce_only: True 表示只减仓（目前只体现在日志里，不直接传给 SDK）
-    - client_id: 你从 TradingView 传来的 client_id；如果为空会自动生成一个。
+    - reduce_only: 目前只用于日志，不会传给 create_order_v3
+    - client_id: 你从 TradingView 传来的 client_id；目前也不传给 SDK，只打印出来
     """
     client = get_client()
 
     side = side.upper()
     size_str = str(size)
 
-    # ★ 先用官方 API 拿 worstPrice，当作市价单的 price
+    # ★ 核心：先用官方 API 拿 worstPrice，当作市价单的 price
     price_str = get_market_price(symbol, side, size_str)
 
     ts = int(time.time())
@@ -168,7 +172,10 @@ def create_market_order(
         },
     )
 
-    # 关键：这里 **不再传 reduce_only**，否则 SDK 会报 TypeError
+    # ==============================
+    # 关键：这里完全按官方 Demo 调用 SDK
+    # 不再传 reduce_only / clientOrderId
+    # ==============================
     order = client.create_order_v3(
         symbol=symbol,
         side=side,
@@ -176,7 +183,6 @@ def create_market_order(
         size=size_str,
         timestampSeconds=ts,
         price=price_str,
-        clientOrderId=client_id,
     )
 
     print("[apex_client] order response:", order)
