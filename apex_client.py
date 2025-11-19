@@ -1,170 +1,147 @@
-# apex_client.py
-# 方案 A：只用 Omni seeds，l2Key 允许为空字符串 ''
-# 使用 apexomni 官方 SDK（apexpro-openapi / apexomni）
+# app.py
+# 简单 Flask 服务：
+# - GET  /        -> "OK"
+# - GET  /health  -> 测试 ApeX 连接（get_account）
+# - POST /webhook -> 接 TradingView webhook，下单到 ApeX
 
 import os
-import time
 from typing import Any, Dict
 
-from apexomni.http_private_v3 import HttpPrivateSign
-from apexomni.constants import (
-    # Testnet
-    APEX_OMNI_HTTP_TEST,
-    NETWORKID_OMNI_TEST_BNB,
-    # Mainnet
-    APEX_OMNI_HTTP_MAIN,
-    NETWORKID_OMNI_MAIN_ARB,
-)
+from flask import Flask, request, jsonify
 
-# ----------------------------------------------------------------------
-# 1. 读取环境变量
-# ----------------------------------------------------------------------
+from apex_client import create_market_order, get_account
 
-# 环境：test = 测试网，main = 主网
-APEX_ENV = os.getenv("APEX_ENV", "test").lower()
+app = Flask(__name__)
 
-if APEX_ENV == "main":
-    BASE_URL = APEX_OMNI_HTTP_MAIN
-    NETWORK_ID = NETWORKID_OMNI_MAIN_ARB
-else:
-    # 默认走测试网
-    BASE_URL = APEX_OMNI_HTTP_TEST
-    NETWORK_ID = NETWORKID_OMNI_TEST_BNB
+# 从环境变量读取配置
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+ENABLE_LIVE_TRADING = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
 
-API_KEY = os.getenv("APEX_API_KEY")
-API_SECRET = os.getenv("APEX_API_SECRET")
-API_PASSPHRASE = os.getenv("APEX_API_PASSPHRASE")
-
-# 必须有的 zk seeds（Omni Key）
-ZK_SEEDS = os.getenv("APEX_ZK_SEEDS")
-
-# l2Key 可以为空，我们默认给 ''
-L2KEY_SEEDS = os.getenv("APEX_L2KEY_SEEDS", "") or ""
-
-# ----------------------------------------------------------------------
-# 2. 基本检查（缺少任何关键参数，直接抛异常）
-# ----------------------------------------------------------------------
-
-
-def _check_env() -> None:
-    missing = []
-    if not API_KEY:
-        missing.append("APEX_API_KEY")
-    if not API_SECRET:
-        missing.append("APEX_API_SECRET")
-    if not API_PASSPHRASE:
-        missing.append("APEX_API_PASSPHRASE")
-    if not ZK_SEEDS:
-        missing.append("APEX_ZK_SEEDS")
-
-    if missing:
-        # 这里抛出异常，在 DO 日志里会一眼看到缺什么
-        raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
+# 默认下单数量（如果 webhook 里没带 size，就用这个）
+# 例如你想固定 0.001 BTC，可以在 DO 里设 APEX_DEFAULT_ORDER_SIZE=0.001
+DEFAULT_ORDER_SIZE = os.getenv("APEX_DEFAULT_ORDER_SIZE", "0.001")
 
 
 # ----------------------------------------------------------------------
-# 3. 初始化 HttpPrivateSign 客户端（只用 seeds，l2Key 为空也可）
-#    官方 README 原话：l2Key not shown in keyManagement; set to '' (empty)
+# 根路由：健康检查
 # ----------------------------------------------------------------------
+@app.route("/", methods=["GET"])
+def root() -> tuple[str, int]:
+    return "OK", 200
 
-
-def init_client() -> HttpPrivateSign:
-    """
-    初始化 ApeX Omni HttpPrivateSign 客户端。
-    使用：
-        - BASE_URL / NETWORK_ID 根据 APEX_ENV 决定 test/main
-        - zk_seeds 使用 Omni Key seeds
-        - zk_l2Key 允许为空字符串 ''
-    """
-    _check_env()
-
-    client = HttpPrivateSign(
-        BASE_URL,
-        network_id=NETWORK_ID,
-        zk_seeds=ZK_SEEDS,
-        zk_l2Key=L2KEY_SEEDS,  # 方案 A：这里可以是 ''
-        api_key_credentials={
-            "key": API_KEY,
-            "secret": API_SECRET,
-            "passphrase": API_PASSPHRASE,
-        },
-    )
-
-    # 官方 Best Practice 要求：用私有接口前要先 configs_v3() 一次
-    client.configs_v3()
-
-    return client
-
-
-# 全局复用的 client 实例
-client: HttpPrivateSign = init_client()
 
 # ----------------------------------------------------------------------
-# 4. 封装几个简单的调用（方便其他文件直接 import 使用）
+# /health：调用 get_account，看 ApeX 是否连通
 # ----------------------------------------------------------------------
+@app.route("/health", methods=["GET"])
+def health():
+    try:
+        acc = get_account()
+        return jsonify({
+            "status": "ok",
+            "account": acc.get("data", {}),
+        }), 200
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+        }), 500
 
 
-def get_account() -> Dict[str, Any]:
-    """
-    获取账户信息，用来测试连通性。
-    等价于官方 demo 里的 client.get_account_v3()
-    """
-    return client.get_account_v3()
+# ----------------------------------------------------------------------
+# /webhook：TradingView Webhook 入口
+# ----------------------------------------------------------------------
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    # 1. 解析 JSON
+    data = request.get_json(silent=True) or {}
+    if not data:
+        return jsonify({"error": "No JSON payload received"}), 400
 
+    # 2. 校验 secret（TradingView 发送的 JSON 里要有同样的 secret）
+    incoming_secret = str(data.get("secret", ""))
+    if WEBHOOK_SECRET and incoming_secret != WEBHOOK_SECRET:
+        return jsonify({"error": "Invalid secret"}), 403
 
-def get_balances() -> Dict[str, Any]:
-    """
-    获取账户余额信息。
-    """
-    return client.get_account_balance_v3()
+    # 3. 读取 symbol
+    # 建议你在 TradingView 的 JSON 里直接写 "symbol": "BTC-USDT" 之类
+    symbol = data.get("symbol")
+    if not symbol:
+        return jsonify({"error": "Missing 'symbol' in payload"}), 400
 
+    # 4. 读取 side（支持两种字段：side / direction）
+    #    - side: "BUY" / "SELL"
+    #    - direction: "long"/"short"/"buy"/"sell"
+    side = data.get("side")
+    if not side:
+        direction = str(data.get("direction", "")).lower()
+        if direction in ("long", "buy"):
+            side = "BUY"
+        elif direction in ("short", "sell"):
+            side = "SELL"
 
-def create_market_order(
-    symbol: str,
-    side: str,
-    size: str,
-    price: str | None = None,
-) -> Dict[str, Any]:
-    """
-    创建一个简单的市价单（官方 create_order_v3 的封装）
-    - symbol: 例如 "BTC-USDT"
-    - side:   "BUY" 或 "SELL"
-    - size:   例如 "0.001"
-    - price:  市价单可以不传，如果你想传一个参考价就传字符串
+    if side not in ("BUY", "SELL"):
+        return jsonify({"error": "Missing or invalid 'side'/'direction'"}), 400
 
-    注意：这里是示例，你的 TradingView Webhook 那边可以再做一层封装。
-    """
-    ts = int(time.time())
+    # 5. 读取 size（如果 webhook 没填，就用默认值）
+    size_raw = data.get("size", DEFAULT_ORDER_SIZE)
+    try:
+        size = str(float(size_raw))  # 转成字符串，确保是数字
+    except Exception:
+        return jsonify({"error": f"Invalid size value: {size_raw}"}), 400
 
-    params: Dict[str, Any] = {
+    # 6. 读取 price（可选；市价单其实可以不传）
+    price = data.get("price")
+    if price is not None:
+        try:
+            price = str(float(price))
+        except Exception:
+            # 传了但不合法，就忽略当市价
+            price = None
+
+    # 7. 组装一下我们这边看到的订单信息，方便日志
+    payload: Dict[str, Any] = {
         "symbol": symbol,
         "side": side,
-        "type": "MARKET",
         "size": size,
-        "timestampSeconds": ts,
+        "price": price,
+        "live": ENABLE_LIVE_TRADING,
     }
-    if price is not None:
-        params["price"] = str(price)
 
-    return client.create_order_v3(**params)
+    # 8. 如果没开实盘，就只做“模拟”——不真正下单，只返回 payload
+    if not ENABLE_LIVE_TRADING:
+        return jsonify({
+            "status": "simulated",
+            "message": "ENABLE_LIVE_TRADING is false, not sending order to ApeX",
+            "order": payload,
+        }), 200
+
+    # 9. 真正发送订单到 ApeX
+    try:
+        res = create_market_order(
+            symbol=symbol,
+            side=side,
+            size=size,
+            price=price,
+        )
+        return jsonify({
+            "status": "ok",
+            "order": payload,
+            "apex_response": res,
+        }), 200
+    except Exception as e:
+        # 报错也返回 payload，方便你在 DO 日志里对照问题
+        return jsonify({
+            "status": "error",
+            "order": payload,
+            "error": str(e),
+        }), 500
 
 
 # ----------------------------------------------------------------------
-# 5. 本文件直接运行时的小测试（可选）
-#    本地 / DO console 里 python apex_client.py 看效果
+# 本地测试直接运行：python app.py
+# DO 上通常会用 gunicorn app:app
 # ----------------------------------------------------------------------
-
-
-def _self_test() -> None:
-    print(f"[apex_client] ENV = {APEX_ENV}, BASE_URL = {BASE_URL}, NETWORK_ID = {NETWORK_ID}")
-    print("[apex_client] Testing configs_v3 & get_account_v3 ...")
-
-    cfg = client.configs_v3()
-    print("[apex_client] configs_v3 OK, symbols:", len(cfg.get("data", {}).get("symbols", [])))
-
-    acc = client.get_account_v3()
-    print("[apex_client] get_account_v3 OK, account id:", acc.get("data", {}).get("account", {}).get("id"))
-
-
 if __name__ == "__main__":
-    _self_test()
+    port = int(os.getenv("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port)
