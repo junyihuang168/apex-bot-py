@@ -11,7 +11,8 @@ import os
 import time
 from typing import Any, Dict
 
-from apexomni.http_private_v3 import HttpPrivateSign
+# ✅ 关键改动在这里：用 http_private_sign，而不是 http_private_v3
+from apexomni.http_private_sign import HttpPrivateSign
 from apexomni.constants import (
     APEX_OMNI_HTTP_MAIN,
     NETWORKID_OMNI_MAIN_ARB,
