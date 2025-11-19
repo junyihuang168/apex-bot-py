@@ -1,7 +1,7 @@
 apexomni>=3.0.8
 flask>=3.0.0
 
-# apex omni SDK 运行所需依赖（都是 SDK 代码里 import 到的）
+# apex omni SDK 运行所需依赖（都是它内部 import 的）
 requests
 websocket-client
 websockets
@@ -10,3 +10,4 @@ ecdsa
 mpmath
 sympy==1.10.1
 python-dateutil
+numpy
