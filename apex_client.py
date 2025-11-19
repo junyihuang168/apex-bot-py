@@ -1,147 +1,177 @@
-# app.py
-# 简单 Flask 服务：
-# - GET  /        -> "OK"
-# - GET  /health  -> 测试 ApeX 连接（get_account）
-# - POST /webhook -> 接 TradingView webhook，下单到 ApeX
+# apex_client.py
+# 主网专用版本（ApeX Omni Mainnet）
+# ------------------------------------------------------------
+# 重要：
+#   - 只连接 ApeX 主网 (APEX_OMNI_HTTP_MAIN / NETWORKID_OMNI_MAIN_ARB)
+#   - 必须设置 APEX_USE_MAINNET=true，否则拒绝初始化
+#   - 使用 Omni Key seeds (APEX_ZK_SEEDS)，l2Key 允许为空字符串 ''
+# ------------------------------------------------------------
 
 import os
+import time
 from typing import Any, Dict
 
-from flask import Flask, request, jsonify
+from apexomni.http_private_v3 import HttpPrivateSign
+from apexomni.constants import (
+    APEX_OMNI_HTTP_MAIN,
+    NETWORKID_OMNI_MAIN_ARB,
+)
 
-from apex_client import create_market_order, get_account
+# ----------------------------------------------------------------------
+# 1. 环境变量读取 & 主网保护开关
+# ----------------------------------------------------------------------
 
-app = Flask(__name__)
+# 你 DO 里已经有这个变量，我们拿来当“主网确认开关”
+APEX_USE_MAINNET = os.getenv("APEX_USE_MAINNET", "false").lower() == "true"
 
-# 从环境变量读取配置
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
-ENABLE_LIVE_TRADING = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
+if not APEX_USE_MAINNET:
+    raise RuntimeError(
+        "APEX_USE_MAINNET is not 'true'. "
+        "This apex_client.py is MAINNET-ONLY. "
+        "If you really want to use Apex mainnet, set APEX_USE_MAINNET=true in your environment."
+    )
 
-# 默认下单数量（如果 webhook 里没带 size，就用这个）
-# 例如你想固定 0.001 BTC，可以在 DO 里设 APEX_DEFAULT_ORDER_SIZE=0.001
-DEFAULT_ORDER_SIZE = os.getenv("APEX_DEFAULT_ORDER_SIZE", "0.001")
+# ApeX 主网基础配置
+BASE_URL = APEX_OMNI_HTTP_MAIN
+NETWORK_ID = NETWORKID_OMNI_MAIN_ARB
+
+# API key 三件套（在 Omni 主网 keyManagement 里生成）
+API_KEY = os.getenv("APEX_API_KEY")
+API_SECRET = os.getenv("APEX_API_SECRET")
+API_PASSPHRASE = os.getenv("APEX_API_PASSPHRASE")
+
+# 必填：Omni Key seeds（主网的那一串）
+ZK_SEEDS = os.getenv("APEX_ZK_SEEDS")
+
+# 可选：l2Key seeds（可以留空，方案 A）
+L2KEY_SEEDS = os.getenv("APEX_L2KEY_SEEDS", "") or ""
+
+# ----------------------------------------------------------------------
+# 2. 基本检查（缺啥就直接抛异常）
+# ----------------------------------------------------------------------
+
+
+def _check_env() -> None:
+    missing = []
+    if not API_KEY:
+        missing.append("APEX_API_KEY")
+    if not API_SECRET:
+        missing.append("APEX_API_SECRET")
+    if not API_PASSPHRASE:
+        missing.append("APEX_API_PASSPHRASE")
+    if not ZK_SEEDS:
+        missing.append("APEX_ZK_SEEDS")
+
+    if missing:
+        raise RuntimeError(
+            f"[apex_client] Missing required environment variables for MAINNET: {', '.join(missing)}"
+        )
 
 
 # ----------------------------------------------------------------------
-# 根路由：健康检查
+# 3. 初始化 HttpPrivateSign（主网）
 # ----------------------------------------------------------------------
-@app.route("/", methods=["GET"])
-def root() -> tuple[str, int]:
-    return "OK", 200
 
+
+def init_client() -> HttpPrivateSign:
+    """
+    初始化 ApeX Omni 主网 HttpPrivateSign 客户端。
+
+    - 使用主网 BASE_URL / NETWORK_ID
+    - 使用 Omni 主网的 ZK_SEEDS
+    - L2KEY_SEEDS 允许为空字符串 ''
+    """
+    _check_env()
+
+    client = HttpPrivateSign(
+        BASE_URL,
+        network_id=NETWORK_ID,
+        zk_seeds=ZK_SEEDS,
+        zk_l2Key=L2KEY_SEEDS,  # 方案 A：允许为空字符串
+        api_key_credentials={
+            "key": API_KEY,
+            "secret": API_SECRET,
+            "passphrase": API_PASSPHRASE,
+        },
+    )
+
+    # 官方建议：使用私有接口前先 configs_v3()
+    client.configs_v3()
+
+    return client
+
+
+# 全局客户端实例（被 app.py 等文件复用）
+client: HttpPrivateSign = init_client()
 
 # ----------------------------------------------------------------------
-# /health：调用 get_account，看 ApeX 是否连通
+# 4. 封装常用调用
 # ----------------------------------------------------------------------
-@app.route("/health", methods=["GET"])
-def health():
-    try:
-        acc = get_account()
-        return jsonify({
-            "status": "ok",
-            "account": acc.get("data", {}),
-        }), 200
-    except Exception as e:
-        return jsonify({
-            "status": "error",
-            "error": str(e),
-        }), 500
 
 
-# ----------------------------------------------------------------------
-# /webhook：TradingView Webhook 入口
-# ----------------------------------------------------------------------
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    # 1. 解析 JSON
-    data = request.get_json(silent=True) or {}
-    if not data:
-        return jsonify({"error": "No JSON payload received"}), 400
+def get_account() -> Dict[str, Any]:
+    """
+    获取账户信息（主网）。
+    """
+    return client.get_account_v3()
 
-    # 2. 校验 secret（TradingView 发送的 JSON 里要有同样的 secret）
-    incoming_secret = str(data.get("secret", ""))
-    if WEBHOOK_SECRET and incoming_secret != WEBHOOK_SECRET:
-        return jsonify({"error": "Invalid secret"}), 403
 
-    # 3. 读取 symbol
-    # 建议你在 TradingView 的 JSON 里直接写 "symbol": "BTC-USDT" 之类
-    symbol = data.get("symbol")
-    if not symbol:
-        return jsonify({"error": "Missing 'symbol' in payload"}), 400
+def get_balances() -> Dict[str, Any]:
+    """
+    获取账户余额信息（主网）。
+    """
+    return client.get_account_balance_v3()
 
-    # 4. 读取 side（支持两种字段：side / direction）
-    #    - side: "BUY" / "SELL"
-    #    - direction: "long"/"short"/"buy"/"sell"
-    side = data.get("side")
-    if not side:
-        direction = str(data.get("direction", "")).lower()
-        if direction in ("long", "buy"):
-            side = "BUY"
-        elif direction in ("short", "sell"):
-            side = "SELL"
 
-    if side not in ("BUY", "SELL"):
-        return jsonify({"error": "Missing or invalid 'side'/'direction'"}), 400
+def create_market_order(
+    symbol: str,
+    side: str,
+    size: str,
+    price: str | None = None,
+) -> Dict[str, Any]:
+    """
+    在 ApeX 主网创建一个简单的市价单。
 
-    # 5. 读取 size（如果 webhook 没填，就用默认值）
-    size_raw = data.get("size", DEFAULT_ORDER_SIZE)
-    try:
-        size = str(float(size_raw))  # 转成字符串，确保是数字
-    except Exception:
-        return jsonify({"error": f"Invalid size value: {size_raw}"}), 400
+    参数：
+        symbol: 例如 "BTC-USDT"（务必用 ApeX 主网上的合约代码）
+        side  : "BUY" 或 "SELL"
+        size  : 例如 "0.001"
+        price : 可选，市价单可以不传，如果传就当作参考价字符串
+    """
+    ts = int(time.time())
 
-    # 6. 读取 price（可选；市价单其实可以不传）
-    price = data.get("price")
-    if price is not None:
-        try:
-            price = str(float(price))
-        except Exception:
-            # 传了但不合法，就忽略当市价
-            price = None
-
-    # 7. 组装一下我们这边看到的订单信息，方便日志
-    payload: Dict[str, Any] = {
+    params: Dict[str, Any] = {
         "symbol": symbol,
         "side": side,
+        "type": "MARKET",
         "size": size,
-        "price": price,
-        "live": ENABLE_LIVE_TRADING,
+        "timestampSeconds": ts,
     }
+    if price is not None:
+        params["price"] = str(price)
 
-    # 8. 如果没开实盘，就只做“模拟”——不真正下单，只返回 payload
-    if not ENABLE_LIVE_TRADING:
-        return jsonify({
-            "status": "simulated",
-            "message": "ENABLE_LIVE_TRADING is false, not sending order to ApeX",
-            "order": payload,
-        }), 200
-
-    # 9. 真正发送订单到 ApeX
-    try:
-        res = create_market_order(
-            symbol=symbol,
-            side=side,
-            size=size,
-            price=price,
-        )
-        return jsonify({
-            "status": "ok",
-            "order": payload,
-            "apex_response": res,
-        }), 200
-    except Exception as e:
-        # 报错也返回 payload，方便你在 DO 日志里对照问题
-        return jsonify({
-            "status": "error",
-            "order": payload,
-            "error": str(e),
-        }), 500
+    return client.create_order_v3(**params)
 
 
 # ----------------------------------------------------------------------
-# 本地测试直接运行：python app.py
-# DO 上通常会用 gunicorn app:app
+# 5. 自测：本地 / DO console 里可以直接 python apex_client.py 看主网连通性
 # ----------------------------------------------------------------------
+
+
+def _self_test() -> None:
+    print(f"[apex_client] MAINNET MODE ENABLED: {APEX_USE_MAINNET}")
+    print(f"[apex_client] BASE_URL = {BASE_URL}, NETWORK_ID = {NETWORK_ID}")
+
+    cfg = client.configs_v3()
+    print(
+        "[apex_client] configs_v3 OK, symbols:",
+        len(cfg.get("data", {}).get("symbols", [])),
+    )
+
+    acc = client.get_account_v3()
+    account_id = acc.get("data", {}).get("account", {}).get("id")
+    print("[apex_client] get_account_v3 OK, account id:", account_id)
+
+
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8080"))
-    app.run(host="0.0.0.0", port=port)
+    _self_test()
