@@ -21,14 +21,10 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def _get_base_and_network():
-    """
-    根据环境变量决定用 mainnet 还是 testnet。
-
-    - APEX_USE_MAINNET=true 切到主网
-    - 或者 APEX_ENV=main / mainnet / prod / production 也视为主网
-    """
+    """根据环境变量决定用 mainnet 还是 testnet。"""
     use_mainnet = _env_bool("APEX_USE_MAINNET", False)
 
+    # 兼容你额外加的 APEX_ENV=main
     env_name = os.getenv("APEX_ENV", "").lower()
     if env_name in ("main", "mainnet", "prod", "production"):
         use_mainnet = True
@@ -48,7 +44,7 @@ def _get_api_credentials():
 
 
 # ---------------------------
-# 创建 ApeX 客户端（带 zk 签名，用于真实下单）
+# 创建 ApeX 客户端（按官方 demo 的逻辑，初始化就拉一次账户）
 # ---------------------------
 
 def get_client() -> HttpPrivateSign:
@@ -69,6 +65,17 @@ def get_client() -> HttpPrivateSign:
         zk_l2Key=zk_l2,
         api_key_credentials=api_creds,
     )
+
+    # ★ 关键：按官方 demo 的做法，先拉一次账户信息，
+    # 这样内部会给 client 挂上 self.accountV3，后面 create_order_v3 就不会报错了。
+    client.accountV3 = {}  # 先给一个空 dict，保证属性一定存在
+    try:
+        acc = client.get_account_v3() or {}
+        client.accountV3 = acc
+        print("[apex_client] accountV3 cached:", acc)
+    except Exception as e:
+        print("[apex_client] WARNING get_account_v3 failed:", e)
+
     return client
 
 
@@ -79,7 +86,7 @@ def get_client() -> HttpPrivateSign:
 def get_account():
     """查询账户信息，方便你在本地或日志里调试。"""
     client = get_client()
-    return client.get_account_v3()
+    return client.accountV3
 
 
 def get_market_price(symbol: str, side: str, size: str) -> str:
@@ -94,7 +101,8 @@ def get_market_price(symbol: str, side: str, size: str) -> str:
     base_url, network_id = _get_base_and_network()
     api_creds = _get_api_credentials()
 
-    # 注意：这里用的是 HttpPrivate_v3（仅 API Key，不需要 zk）
+    # 这里不用 zk 签名，只需要 API key，所以用 HttpPrivate_v3。
+    # 为了兼容性，把 import 放在函数里。
     from apexomni.http_private_v3 import HttpPrivate_v3
 
     http_v3_client = HttpPrivate_v3(
@@ -106,12 +114,14 @@ def get_market_price(symbol: str, side: str, size: str) -> str:
     side = side.upper()
     size_str = str(size)
 
+    # 调用官方 get_worst_price_v3
     res = http_v3_client.get_worst_price_v3(
         symbol=symbol,
         size=size_str,
         side=side,
     )
 
+    # 返回结构一般是: {'worstPrice': '123.00', 'bidOnePrice': '...', 'askOnePrice': '...'}
     price = None
     if isinstance(res, dict):
         if "worstPrice" in res:
@@ -120,6 +130,7 @@ def get_market_price(symbol: str, side: str, size: str) -> str:
             price = res["data"]["worstPrice"]
 
     if price is None:
+        # 如果接口返回结构有变，这里会把信息打进日志，方便你排查
         raise RuntimeError(f"[apex_client] get_worst_price_v3 返回异常: {res}")
 
     price_str = str(price)
@@ -133,7 +144,7 @@ def create_market_order(
     symbol: str,
     side: str,
     size: str,
-    reduce_only: bool = False,   # 目前只是记录在日志，不传给 Apex
+    reduce_only: bool = False,
     client_id: str | None = None,
 ):
     """
@@ -142,8 +153,8 @@ def create_market_order(
     - symbol: 例如 'BNB-USDT'
     - side: 'BUY' 或 'SELL'
     - size: 数量（字符串或数字）
-    - reduce_only: 目前只用于日志，不会传给 create_order_v3
-    - client_id: 你从 TradingView 传来的 client_id；目前也不传给 SDK，只打印出来
+    - reduce_only: True 表示只减仓（用于平仓信号）
+    - client_id: 你从 TradingView 传来的 client_id；如果为空会自动生成一个。
     """
     client = get_client()
 
@@ -158,24 +169,22 @@ def create_market_order(
         safe_symbol = symbol.replace("/", "-")
         client_id = f"tv-{safe_symbol}-{ts}"
 
-    print(
-        "[apex_client] create_market_order params:",
-        {
-            "symbol": symbol,
-            "side": side,
-            "type": "MARKET",
-            "size": size_str,
-            "price": price_str,
-            "reduce_only": reduce_only,
-            "clientOrderId": client_id,
-            "timestampSeconds": ts,
-        },
-    )
+    params = {
+        "symbol": symbol,
+        "side": side,
+        "type": "MARKET",
+        "size": size_str,
+        "price": price_str,
+        "reduce_only": reduce_only,
+        # 这些字段只是打印，真正下单时只传 SDK 支持的参数
+        "clientOrderId": client_id,
+        "timestampSeconds": ts,
+    }
+    print("[apex_client] create_market_order params:", params)
 
-    # ==============================
-    # 关键：这里完全按官方 Demo 调用 SDK
-    # 不再传 reduce_only / clientOrderId
-    # ==============================
+    # ⚠️ 注意：根据你之前的报错，Python 版 SDK 的 create_order_v3
+    # 并不接受 clientOrderId / accountId 这些 keyword argument，
+    # 所以这里只传官方 Demo 里肯定支持的字段。
     order = client.create_order_v3(
         symbol=symbol,
         side=side,
@@ -183,6 +192,7 @@ def create_market_order(
         size=size_str,
         timestampSeconds=ts,
         price=price_str,
+        reduce_only=reduce_only,
     )
 
     print("[apex_client] order response:", order)
