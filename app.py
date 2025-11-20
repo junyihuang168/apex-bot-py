@@ -1,85 +1,71 @@
 import os
-import logging
 from flask import Flask, request, jsonify
 
-from apex_client import (
-    create_market_order,
-    get_account,
-)
+from apex_client import create_market_order, get_account
 
 app = Flask(__name__)
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# 和 DO 的环境变量 WEBHOOK_SECRET 保持一致
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 
 
-@app.route("/")
-def index():
-    return "Apex bot alive", 200
+@app.route("/health", methods=["GET"])
+def health():
+    return "ok", 200
+
+
+@app.route("/account", methods=["GET"])
+def account():
+    try:
+        info = get_account()
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+    return jsonify(info)
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    # 1. 解析 JSON
-    try:
-        data = request.get_json(force=True)
-    except Exception as e:
-        logger.exception("[WEBHOOK] invalid json")
-        return jsonify({"ok": False, "error": "invalid json"}), 400
+    data = request.get_json(force=True, silent=True) or {}
+    print("[WEBHOOK] raw body:", data)
 
-    logger.info("[WEBHOOK] raw body: %s", data)
+    # 1）校验 secret
+    secret = data.get("secret")
+    print("[WEBHOOK] secret from TV:", secret)
+    print("[WEBHOOK] expected secret:", WEBHOOK_SECRET)
+    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
+        print("[WEBHOOK] invalid secret, ignore")
+        return "forbidden", 403
 
-    # 2. 校验 secret
-    secret = data.get("secret", "")
-    logger.info("[WEBHOOK] secret from TV: %s", secret)
-    logger.info("[WEBHOOK] expected secret: %s", WEBHOOK_SECRET)
-
-    if not WEBHOOK_SECRET or secret != WEBHOOK_SECRET:
-        return jsonify({"ok": False, "error": "bad secret"}), 403
-
-    # 3. 提取参数（TradingView 传来的）
-    symbol = data.get("symbol")          # 例如 'ZEC-USDT'
-    side = data.get("side", "").upper()  # BUY / SELL
-    order_type = data.get("type", "MARKET").upper()
-    size = str(data.get("size", "0"))
+    # 2）从 TradingView JSON 里拿字段
+    symbol = data.get("symbol")
+    side = data.get("side")
+    size_usdt = float(data.get("size", 0) or 0)      # TV 里的 size = USDT 金额
+    price_from_tv = float(data.get("price", 0) or 0) # TV 里的 price，用来估算数量
     reduce_only = bool(data.get("reduce_only", False))
-    client_id = data.get("client_id")
-    signal_type = data.get("signal_type", "entry")
+    client_id = data.get("client_id") or None
 
-    # TV 传来的 price 只用来打日志，不再作为参数传给 create_market_order
-    tv_price = data.get("price")
-    logger.info(
-        "[WEBHOOK] sending order to Apex: "
-        "symbol=%s side=%s size=%s type=%s price=%s reduce_only=%s signal_type=%s",
-        symbol, side, size, order_type, tv_price, reduce_only, signal_type,
+    print(
+        "[WEBHOOK] sending order to Apex:",
+        f"symbol={symbol} side={side} sizeUSDT={size_usdt} price={price_from_tv}",
+        f"reduce_only={reduce_only}",
     )
 
-    # 4. 根据 type 调用我们封装好的下单函数
+    # 3）调用 apex_client 下单
     try:
-        if order_type == "MARKET":
-            # ⚠️ 这里不要再传 price=xxx，否则就会出现你刚才的 TypeError
-            resp = create_market_order(
-                symbol=symbol,
-                side=side,
-                size=size,
-                reduce_only=reduce_only,
-                client_id=client_id,
-            )
-        else:
-            # 目前只支持 MARKET，下次要做 LIMIT 再加一个 create_limit_order
-            return jsonify({"ok": False, "error": f"unsupported order type: {order_type}"}), 400
-
+        resp = create_market_order(
+            symbol=symbol,
+            side=side,
+            usdt_size=size_usdt,
+            tv_price=price_from_tv,
+            reduce_only=reduce_only,
+            client_id=client_id,
+        )
     except Exception as e:
-        logger.exception("[WEBHOOK] error when sending order to Apex")
-        return jsonify({"ok": False, "error": str(e)}), 500
+        print("[WEBHOOK] error when sending order to Apex:", repr(e))
+        return jsonify({"status": "error", "message": str(e)}), 500
 
-    return jsonify({"ok": True, "data": resp}), 200
+    return jsonify({"status": "ok", "apex": resp})
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8080"))
-    # DO 会把流量打到这个端口，保持不动就行
+    port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
