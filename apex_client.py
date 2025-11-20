@@ -1,5 +1,6 @@
 import os
 import time
+import random
 from decimal import Decimal, ROUND_DOWN
 
 from apexomni.http_private_sign import HttpPrivateSign
@@ -101,6 +102,13 @@ def _get_api_credentials():
         "secret": os.environ["APEX_API_SECRET"],
         "passphrase": os.environ["APEX_API_PASSPHRASE"],
     }
+
+
+def _random_client_id() -> str:
+    """
+    生成 ApeX 官方风格的 clientId：纯数字字符串，避免 ORDER_INVALID_CLIENT_ORDER_ID。
+    """
+    return str(int(float(str(random.random())[2:])))
 
 
 # ---------------------------
@@ -291,9 +299,16 @@ def create_market_order(
         price_str = get_market_price(symbol, side, size_str)
 
     ts = int(time.time())
-    if client_id is None:
-        safe_symbol = symbol.replace("/", "-")
-        client_id = f"tv-{safe_symbol}-{ts}"
+
+    # ApeX 使用纯数字 clientId，我们这里总是重新生成一个合法的
+    apex_client_id = _random_client_id()
+    tv_client_id = client_id
+    if tv_client_id:
+        print(
+            f"[apex_client] tv_client_id={tv_client_id} -> apex_clientId={apex_client_id}"
+        )
+    else:
+        print(f"[apex_client] apex_clientId={apex_client_id} (no tv_client_id)")
 
     print(
         "[apex_client] create_market_order params:",
@@ -304,7 +319,7 @@ def create_market_order(
             "size": size_str,
             "price": price_str,
             "reduceOnly": reduce_only,
-            "clientId": client_id,
+            "clientId": apex_client_id,
             "timestampSeconds": ts,
         },
     )
@@ -318,7 +333,7 @@ def create_market_order(
         price=price_str,
         timestampSeconds=ts,
         reduceOnly=reduce_only,   # ✅ 驼峰写法
-        clientId=client_id,       # ✅ 驼峰写法
+        clientId=apex_client_id,   # ✅ 使用合法的纯数字 ID
     )
 
     print("[apex_client] order response:", order)
