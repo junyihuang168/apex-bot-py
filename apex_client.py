@@ -1,3 +1,4 @@
+# apex_client.py
 import os
 import time
 from decimal import Decimal, ROUND_DOWN
@@ -11,19 +12,25 @@ from apexomni.constants import (
     NETWORKID_TEST,
 )
 
+# ---------------------------------------------------------------------
+# 一些小工具
+# ---------------------------------------------------------------------
 
-# ---------------------------
-# 小工具
-# ---------------------------
 
 def _env_bool(name: str, default: bool = False) -> bool:
-    """环境变量字符串 -> bool."""
+    """把环境变量字符串转成布尔值."""
     value = os.getenv(name, str(default))
     return value.lower() in ("1", "true", "yes", "y", "on")
 
 
 def _get_base_and_network():
-    """根据环境变量决定 mainnet / testnet."""
+    """
+    根据环境变量决定用 mainnet 还是 testnet。
+
+    - APEX_USE_MAINNET=true  或
+    - APEX_ENV=main / mainnet / prod / production
+    都会走主网，否则走 testnet。
+    """
     use_mainnet = _env_bool("APEX_USE_MAINNET", False)
 
     env_name = os.getenv("APEX_ENV", "").lower()
@@ -36,7 +43,7 @@ def _get_base_and_network():
 
 
 def _get_api_credentials():
-    """从环境变量拿 API key 三件套."""
+    """从环境变量里拿 API key / secret / passphrase。"""
     return {
         "key": os.environ["APEX_API_KEY"],
         "secret": os.environ["APEX_API_SECRET"],
@@ -44,116 +51,162 @@ def _get_api_credentials():
     }
 
 
-# ---------------------------
-# client 单例
-# ---------------------------
+# ---------------------------------------------------------------------
+# 全局客户端（带缓存）
+# ---------------------------------------------------------------------
 
 _sign_client: HttpPrivateSign | None = None
 _http_v3_client: HttpPrivate_v3 | None = None
 
 
 def _get_sign_client() -> HttpPrivateSign:
+    """
+    返回带 zk 签名的 HttpPrivateSign 客户端，
+    并且**预热一次 get_account_v3()**，保证有 accountV3。
+    """
     global _sign_client
     if _sign_client is None:
         base_url, network_id = _get_base_and_network()
         api_creds = _get_api_credentials()
+
         zk_seeds = os.environ["APEX_ZK_SEEDS"]
         zk_l2 = os.getenv("APEX_L2KEY_SEEDS") or None
 
-        _sign_client = HttpPrivateSign(
+        client = HttpPrivateSign(
             base_url,
             network_id=network_id,
             zk_seeds=zk_seeds,
             zk_l2Key=zk_l2,
             api_key_credentials=api_creds,
         )
+
+        # ★ 关键：预热 accountV3，避免 AttributeError: accountV3
+        try:
+            _ = client.get_account_v3()
+            print("[apex_client] warmup get_account_v3() ok")
+        except Exception as e:  # noqa: BLE001
+            # 即使失败也不致命，最多影响第一笔单
+            print("[apex_client] warmup get_account_v3() failed:", e)
+
+        _sign_client = client
+
     return _sign_client
 
 
 def _get_http_v3_client() -> HttpPrivate_v3:
+    """不需要 zk 的 HTTP v3 客户端（用来查 worst price 等公共接口）。"""
     global _http_v3_client
     if _http_v3_client is None:
         base_url, network_id = _get_base_and_network()
         api_creds = _get_api_credentials()
+
         _http_v3_client = HttpPrivate_v3(
             base_url,
             network_id=network_id,
             api_key_credentials=api_creds,
         )
+
     return _http_v3_client
 
 
-# ---------------------------
-# 通用查询函数
-# ---------------------------
+# ---------------------------------------------------------------------
+# 对外暴露的一些小函数
+# ---------------------------------------------------------------------
+
 
 def get_account():
-    """查询账号信息（positions 等），方便 reduce_only 逻辑用。"""
+    """查询账户信息，方便在本地 / 日志里调试。"""
     client = _get_sign_client()
     return client.get_account_v3()
 
 
-def get_worst_price(symbol: str, side: str, size: str = "1") -> str:
+def _extract_worst_price(res) -> float:
     """
-    用官方 GET /v3/get-worst-price 查盘口价。
-    只需要一个大概 size（1 就够），主要是拿 price。
+    从 get_worst_price_v3 的返回里抽出 worstPrice。
+    官方有时候会包一层 data，所以做个兜底解析。
     """
-    side = side.upper()
-    client = _get_http_v3_client()
-    res = client.get_worst_price_v3(symbol=symbol, size=str(size), side=side)
-
     price = None
     if isinstance(res, dict):
         if "worstPrice" in res:
             price = res["worstPrice"]
-        elif "data" in res and isinstance(res["data"], dict):
-            price = res["data"].get("worstPrice")
+        elif "data" in res and isinstance(res["data"], dict) and "worstPrice" in res["data"]:
+            price = res["data"]["worstPrice"]
 
     if price is None:
         raise RuntimeError(f"[apex_client] get_worst_price_v3 返回异常: {res}")
 
-    price_str = str(price)
-    print(f"[apex_client] worst price for {symbol} {side} size={size}: {price_str}")
-    return price_str
+    return float(price)
 
 
-def _decimal_floor(value: float, step: float) -> float:
+def get_market_price(symbol: str, side: str, usdt_size: float) -> float:
     """
-    把 value 按 step 向下取整（保证是 step 的整数倍，同时保证 <= 原值）
+    方案 B 辅助函数：获取当前市价。
+
+    这里为了简单，直接用 size=1 调 get_worst_price_v3，
+    对于你这种小仓位下单影响可以忽略。
     """
-    d = Decimal(str(value))
-    s = Decimal(str(step))
-    if s <= 0:
-        return float(d)
+    http = _get_http_v3_client()
+    side_up = side.upper()
 
-    scaled = (d / s).quantize(Decimal("1"), rounding=ROUND_DOWN)
-    floored = scaled * s
-    return float(floored)
+    # size 传 1 就行，我们只要一个「每 1 个币」的大概价格
+    res = http.get_worst_price_v3(symbol=symbol, size="1", side=side_up)
+    price = _extract_worst_price(res)
+
+    print(
+        f"[apex_client] worst price for {symbol} {side_up} "
+        f"sizeUSDT={usdt_size}: {price}"
+    )
+    return price
 
 
-def _get_position_size(symbol: str) -> float:
+# ---------------------------------------------------------------------
+# 自动撮合 USDT 金额 -> 币数量，并自动处理 stepSize 的 create_market_order
+# ---------------------------------------------------------------------
+
+
+def _submit_order(
+    client: HttpPrivateSign,
+    *,
+    symbol: str,
+    side: str,
+    size_str: str,
+    price_str: str,
+    reduce_only: bool,
+) -> dict:
     """
-    当前 symbol 的持仓绝对数量（不管多空），没有就返回 0.
+    真正调 create_order_v3 的地方。
+    注意：
+      - 这里只传官方肯定支持的参数，避免 TypeError。
+      - reduce_only -> reduceOnly （驼峰）传给 SDK。
     """
-    try:
-        acc = get_account()
-    except Exception as e:
-        print("[apex_client] get_account_v3 失败:", e)
-        return 0.0
+    ts = int(time.time())
 
-    positions = acc.get("positions") or []
-    for p in positions:
-        if p.get("symbol") == symbol:
-            try:
-                return abs(float(p.get("size", "0")))
-            except Exception:
-                return 0.0
-    return 0.0
+    print(
+        "[apex_client] create_market_order params:",
+        {
+            "symbol": symbol,
+            "side": side,
+            "type": "MARKET",
+            "size": size_str,
+            "price": price_str,
+            "reduce_only": reduce_only,
+            "timestampSeconds": ts,
+        },
+    )
 
+    order = client.create_order_v3(
+        symbol=symbol,
+        side=side,
+        type="MARKET",
+        size=size_str,
+        price=price_str,
+        timestampSeconds=ts,
+        reduceOnly=reduce_only,
+    )
 
-# ---------------------------
-# 下单核心：方案 B（按 USDT 量自动换算成币）
-# ---------------------------
+    print("[apex_client] order response:", order)
+    return order
+
 
 def create_market_order(
     symbol: str,
@@ -162,89 +215,94 @@ def create_market_order(
     reduce_only: bool = False,
 ):
     """
-    根据 USDT 金额自动换算成币数量，再按官方 Demo 调用 create_order_v3。
+    方案 B：按照「USDT 金额」自动换算成币的数量再下 MARKET 单。
 
-    参数：
-      - symbol: 例如 'ZEC-USDT'
-      - side:   'BUY' / 'SELL'
-      - usdt_size: 预算多少 USDT（来自 TradingView 的 size 字段）
-      - reduce_only: True 表示“只平仓不反向开新仓”，这里通过当前持仓 size 做截断实现
+    - symbol: 'ZEC-USDT' 之类
+    - side: 'BUY' / 'SELL'
+    - usdt_size: 你在 TV / Pine 里输入的 USDT 金额（例如 10）
+    - reduce_only: True 表示只减仓，用于平仓信号
     """
-    side = side.upper()
-    usdt_size = float(usdt_size)
-
-    if usdt_size <= 0:
-        raise ValueError("usdt_size 必须 > 0")
-
-    # 1) 先拿 worst price
-    price_str = get_worst_price(symbol, side, size="1")
-    price = float(price_str)
-
-    # 2) 预算 USDT 换算成“理论上的币数量”
-    raw_qty = usdt_size / price
-
-    # 3) reduce_only 的话，不允许下单数量超过当前持仓
-    if reduce_only:
-        pos_size = _get_position_size(symbol)
-        if pos_size <= 0:
-            print(f"[apex_client] reduce_only=True 但 {symbol} 没有持仓，跳过下单。")
-            return {"code": 0, "msg": "NO_POSITION"}
-        raw_qty = min(raw_qty, pos_size)
-
-    # 先用 6 位小数做一个初始数量
-    qty = float(f"{raw_qty:.6f}")
+    side_up = side.upper()
+    usdt_f = float(usdt_size)
+    if usdt_f <= 0:
+        raise ValueError(f"usdt_size 必须 > 0，当前为 {usdt_size}")
 
     client = _get_sign_client()
 
-    def _send(size_float: float):
-        # 转成字符串，去掉多余 0
-        size_str = f"{size_float:.6f}".rstrip("0").rstrip(".")
-        ts = int(time.time())
+    # 1) 先拿一个市价（每 1 个币大概多少钱）
+    price = get_market_price(symbol, side_up, usdt_f)
 
-        print(
-            "[apex_client] create_market_order params:",
-            {
-                "symbol": symbol,
-                "side": side,
-                "type": "MARKET",
-                "size": size_str,
-                "price": price_str,
-                "reduce_only": reduce_only,
-                "timestampSeconds": ts,
-            },
-        )
+    # 2) 用 USDT 金额除以价格，得到大概的币数量
+    #    用 Decimal 处理小数，并向下取整，避免金额超出。
+    qty_est = Decimal(str(usdt_f)) / Decimal(str(price))
 
-        # ⚠️ 这里严格对齐官方 Demo：只能传这几个参数
-        order = client.create_order_v3(
-            symbol=symbol,
-            side=side,
-            type="MARKET",
-            size=size_str,
-            timestampSeconds=ts,
-            price=price_str,
-        )
+    # 先粗略保留 6 位小数再向下取整
+    qty_est = qty_est.quantize(Decimal("0.000001"), rounding=ROUND_DOWN)
+    if qty_est <= 0:
+        raise ValueError(f"根据 USDT 金额 {usdt_size} 算出来的数量太小: {qty_est}")
 
-        print("[apex_client] order response:", order)
-        return order
+    size_str = format(qty_est.normalize(), "f")
+    price_str = str(price)
 
-    # 4) 第一次尝试
-    order = _send(qty)
+    # 3) 第一次尝试下单
+    resp = _submit_order(
+        client,
+        symbol=symbol,
+        side=side_up,
+        size_str=size_str,
+        price_str=price_str,
+        reduce_only=reduce_only,
+    )
 
-    # 5) 如果因为小数精度 / stepSize 报错，再按 stepSize 向下取整一次重试
+    # 4) 如果返回的是 stepSize 不合法（INVALID_DECIMAL_SCALE_PARAM），
+    #    读出 stepSize，自动向下取整 1 次再重新下单。
     try:
-        if isinstance(order, dict) and order.get("key") == "INVALID_DECIMAL_SCALE_PARAM":
-            detail = order.get("detail") or {}
-            step = detail.get("stepSize") or detail.get("step_size")
-            if step is not None:
-                step_f = float(step)
-                adj_qty = _decimal_floor(raw_qty, step_f)
-                if adj_qty <= 0:
-                    raise RuntimeError(
-                        f"size {raw_qty} 太小，按 stepSize={step_f} 处理后为 0"
-                    )
-                print(f"[apex_client] 因 stepSize 重试: stepSize={step_f}, size={adj_qty}")
-                order = _send(adj_qty)
-    except Exception as e:
-        print("[apex_client] 重试逻辑出错（可以忽略，看看上面的返回）:", e)
+        if (
+            isinstance(resp, dict)
+            and resp.get("code") == 3
+            and isinstance(resp.get("msg"), str)
+            and "INVALID_DECIMAL_SCALE_PARAM" in resp.get("msg", "")
+        ):
+            detail = resp.get("detail") or {}
+            step_size_str = detail.get("stepSize")
+            if step_size_str:
+                step = Decimal(step_size_str)
+                size_dec = Decimal(size_str)
 
-    return order
+                # 按 stepSize 向下取整
+                # new_size = floor(size_dec / step) * step
+                new_size_units = (size_dec / step).to_integral_value(
+                    rounding=ROUND_DOWN
+                )
+                new_size_dec = new_size_units * step
+
+                if new_size_dec <= 0:
+                    print(
+                        "[apex_client] stepSize 调整后 size<=0，"
+                        "不再重试下单，新 size:",
+                        new_size_dec,
+                    )
+                    return resp
+
+                new_size_str = format(new_size_dec.normalize(), "f")
+                print(
+                    "[apex_client] INVALID_DECIMAL_SCALE_PARAM，"
+                    f"根据 stepSize={step_size_str} 把 size 从 {size_str} 调整为 {new_size_str}，"
+                    "准备重新下单……"
+                )
+
+                # 用新的 size 再试一次
+                resp2 = _submit_order(
+                    client,
+                    symbol=symbol,
+                    side=side_up,
+                    size_str=new_size_str,
+                    price_str=price_str,
+                    reduce_only=reduce_only,
+                )
+                return resp2
+    except Exception as e:  # noqa: BLE001
+        # 这里任何解析失败都不致命，直接把第一次返回的结果给出去
+        print("[apex_client] 处理 INVALID_DECIMAL_SCALE_PARAM 时出错:", e)
+
+    return resp
