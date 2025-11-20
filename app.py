@@ -5,48 +5,79 @@ from apex_client import create_market_order
 
 app = Flask(__name__)
 
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+# TradingView 警报里带的 "secret" 要和这里一致
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+
+
+@app.route("/", methods=["GET"])
+def index():
+    return "OK", 200
 
 
 @app.route("/webhook", methods=["POST"])
-def webhook():
-    data = request.get_json(force=True, silent=True) or {}
-    print("[WEBHOOK] raw body:", data)
+def tv_webhook():
+    try:
+        body = request.get_json(force=True, silent=False)
+    except Exception as e:
+        print("[WEBHOOK] invalid JSON:", e)
+        return "invalid json", 400
 
-    # 1) 校验 secret
-    tv_secret = data.get("secret")
-    if WEBHOOK_SECRET and tv_secret != WEBHOOK_SECRET:
-        print("[WEBHOOK] expected secret:", WEBHOOK_SECRET)
-        return "invalid secret", 403
+    print("[WEBHOOK] raw body:", body)
 
-    # 2) 解析 TradingView 传来的字段
-    symbol = data.get("symbol")          # 例如 'ZEC-USDT'
-    side = (data.get("side") or "BUY").upper()
-    signal_type = data.get("signal_type", "entry")  # 'entry' / 'exit'
-    usdt_size = float(data.get("size", 0))          # 这里是「USDT 数量」
+    if not isinstance(body, dict):
+        return "bad payload", 400
 
-    print(
-        "[WEBHOOK] sending order to Apex:",
-        f"symbol={symbol} side={side} sizeUSDT={usdt_size} signal_type={signal_type}",
-    )
+    # 校验 secret（如果你设置了）
+    if WEBHOOK_SECRET:
+        if body.get("secret") != WEBHOOK_SECRET:
+            print("[WEBHOOK] invalid secret")
+            return "forbidden", 403
 
-    # exit 信号我们当成 reduce_only（只平不反向）
-    reduce_only = signal_type == "exit"
+    symbol = body.get("symbol")
+    side = str(body.get("side", "")).upper()
+    action = str(body.get("action", "")).lower()
+    signal_type = body.get("signal_type")
+
+    if not symbol or side not in ("BUY", "SELL"):
+        return "missing symbol or side", 400
+
+    # TradingView 里的 size：我们把它当成 USDT 金额
+    size_usdt = body.get("size")
+    if size_usdt is None:
+        return "missing size", 400
+
+    # 是否 reduce_only：
+    # - 如果 payload 里明确给了 reduce_only，就直接用
+    # - 否则 action == "close" 视为 reduce_only=True
+    if "reduce_only" in body:
+        reduce_only = bool(body["reduce_only"])
+    else:
+        reduce_only = action == "close"
+
+    client_id = body.get("client_id")
 
     try:
-        resp = create_market_order(
+        print(
+            f"[WEBHOOK] sending order to Apex: "
+            f"symbol={symbol} side={side} sizeUSDT={size_usdt} signal_type={signal_type}"
+        )
+
+        order = create_market_order(
             symbol=symbol,
             side=side,
-            usdt_size=usdt_size,
+            size_usdt=size_usdt,   # ★ 关键：把 size 作为 USDT 金额传进去
             reduce_only=reduce_only,
+            client_id=client_id,
         )
-        return jsonify({"status": "ok", "resp": resp}), 200
+
+        return jsonify({"status": "ok", "order": order}), 200
+
     except Exception as e:
-        print("ERROR: [WEBHOOK] error when sending order to Apex:", repr(e))
-        return "internal error", 500
+        print("[WEBHOOK] error when sending order to Apex:", repr(e))
+        return f"error: {e}", 500
 
 
 if __name__ == "__main__":
-    # 本地跑的时候用这个；DO 上会自己注入 PORT
-    port = int(os.environ.get("PORT", 8080))
+    # DO/Heroku 通常会设置 PORT 环境变量
+    port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
