@@ -7,7 +7,7 @@ import time
 import logging
 from decimal import Decimal, ROUND_DOWN
 
-from apexomni.http_private_v3 import HttpPrivateSign
+from apexomni.http_private_sign import HttpPrivateSign
 from apexomni.constants import APEX_OMNI_HTTP_TEST, NETWORKID_TEST
 
 log = logging.getLogger("apex_client")
@@ -15,7 +15,7 @@ log.setLevel(logging.INFO)
 
 
 def _get_env(name: str, default: str | None = None) -> str | None:
-    """Small helper to read environment variables and log when missing."""
+    """Read environment variables and log when missing."""
     value = os.getenv(name, default)
     if value is None or value == "":
         log.warning("[apex_client] ENV %s is not set", name)
@@ -60,8 +60,7 @@ class ApexClient:
         )
 
         # --- Required by the SDK: configs_v3 + get_account_v3 ---
-        # DO NOT use the old `configV3` name. It does not exist.
-        log.info("[apex_client] Fetching configs_v3() and account_v3() ...")
+        log.info("[apex_client] Fetching configs_v3() and get_account_v3() ...")
         self.configs = self.client.configs_v3()
         self.account = self.client.get_account_v3()
         log.info("[apex_client] configs_v3 and account_v3 loaded successfully")
@@ -73,7 +72,7 @@ class ApexClient:
     def _calc_size_from_usdt(symbol: str, size_usdt: float, price: float) -> str:
         """
         Convert a USDT notional amount to base asset size (string),
-        flooring to 6 decimal places to be safe for most symbols.
+        flooring to 6 decimal places.
 
         Example: size_usdt = 10, price = 683.21 -> size ~ 0.01464...
         """
@@ -86,7 +85,7 @@ class ApexClient:
         return format(size, "f")
 
     # ------------------------------------------------------------------
-    # Public API used by app.py
+    # Instance method used internally and by the module-level wrapper
     # ------------------------------------------------------------------
     def create_market_order(
         self,
@@ -168,13 +167,23 @@ class ApexClient:
         return resp
 
 
-# Optional module-level singleton, so app.py can do:
-#   from apex_client import apex_client
-# and call apex_client.create_market_order(...)
+# ----------------------------------------------------------------------
+# Module-level singleton + wrapper, so app.py can:
+#   from apex_client import create_market_order
+# ----------------------------------------------------------------------
 try:
     apex_client = ApexClient()
 except Exception as e:
-    # We log the error instead of crashing import; app.py can still
-    # decide how to handle missing client.
     log.exception("[apex_client] Failed to initialize ApexClient: %s", e)
     apex_client = None
+
+
+def create_market_order(*args, **kwargs):
+    """
+    Module-level wrapper for compatibility with:
+
+        from apex_client import create_market_order
+    """
+    if apex_client is None:
+        raise RuntimeError("ApexClient is not initialized")
+    return apex_client.create_market_order(*args, **kwargs)
