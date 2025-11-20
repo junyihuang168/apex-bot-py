@@ -1,189 +1,325 @@
-# apex_client.py
-# Thin wrapper around apexomni HttpPrivateSign for Apex Omni V3.
-# Uses configs_v3() and get_account_v3() as required by the new SDK.
-
 import os
 import time
-import logging
 from decimal import Decimal, ROUND_DOWN
 
 from apexomni.http_private_sign import HttpPrivateSign
-from apexomni.constants import APEX_OMNI_HTTP_TEST, NETWORKID_TEST
+from apexomni.constants import (
+    APEX_OMNI_HTTP_MAIN,
+    APEX_OMNI_HTTP_TEST,
+    NETWORKID_OMNI_MAIN_ARB,
+    NETWORKID_TEST,
+)
 
-log = logging.getLogger("apex_client")
-log.setLevel(logging.INFO)
+# -------------------------------------------------------------------
+# 交易规则（默认：最小数量 0.01，步长 0.01，小数点后 2 位）
+# 如果以后某个币不一样，可以在 SYMBOL_RULES 里单独覆盖
+# -------------------------------------------------------------------
+
+DEFAULT_SYMBOL_RULES = {
+    "min_qty": Decimal("0.01"),     # 最小数量
+    "step_size": Decimal("0.01"),   # 每档步长
+    "qty_decimals": 2,              # 小数位数
+}
+
+SYMBOL_RULES: dict[str, dict] = {
+    # 举例：如果以后 BTC-USDT 规则不同，可以这样写：
+    # "BTC-USDT": {
+    #     "min_qty": Decimal("0.001"),
+    #     "step_size": Decimal("0.001"),
+    #     "qty_decimals": 3,
+    # },
+}
 
 
-def _get_env(name: str, default: str | None = None) -> str | None:
-    """Read environment variables and log when missing."""
-    value = os.getenv(name, default)
-    if value is None or value == "":
-        log.warning("[apex_client] ENV %s is not set", name)
-    return value
+def _get_symbol_rules(symbol: str) -> dict:
+    """返回某个交易对的撮合规则（没有就用默认）"""
+    s = symbol.upper()
+    rules = SYMBOL_RULES.get(s, {})
+    merged = {**DEFAULT_SYMBOL_RULES, **rules}
+    return merged
 
 
-class ApexClient:
+def _snap_quantity(symbol: str, theoretical_qty: Decimal) -> Decimal:
     """
-    Simple client that:
-    1. Initializes HttpPrivateSign with zk_seeds + l2Key + api keys
-    2. Calls configs_v3() and get_account_v3() once
-    3. Provides create_market_order() which can take size in USDT
+    把理论数量对齐到交易所允许的网格：
+    - 向下取整到 step_size 的整数倍
+    - 再限制为 qty_decimals 位小数
+    - 如果小于 min_qty，就报错（预算太小）
     """
+    rules = _get_symbol_rules(symbol)
+    step = rules["step_size"]
+    min_qty = rules["min_qty"]
+    decimals = rules["qty_decimals"]
 
-    def __init__(self) -> None:
-        # --- Load credentials from environment ---
-        api_key = _get_env("APEX_API_KEY")
-        api_secret = _get_env("APEX_API_SECRET")
-        api_passphrase = _get_env("APEX_API_PASSPHRASE")
+    if theoretical_qty <= 0:
+        raise ValueError("calculated quantity must be > 0")
 
-        zk_seeds = _get_env("APEX_ZK_SEEDS")
-        l2_key = _get_env("APEX_L2KEY_SEEDS", "")
+    # 向下取整到 step 的整数倍
+    steps = (theoretical_qty // step)  # Decimal 的整除
+    snapped = steps * step
 
-        if not (api_key and api_secret and api_passphrase and zk_seeds):
-            log.warning(
-                "[apex_client] Some Apex credentials are missing. "
-                "Trading requests may fail."
-            )
+    # 限制小数位数
+    quantum = Decimal("1").scaleb(-decimals)  # 等价于 10^-decimals，比如 0.01
+    snapped = snapped.quantize(quantum, rounding=ROUND_DOWN)
 
-        # --- Init HttpPrivateSign client (Testnet endpoint + network id) ---
-        # If you want mainnet later, just change APEX_OMNI_HTTP_TEST / NETWORKID_TEST.
-        self.client = HttpPrivateSign(
-            APEX_OMNI_HTTP_TEST,
-            network_id=NETWORKID_TEST,
-            zk_seeds=zk_seeds,
-            zk_l2Key=l2_key,
-            api_key_credentials={
-                "key": api_key,
-                "secret": api_secret,
-                "passphrase": api_passphrase,
-            },
+    if snapped < min_qty:
+        raise ValueError(
+            f"budget too small: snapped quantity {snapped} < minQty {min_qty}"
         )
 
-        # --- Required by the SDK: configs_v3 + get_account_v3 ---
-        log.info("[apex_client] Fetching configs_v3() and get_account_v3() ...")
-        self.configs = self.client.configs_v3()
-        self.account = self.client.get_account_v3()
-        log.info("[apex_client] configs_v3 and account_v3 loaded successfully")
+    return snapped
 
-    # ------------------------------------------------------------------
-    # Helper to convert from USDT notionals to base-asset size
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _calc_size_from_usdt(symbol: str, size_usdt: float, price: float) -> str:
-        """
-        Convert a USDT notional amount to base asset size (string),
-        flooring to 6 decimal places.
 
-        Example: size_usdt = 10, price = 683.21 -> size ~ 0.01464...
-        """
-        if price <= 0 or size_usdt <= 0:
-            raise ValueError("price and size_usdt must be positive")
+# ---------------------------
+# 内部小工具函数
+# ---------------------------
 
-        raw = Decimal(str(size_usdt)) / Decimal(str(price))
-        # Floor to 6 decimal places to avoid "too many decimal" issues
-        size = raw.quantize(Decimal("0.000001"), rounding=ROUND_DOWN)
-        return format(size, "f")
+def _env_bool(name: str, default: bool = False) -> bool:
+    """把环境变量字符串转成布尔值."""
+    value = os.getenv(name, str(default))
+    return value.lower() in ("1", "true", "yes", "y", "on")
 
-    # ------------------------------------------------------------------
-    # Instance method used internally and by the module-level wrapper
-    # ------------------------------------------------------------------
-    def create_market_order(
-        self,
-        symbol: str,
-        side: str,
-        sizeUSDT: float | int | str | None = None,
-        price: float | int | str | None = None,
-        reduce_only: bool = False,
-        client_id: str | None = None,
-        signal_type: str | None = None,
-        **_,
-    ):
-        """
-        Create a MARKET order on Apex Omni.
 
-        Parameters (most common from webhook/app.py):
-            symbol      - e.g. "ZEC-USDT"
-            side        - "BUY" or "SELL"
-            sizeUSDT    - notional in USDT (we convert to coin size)
-            price       - reference / worst price from TV (required for MARKET)
-            reduce_only - whether this is a reduce-only (exit) order
-            client_id   - optional client id (for logging)
-            signal_type - optional string like "entry"/"exit" (for logging)
+def _get_base_and_network():
+    """根据环境变量决定用 mainnet 还是 testnet。"""
+    use_mainnet = _env_bool("APEX_USE_MAINNET", False)
 
-        Any extra keyword arguments are accepted via **_ so that
-        changes in app.py/webhook won't break this function.
-        """
+    # 兼容你额外加的 APEX_ENV=main
+    env_name = os.getenv("APEX_ENV", "").lower()
+    if env_name in ("main", "mainnet", "prod", "production"):
+        use_mainnet = True
 
-        # --- Normalize inputs ---
-        if isinstance(sizeUSDT, str):
-            size_usdt_val = float(sizeUSDT)
-        else:
-            size_usdt_val = float(sizeUSDT) if sizeUSDT is not None else 0.0
+    base_url = APEX_OMNI_HTTP_MAIN if use_mainnet else APEX_OMNI_HTTP_TEST
+    network_id = NETWORKID_OMNI_MAIN_ARB if use_mainnet else NETWORKID_TEST
+    return base_url, network_id
 
-        if isinstance(price, str):
-            price_val = float(price) if price else 0.0
-        else:
-            price_val = float(price) if price is not None else 0.0
 
-        if size_usdt_val <= 0:
-            raise ValueError("sizeUSDT must be > 0")
+def _get_api_credentials():
+    """从环境变量里拿 API key / secret / passphrase。"""
+    return {
+        "key": os.environ["APEX_API_KEY"],
+        "secret": os.environ["APEX_API_SECRET"],
+        "passphrase": os.environ["APEX_API_PASSPHRASE"],
+    }
 
-        if price_val <= 0:
-            raise ValueError("price must be > 0 for MARKET orders")
 
-        # --- Convert USDT notional -> base size ---
-        size_str = self._calc_size_from_usdt(symbol, size_usdt_val, price_val)
+# ---------------------------
+# 创建 ApeX 客户端
+# ---------------------------
 
-        log.info(
-            "[apex_client] worst price for %s %s sizeUSDT=%.4f: %.8f (signal_type=%s)",
-            symbol,
-            side,
-            size_usdt_val,
-            price_val,
-            signal_type,
+def get_client() -> HttpPrivateSign:
+    """
+    返回带 zk 签名的 HttpPrivateSign 客户端，
+    用于真正的下单（create_order_v3）。
+
+    这里模仿官方 demo：
+        1) new HttpPrivateSign(...)
+        2) client.configs_v3()
+        3) client.get_account_v3()
+    """
+    base_url, network_id = _get_base_and_network()
+    api_creds = _get_api_credentials()
+
+    zk_seeds = os.environ["APEX_ZK_SEEDS"]
+    zk_l2 = os.getenv("APEX_L2KEY_SEEDS") or None
+
+    client = HttpPrivateSign(
+        base_url,
+        network_id=network_id,
+        zk_seeds=zk_seeds,
+        zk_l2Key=zk_l2,
+        api_key_credentials=api_creds,
+    )
+
+    # ① 先拉 configs_v3，初始化 client.configV3
+    try:
+        cfg = client.configs_v3()
+        print("[apex_client] configs_v3 ok:", cfg)
+    except Exception as e:
+        print("[apex_client] WARNING configs_v3 error:", e)
+
+    # ② 再拉 account_v3，初始化 client.accountV3
+    try:
+        acc = client.get_account_v3()
+        print("[apex_client] get_account_v3 ok:", acc)
+    except Exception as e:
+        print("[apex_client] WARNING get_account_v3 error:", e)
+
+    return client
+
+
+# ---------------------------
+# 对外工具函数
+# ---------------------------
+
+def get_account():
+    """查询账户信息，方便你在本地或日志里调试。"""
+    client = get_client()
+    return client.get_account_v3()
+
+
+def get_market_price(symbol: str, side: str, size: str) -> str:
+    """
+    使用官方推荐的 GET /v3/get-worst-price 来获取市价单应当使用的价格。
+    - symbol: 例如 'BNB-USDT'
+    - side: 'BUY' 或 'SELL'
+    - size: 下单数量（字符串或数字均可）
+
+    返回: 字符串形式的价格（比如 '532.15'）
+    """
+    base_url, network_id = _get_base_and_network()
+    api_creds = _get_api_credentials()
+
+    # 官方示例用的是 HttpPrivate_v3（只用 API key，不需要 zk）
+    from apexomni.http_private_v3 import HttpPrivate_v3
+
+    http_v3_client = HttpPrivate_v3(
+        base_url,
+        network_id=network_id,
+        api_key_credentials=api_creds,
+    )
+
+    side = side.upper()
+    size_str = str(size)
+
+    res = http_v3_client.get_worst_price_v3(
+        symbol=symbol,
+        size=size_str,
+        side=side,
+    )
+
+    price = None
+    if isinstance(res, dict):
+        if "worstPrice" in res:
+            price = res["worstPrice"]
+        elif "data" in res and isinstance(res["data"], dict) and "worstPrice" in res["data"]:
+            price = res["data"]["worstPrice"]
+
+    if price is None:
+        raise RuntimeError(f"[apex_client] get_worst_price_v3 返回异常: {res}")
+
+    price_str = str(price)
+    print(f"[apex_client] worst price for {symbol} {side} size={size_str}: {price_str}")
+    return price_str
+
+
+def create_market_order(
+    symbol: str,
+    side: str,
+    size: str | float | int | None = None,
+    size_usdt: str | float | int | None = None,
+    reduce_only: bool = False,
+    client_id: str | None = None,
+):
+    """
+    创建 ApeX 的 MARKET 市价单。
+
+    两种用法：
+    1) 旧用法：直接传币的数量：
+        create_market_order(symbol, side, size="0.05", ...)
+       → 会直接用 size 作为下单数量。
+
+    2) 新用法（推荐）：传 USDT 金额，自动撮合数量：
+        create_market_order(symbol, side, size_usdt="10", ...)
+       → 会根据市价 + 交易规则，把 10 USDT
+         换算为合法的数量（如 0.01 ZEC），再下单。
+    """
+    client = get_client()
+
+    # 再保险：如果某些版本没有提前创建属性，就在这里兜底一下
+    if not hasattr(client, "configV3"):
+        try:
+            client.configs_v3()
+        except Exception as e:
+            print("[apex_client] fallback configs_v3 error:", e)
+
+    if not hasattr(client, "accountV3"):
+        try:
+            client.get_account_v3()
+        except Exception as e:
+            print("[apex_client] fallback get_account_v3 error:", e)
+
+    side = side.upper()
+
+    # -----------------------------
+    # 分支 A：用 USDT 预算自动撮合
+    # -----------------------------
+    if size_usdt is not None:
+        budget = Decimal(str(size_usdt))
+        if budget <= 0:
+            raise ValueError("size_usdt must be > 0")
+
+        rules = _get_symbol_rules(symbol)
+        min_qty = rules["min_qty"]
+        decimals = rules["qty_decimals"]
+
+        # 先用最小数量去问一次 worst price，当作当前市价参考
+        ref_price_decimal = Decimal(
+            get_market_price(symbol, side, str(min_qty))
         )
 
-        # For MARKET orders Apex still expects a "price" (protective worst price)
-        order_params = {
+        # 理论数量 = 预算 / 价格
+        theoretical_qty = budget / ref_price_decimal
+
+        # 对齐到交易所允许的网格（0.01, 0.02, ...）
+        snapped_qty = _snap_quantity(symbol, theoretical_qty)
+
+        # 为了更准确，再用真正的下单数量问一次 worst price
+        price_str = get_market_price(symbol, side, str(snapped_qty))
+        price_decimal = Decimal(price_str)
+
+        # 格式化成固定小数位（例如 0.01）
+        size_str = format(snapped_qty, f".{decimals}f")
+
+        used_budget = (snapped_qty * price_decimal).quantize(
+            Decimal("0.01"), rounding=ROUND_DOWN
+        )
+
+        print(
+            f"[apex_client] budget={budget} USDT -> qty={size_str} {symbol.split('-')[0]}, "
+            f"used≈{used_budget} USDT (price {price_str})"
+        )
+
+    # -----------------------------
+    # 分支 B：旧逻辑，直接用 size 作为数量
+    # -----------------------------
+    else:
+        if size is None:
+            raise ValueError("size or size_usdt must be provided")
+
+        size_str = str(size)
+        price_str = get_market_price(symbol, side, size_str)
+
+    ts = int(time.time())
+    if client_id is None:
+        safe_symbol = symbol.replace("/", "-")
+        client_id = f"tv-{safe_symbol}-{ts}"
+
+    print(
+        "[apex_client] create_market_order params:",
+        {
             "symbol": symbol,
             "side": side,
             "type": "MARKET",
             "size": size_str,
-            "timestampSeconds": int(time.time()),
-            "price": str(price_val),
-            "reduce_only": bool(reduce_only),
-        }
+            "price": price_str,
+            "reduceOnly": reduce_only,
+            "clientId": client_id,
+            "timestampSeconds": ts,
+        },
+    )
 
-        # Optional client id, if your webhook sends it
-        if client_id:
-            # Only add if provided – safe even if Apex ignores it
-            order_params["clientId"] = str(client_id)
+    # 关键：参数名要和 SDK 的 create_order_v3 定义一致
+    order = client.create_order_v3(
+        symbol=symbol,
+        side=side,
+        type="MARKET",
+        size=size_str,
+        price=price_str,
+        timestampSeconds=ts,
+        reduceOnly=reduce_only,   # ✅ 驼峰写法
+        clientId=client_id,       # ✅ 驼峰写法
+    )
 
-        log.info("[apex_client] create_market_order params: %s", order_params)
-
-        # --- Send order to Apex Omni ---
-        resp = self.client.create_order_v3(**order_params)
-        log.info("[apex_client] create_order_v3 response: %s", resp)
-        return resp
-
-
-# ----------------------------------------------------------------------
-# Module-level singleton + wrapper, so app.py can:
-#   from apex_client import create_market_order
-# ----------------------------------------------------------------------
-try:
-    apex_client = ApexClient()
-except Exception as e:
-    log.exception("[apex_client] Failed to initialize ApexClient: %s", e)
-    apex_client = None
-
-
-def create_market_order(*args, **kwargs):
-    """
-    Module-level wrapper for compatibility with:
-
-        from apex_client import create_market_order
-    """
-    if apex_client is None:
-        raise RuntimeError("ApexClient is not initialized")
-    return apex_client.create_market_order(*args, **kwargs)
+    print("[apex_client] order response:", order)
+    return order
