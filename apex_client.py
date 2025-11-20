@@ -224,7 +224,9 @@ def _get_worst_price(symbol: str, side: str, size: float) -> float:
 def create_market_order(
     symbol: str,
     side: str,
-    usdt_size: float,
+    # 兼容旧版本：你可以传 size=10，也可以传 usdt_size=10
+    size: float | None = None,
+    usdt_size: float | None = None,
     reduce_only: bool = False,
     client_id: str | None = None,
 ):
@@ -235,10 +237,18 @@ def create_market_order(
     ----
     symbol:     'ZEC-USDT' 这种
     side:       'BUY' / 'SELL'
-    usdt_size:  你想用多少 USDT 下单（比如 10）
-    reduce_only:True 用在平仓单；False 用在开仓单
+    size / usdt_size:  你想用多少 USDT 下单（比如 10）
+    reduce_only: True 用在平仓单；False 用在开仓单
     client_id:  TradingView 传进来的 client_id（可选）
     """
+    # ------- 兼容处理 -------
+    if usdt_size is None:
+        if size is None:
+            raise ValueError("[apex_client] 必须提供 size 或 usdt_size 其中一个")
+        usdt_size = float(size)
+    else:
+        usdt_size = float(usdt_size)
+
     client = get_client()
 
     # 这个调用会在 HttpPrivateSign 里初始化 configV3，避免之前的 AttributeError
@@ -247,7 +257,6 @@ def create_market_order(
     step_size, min_size = _load_symbol_rules(symbol)
 
     side = side.upper()
-    usdt_size = float(usdt_size)
 
     if usdt_size <= 0:
         raise ValueError("[apex_client] usdt_size 必须 > 0")
@@ -290,7 +299,7 @@ def create_market_order(
             "size": size_str,
             "price": price_str,
             "reduce_only": bool(reduce_only),
-            "clientId": client_id,
+            "clientOrderId": client_id,
             "timestampSeconds": ts,
         },
     )
@@ -303,7 +312,8 @@ def create_market_order(
         size=size_str,
         timestampSeconds=ts,
         price=price_str,
-        reduceOnly=reduce_only,   # 平仓单用 True（Reduce-Only）
+        # 注意：新版 SDK 用 reduceOnly / clientOrderId（驼峰写法）
+        reduceOnly=reduce_only,
         clientOrderId=client_id,
     )
 
