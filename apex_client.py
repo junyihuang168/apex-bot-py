@@ -1,7 +1,6 @@
 import os
 import time
-import math
-from typing import Tuple, Dict, Any
+from decimal import Decimal, ROUND_DOWN
 
 from apexomni.http_private_sign import HttpPrivateSign
 from apexomni.http_private_v3 import HttpPrivate_v3
@@ -13,15 +12,20 @@ from apexomni.constants import (
 )
 
 
+# ---------------------------
+# 小工具
+# ---------------------------
+
 def _env_bool(name: str, default: bool = False) -> bool:
-    """把环境变量转成 bool。"""
+    """环境变量字符串 -> bool."""
     value = os.getenv(name, str(default))
     return value.lower() in ("1", "true", "yes", "y", "on")
 
 
-def _get_base_and_network() -> Tuple[str, int]:
-    """根据环境变量决定 mainnet / testnet。"""
+def _get_base_and_network():
+    """根据环境变量决定 mainnet / testnet."""
     use_mainnet = _env_bool("APEX_USE_MAINNET", False)
+
     env_name = os.getenv("APEX_ENV", "").lower()
     if env_name in ("main", "mainnet", "prod", "production"):
         use_mainnet = True
@@ -31,8 +35,8 @@ def _get_base_and_network() -> Tuple[str, int]:
     return base_url, network_id
 
 
-def _get_api_credentials() -> Dict[str, str]:
-    """从环境变量里读 API key / secret / passphrase。"""
+def _get_api_credentials():
+    """从环境变量拿 API key 三件套."""
     return {
         "key": os.environ["APEX_API_KEY"],
         "secret": os.environ["APEX_API_SECRET"],
@@ -40,123 +44,207 @@ def _get_api_credentials() -> Dict[str, str]:
     }
 
 
-def _make_signed_client() -> HttpPrivateSign:
-    """带 zk 签名的客户端，用来真正下单 create_order_v3。"""
-    base_url, network_id = _get_base_and_network()
-    api_creds = _get_api_credentials()
+# ---------------------------
+# client 单例
+# ---------------------------
 
-    zk_seeds = os.environ["APEX_ZK_SEEDS"]
-    zk_l2 = os.getenv("APEX_L2KEY_SEEDS") or None
-
-    return HttpPrivateSign(
-        base_url,
-        network_id=network_id,
-        zk_seeds=zk_seeds,
-        zk_l2Key=zk_l2,
-        api_key_credentials=api_creds,
-    )
+_sign_client: HttpPrivateSign | None = None
+_http_v3_client: HttpPrivate_v3 | None = None
 
 
-def _make_public_client() -> HttpPrivate_v3:
-    """轻量级 v3 客户端，用来调公开接口（比如 get_worst_price_v3）。"""
-    base_url, network_id = _get_base_and_network()
-    api_creds = _get_api_credentials()
-    return HttpPrivate_v3(
-        base_url,
-        network_id=network_id,
-        api_key_credentials=api_creds,
-    )
+def _get_sign_client() -> HttpPrivateSign:
+    global _sign_client
+    if _sign_client is None:
+        base_url, network_id = _get_base_and_network()
+        api_creds = _get_api_credentials()
+        zk_seeds = os.environ["APEX_ZK_SEEDS"]
+        zk_l2 = os.getenv("APEX_L2KEY_SEEDS") or None
+
+        _sign_client = HttpPrivateSign(
+            base_url,
+            network_id=network_id,
+            zk_seeds=zk_seeds,
+            zk_l2Key=zk_l2,
+            api_key_credentials=api_creds,
+        )
+    return _sign_client
 
 
-def floor_to_decimals(value: float, decimals: int) -> float:
-    """向下取整到 N 位小数（永远不会四舍五入往上）。"""
-    factor = 10 ** decimals
-    return math.floor(value * factor) / factor
+def _get_http_v3_client() -> HttpPrivate_v3:
+    global _http_v3_client
+    if _http_v3_client is None:
+        base_url, network_id = _get_base_and_network()
+        api_creds = _get_api_credentials()
+        _http_v3_client = HttpPrivate_v3(
+            base_url,
+            network_id=network_id,
+            api_key_credentials=api_creds,
+        )
+    return _http_v3_client
 
 
-def _extract_worst_price(res: Any) -> str:
-    """
-    从 get_worst_price_v3 的返回里尽量把 worstPrice 抠出来。
-    有些 SDK 可能包了一层 data，这里做一点兼容。
-    """
-    if isinstance(res, dict):
-        if "worstPrice" in res:
-            return str(res["worstPrice"])
-        if "data" in res and isinstance(res["data"], dict) and "worstPrice" in res["data"]:
-            return str(res["data"]["worstPrice"])
-    # 实在不行就直接转成字符串（最保底的 fallback）
-    return str(res)
-
+# ---------------------------
+# 通用查询函数
+# ---------------------------
 
 def get_account():
-    """方便在日志或本地调试时看账户信息。"""
-    client = _make_signed_client()
+    """查询账号信息（positions 等），方便 reduce_only 逻辑用。"""
+    client = _get_sign_client()
     return client.get_account_v3()
 
+
+def get_worst_price(symbol: str, side: str, size: str = "1") -> str:
+    """
+    用官方 GET /v3/get-worst-price 查盘口价。
+    只需要一个大概 size（1 就够），主要是拿 price。
+    """
+    side = side.upper()
+    client = _get_http_v3_client()
+    res = client.get_worst_price_v3(symbol=symbol, size=str(size), side=side)
+
+    price = None
+    if isinstance(res, dict):
+        if "worstPrice" in res:
+            price = res["worstPrice"]
+        elif "data" in res and isinstance(res["data"], dict):
+            price = res["data"].get("worstPrice")
+
+    if price is None:
+        raise RuntimeError(f"[apex_client] get_worst_price_v3 返回异常: {res}")
+
+    price_str = str(price)
+    print(f"[apex_client] worst price for {symbol} {side} size={size}: {price_str}")
+    return price_str
+
+
+def _decimal_floor(value: float, step: float) -> float:
+    """
+    把 value 按 step 向下取整（保证是 step 的整数倍，同时保证 <= 原值）
+    """
+    d = Decimal(str(value))
+    s = Decimal(str(step))
+    if s <= 0:
+        return float(d)
+
+    scaled = (d / s).quantize(Decimal("1"), rounding=ROUND_DOWN)
+    floored = scaled * s
+    return float(floored)
+
+
+def _get_position_size(symbol: str) -> float:
+    """
+    当前 symbol 的持仓绝对数量（不管多空），没有就返回 0.
+    """
+    try:
+        acc = get_account()
+    except Exception as e:
+        print("[apex_client] get_account_v3 失败:", e)
+        return 0.0
+
+    positions = acc.get("positions") or []
+    for p in positions:
+        if p.get("symbol") == symbol:
+            try:
+                return abs(float(p.get("size", "0")))
+            except Exception:
+                return 0.0
+    return 0.0
+
+
+# ---------------------------
+# 下单核心：方案 B（按 USDT 量自动换算成币）
+# ---------------------------
 
 def create_market_order(
     symbol: str,
     side: str,
     usdt_size: float,
-    tv_price: float,
     reduce_only: bool = False,
-    client_id: str | None = None,
 ):
     """
-    用“USDT 金额”来创建 MARKET 市价单（方案 B）。
+    根据 USDT 金额自动换算成币数量，再按官方 Demo 调用 create_order_v3。
 
-    - symbol: 例如 'ZEC-USDT'
-    - side: 'BUY' / 'SELL'
-    - usdt_size: TradingView 传过来的 USDT 金额（比如 10 表示 10 USDT 名义）
-    - tv_price: TradingView 发过来的价格，用来估算数量
-    - reduce_only: True=减仓/平仓，False=开仓
-    - client_id: 从 TradingView 传来的 client_id（会转发给 Apex）
+    参数：
+      - symbol: 例如 'ZEC-USDT'
+      - side:   'BUY' / 'SELL'
+      - usdt_size: 预算多少 USDT（来自 TradingView 的 size 字段）
+      - reduce_only: True 表示“只平仓不反向开新仓”，这里通过当前持仓 size 做截断实现
     """
     side = side.upper()
     usdt_size = float(usdt_size)
-    tv_price = float(tv_price)
 
     if usdt_size <= 0:
-        raise ValueError(f"usdt_size must be > 0, got {usdt_size}")
+        raise ValueError("usdt_size 必须 > 0")
 
-    # --- 1) USDT -> 币的数量（先用 TV 价格估算） ---
-    raw_qty = usdt_size / tv_price
-    # 大部分 perp 的 stepSize = 0.01，这里统一向下取 2 位小数，简单又安全
-    qty = floor_to_decimals(raw_qty, 2)
-    if qty <= 0:
-        raise ValueError(f"computed qty <= 0 from usdt_size={usdt_size}, tv_price={tv_price}")
+    # 1) 先拿 worst price
+    price_str = get_worst_price(symbol, side, size="1")
+    price = float(price_str)
 
-    qty_str = f"{qty:.2f}"
+    # 2) 预算 USDT 换算成“理论上的币数量”
+    raw_qty = usdt_size / price
 
-    # --- 2) 用官方 get_worst_price_v3 拿一个合法的价格 ---
-    public_client = _make_public_client()
-    worst_res = public_client.get_worst_price_v3(
-        symbol=symbol,
-        size=qty_str,
-        side=side,
-    )
-    worst_price_str = _extract_worst_price(worst_res)
+    # 3) reduce_only 的话，不允许下单数量超过当前持仓
+    if reduce_only:
+        pos_size = _get_position_size(symbol)
+        if pos_size <= 0:
+            print(f"[apex_client] reduce_only=True 但 {symbol} 没有持仓，跳过下单。")
+            return {"code": 0, "msg": "NO_POSITION"}
+        raw_qty = min(raw_qty, pos_size)
 
-    # --- 3) 带 zk 签名的真正下单 ---
-    ts = int(time.time())
-    if client_id is None:
-        safe_symbol = symbol.replace("/", "-")
-        client_id = f"tv-{safe_symbol}-{ts}"
+    # 先用 6 位小数做一个初始数量
+    qty = float(f"{raw_qty:.6f}")
 
-    signed_client = _make_signed_client()
+    client = _get_sign_client()
 
-    params = {
-        "symbol": symbol,
-        "side": side,
-        "type": "MARKET",
-        "size": qty_str,          # 注意：这里是“币的数量”，不是 USDT 金额
-        "price": worst_price_str,
-        "reduce_only": reduce_only,
-        "client_id": client_id,   # ✅ 一定要用 client_id（蛇形），不要用 clientOrderId
-        "timestampSeconds": ts,
-    }
-    print("[apex_client] create_market_order params:", params)
+    def _send(size_float: float):
+        # 转成字符串，去掉多余 0
+        size_str = f"{size_float:.6f}".rstrip("0").rstrip(".")
+        ts = int(time.time())
 
-    order = signed_client.create_order_v3(**params)
-    print("[apex_client] order response:", order)
+        print(
+            "[apex_client] create_market_order params:",
+            {
+                "symbol": symbol,
+                "side": side,
+                "type": "MARKET",
+                "size": size_str,
+                "price": price_str,
+                "reduce_only": reduce_only,
+                "timestampSeconds": ts,
+            },
+        )
+
+        # ⚠️ 这里严格对齐官方 Demo：只能传这几个参数
+        order = client.create_order_v3(
+            symbol=symbol,
+            side=side,
+            type="MARKET",
+            size=size_str,
+            timestampSeconds=ts,
+            price=price_str,
+        )
+
+        print("[apex_client] order response:", order)
+        return order
+
+    # 4) 第一次尝试
+    order = _send(qty)
+
+    # 5) 如果因为小数精度 / stepSize 报错，再按 stepSize 向下取整一次重试
+    try:
+        if isinstance(order, dict) and order.get("key") == "INVALID_DECIMAL_SCALE_PARAM":
+            detail = order.get("detail") or {}
+            step = detail.get("stepSize") or detail.get("step_size")
+            if step is not None:
+                step_f = float(step)
+                adj_qty = _decimal_floor(raw_qty, step_f)
+                if adj_qty <= 0:
+                    raise RuntimeError(
+                        f"size {raw_qty} 太小，按 stepSize={step_f} 处理后为 0"
+                    )
+                print(f"[apex_client] 因 stepSize 重试: stepSize={step_f}, size={adj_qty}")
+                order = _send(adj_qty)
+    except Exception as e:
+        print("[apex_client] 重试逻辑出错（可以忽略，看看上面的返回）:", e)
+
     return order
