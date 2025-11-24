@@ -1,462 +1,183 @@
-# apex_client.py
-
 import os
-import time
-import random
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal
+from flask import Flask, request, jsonify
 
-from apexomni.http_private_sign import HttpPrivateSign
-from apexomni.constants import (
-    APEX_OMNI_HTTP_MAIN,
-    APEX_OMNI_HTTP_TEST,
-    NETWORKID_OMNI_MAIN_ARB,
-    NETWORKID_TEST,
+# 从 apex_client.py 导入工具函数
+from apex_client import (
+    create_market_order,
+    create_market_order_with_tpsl,
+    get_market_price,
 )
 
-# -------------------------------------------------------------------
-# 交易规则（默认：最小数量 0.01，步长 0.01，小数点后 2 位）
-# 如果以后某个币不一样，可以在 SYMBOL_RULES 里单独覆盖
-# -------------------------------------------------------------------
-DEFAULT_SYMBOL_RULES = {
-    "min_qty": Decimal("0.01"),   # 最小数量
-    "step_size": Decimal("0.01"), # 每档步长
-    "qty_decimals": 2,            # 小数位数
-}
+app = Flask(__name__)
 
-SYMBOL_RULES: dict[str, dict] = {
-    # 举例：如果以后 BTC-USDT 规则不同，可以这样写：
-    # "BTC-USDT": {
-    #     "min_qty": Decimal("0.001"),
-    #     "step_size": Decimal("0.001"),
-    #     "qty_decimals": 3,
-    # },
-}
+# TradingView 里的 secret，用来校验
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+
+# 记住「每个 bot 在每个 symbol 上自己开的那一份仓位」
+# key:  (bot_id, symbol) -> value: {"side": "BUY"/"SELL", "qty": Decimal}
+BOT_POSITIONS: dict[tuple[str, str], dict] = {}
 
 
-def _get_symbol_rules(symbol: str) -> dict:
-    """返回某个交易对的撮合规则（没有就用默认）"""
-    s = symbol.upper()
-    rules = SYMBOL_RULES.get(s, {})
-    merged = {**DEFAULT_SYMBOL_RULES, **rules}
-    return merged
+@app.route("/", methods=["GET"])
+def index():
+    # DO health check 就是 GET / 看你有没有回 200
+    return "OK", 200
 
 
-def _snap_quantity(symbol: str, theoretical_qty: Decimal) -> Decimal:
-    """
-    把理论数量对齐到交易所允许的网格：
-    - 向下取整到 step_size 的整数倍
-    - 再限制为 qty_decimals 位小数
-    - 如果小于 min_qty，就报错（预算太小）
-    """
-    if theoretical_qty <= 0:
-        raise ValueError("calculated quantity must be > 0")
-
-    rules = _get_symbol_rules(symbol)
-    step = rules["step_size"]
-    min_qty = rules["min_qty"]
-    decimals = rules["qty_decimals"]
-
-    # 向下取整到 step 的整数倍
-    steps = (theoretical_qty // step)
-    snapped = steps * step
-
-    # 限制小数位数
-    quantum = Decimal("1").scaleb(-decimals)  # 10^-decimals，例如 0.01
-    snapped = snapped.quantize(quantum, rounding=ROUND_DOWN)
-
-    if snapped < min_qty:
-        raise ValueError(
-            f"budget too small: snapped quantity {snapped} < minQty {min_qty}"
-        )
-
-    return snapped
-
-
-# ---------------------------
-# 内部小工具函数
-# ---------------------------
-def _env_bool(name: str, default: bool = False) -> bool:
-    """把环境变量字符串转成布尔值."""
-    value = os.getenv(name, str(default))
-    return value.lower() in ("1", "true", "yes", "y", "on")
-
-
-def _get_base_and_network():
-    """根据环境变量决定用 mainnet 还是 testnet。"""
-    use_mainnet = _env_bool("APEX_USE_MAINNET", False)
-
-    # 兼容你额外加的 APEX_ENV=main
-    env_name = os.getenv("APEX_ENV", "").lower()
-    if env_name in ("main", "mainnet", "prod", "production"):
-        use_mainnet = True
-
-    base_url = APEX_OMNI_HTTP_MAIN if use_mainnet else APEX_OMNI_HTTP_TEST
-    network_id = NETWORKID_OMNI_MAIN_ARB if use_mainnet else NETWORKID_TEST
-    return base_url, network_id
-
-
-def _get_api_credentials():
-    """从环境变量里拿 API key / secret / passphrase。"""
-    return {
-        "key": os.environ["APEX_API_KEY"],
-        "secret": os.environ["APEX_API_SECRET"],
-        "passphrase": os.environ["APEX_API_PASSPHRASE"],
-    }
-
-
-def _random_client_id() -> str:
-    """
-    生成 ApeX 官方风格的 clientId：纯数字字符串，
-    避免 ORDER_INVALID_CLIENT_ORDER_ID。
-    """
-    return str(int(float(str(random.random())[2:])))
-
-
-# ---------------------------
-# 创建 ApeX 客户端
-# ---------------------------
-def get_client() -> HttpPrivateSign:
-    """
-    返回带 zk 签名的 HttpPrivateSign 客户端，
-    用于真正的下单（create_order_v3）。
-    """
-    base_url, network_id = _get_base_and_network()
-    api_creds = _get_api_credentials()
-
-    zk_seeds = os.environ["APEX_ZK_SEEDS"]
-    zk_l2 = os.getenv("APEX_L2KEY_SEEDS") or None
-
-    client = HttpPrivateSign(
-        base_url,
-        network_id=network_id,
-        zk_seeds=zk_seeds,
-        zk_l2Key=zk_l2,
-        api_key_credentials=api_creds,
-    )
-
-    # ① 先拉 configs_v3，初始化 client.configV3
+@app.route("/webhook", methods=["POST"])
+def tv_webhook():
+    # ---------------------------
+    # 1. 解析 & 校验基础字段
+    # ---------------------------
     try:
-        cfg = client.configs_v3()
-        print("[apex_client] configs_v3 ok:", cfg)
+        body = request.get_json(force=True, silent=False)
     except Exception as e:
-        print("[apex_client] WARNING configs_v3 error:", e)
+        print("[WEBHOOK] invalid json:", e)
+        return "invalid json", 400
 
-    # ② 再拉 account_v3，初始化 client.accountV3
-    try:
-        acc = client.get_account_v3()
-        print("[apex_client] get_account_v3 ok:", acc)
-    except Exception as e:
-        print("[apex_client] WARNING get_account_v3 error:", e)
+    print("[WEBHOOK] raw body:", body)
 
-    return client
+    if not isinstance(body, dict):
+        return "bad payload", 400
 
+    # 校验 secret（可选）
+    if WEBHOOK_SECRET:
+        if body.get("secret") != WEBHOOK_SECRET:
+            print("[WEBHOOK] invalid secret")
+            return "forbidden", 403
 
-# ---------------------------
-# 对外工具函数
-# ---------------------------
-def get_account():
-    """查询账户信息，方便你在本地或日志里调试。"""
-    client = get_client()
-    return client.get_account_v3()
+    symbol = body.get("symbol")
+    side_raw = str(body.get("side", "")).upper()
+    signal_type = str(body.get("signal_type", "")).lower()  # "entry" / "exit"
+    action = str(body.get("action", "")).lower()
+    size_field = body.get("size")  # 入场时的 USDT 金额
+    bot_id = str(body.get("bot_id", "default"))             # 每个机器人要传一个 bot_id
+    tv_client_id = body.get("client_id")                    # 只用于日志
 
+    if not symbol:
+        return "missing symbol", 400
 
-def get_market_price(symbol: str, side: str, size: str) -> str:
-    """
-    使用官方推荐的 GET /v3/get-worst-price 来获取市价单应当使用的价格。
-    - symbol: 例如 'BNB-USDT'
-    - side: 'BUY' 或 'SELL'
-    - size: 下单数量（字符串或数字均可）
+    # 兼容：如果没写 signal_type，用 action 来判断 open/close
+    if signal_type not in ("entry", "exit"):
+        if action in ("open", "entry"):
+            signal_type = "entry"
+        elif action in ("close", "exit"):
+            signal_type = "exit"
+        else:
+            return "missing signal_type (entry/exit)", 400
 
-    返回: 字符串形式的价格（比如 '532.15'）
-    """
-    base_url, network_id = _get_base_and_network()
-    api_creds = _get_api_credentials()
+    # -----------------------
+    # 2. ENTRY：买入 / 开仓
+    # -----------------------
+    if signal_type == "entry":
+        if side_raw not in ("BUY", "SELL"):
+            return "missing or invalid side", 400
 
-    # 官方示例用的是 HttpPrivate_v3（只用 API key，不需要 zk）
-    from apexomni.http_private_v3 import HttpPrivate_v3
+        if size_field is None:
+            return "missing size (USDT)", 400
 
-    http_v3_client = HttpPrivate_v3(
-        base_url,
-        network_id=network_id,
-        api_key_credentials=api_creds,
-    )
-
-    side = side.upper()
-    size_str = str(size)
-
-    res = http_v3_client.get_worst_price_v3(
-        symbol=symbol,
-        size=size_str,
-        side=side,
-    )
-
-    price = None
-    if isinstance(res, dict):
-        if "worstPrice" in res:
-            price = res["worstPrice"]
-        elif "data" in res and isinstance(res["data"], dict) and "worstPrice" in res["data"]:
-            price = res["data"]["worstPrice"]
-
-    if price is None:
-        raise RuntimeError(f"[apex_client] get_worst_price_v3 返回异常: {res}")
-
-    price_str = str(price)
-    print(f"[apex_client] worst price for {symbol} {side} size={size_str}: {price_str}")
-    return price_str
-
-
-def create_market_order(
-    symbol: str,
-    side: str,
-    size: str | float | int | None = None,
-    size_usdt: str | float | int | None = None,
-    reduce_only: bool = False,
-    client_id: str | None = None,
-):
-    """
-    创建 ApeX 的 MARKET 市价单。
-
-    两种用法：
-    1) 旧用法：直接传币的数量：
-         create_market_order(symbol, side, size="0.05", ...)
-       → 会直接用 size 作为下单数量。
-
-    2) 新用法（推荐）：传 USDT 金额，自动撮合数量：
-         create_market_order(symbol, side, size_usdt="10", ...)
-       → 会根据市价 + 交易规则，把 10 USDT
-         换算为合法的数量（如 0.01 ZEC），再下单。
-    """
-    client = get_client()
-
-    # 兜底：如果属性没初始化，就补拉一次
-    if not hasattr(client, "configV3"):
-        try:
-            client.configs_v3()
-        except Exception as e:
-            print("[apex_client] fallback configs_v3 error:", e)
-
-    if not hasattr(client, "accountV3"):
-        try:
-            client.get_account_v3()
-        except Exception as e:
-            print("[apex_client] fallback get_account_v3 error:", e)
-
-    side = side.upper()
-
-    # -----------------------------
-    # 分支 A：用 USDT 预算自动撮合
-    # -----------------------------
-    if size_usdt is not None:
-        budget = Decimal(str(size_usdt))
+        budget = Decimal(str(size_field))
         if budget <= 0:
-            raise ValueError("size_usdt must be > 0")
+            return "size (USDT) must be > 0", 400
 
-        rules = _get_symbol_rules(symbol)
-        min_qty = rules["min_qty"]
-        decimals = rules["qty_decimals"]
-
-        # 先用最小数量去问一次 worst price，当作当前市价参考
-        ref_price_decimal = Decimal(
-            get_market_price(symbol, side, str(min_qty))
+        # ★ 真正下单（市价开仓 + 附带 TP/SL 触发价）
+        order_info = create_market_order_with_tpsl(
+            symbol=symbol,
+            side=side_raw,
+            size_usdt=budget,
+            tp_pct=Decimal("0.019"),  # +1.9% TP
+            sl_pct=Decimal("0.006"),  # -0.6% SL
+            client_id=tv_client_id,
         )
 
-        # 理论数量 = 预算 / 价格
-        theoretical_qty = budget / ref_price_decimal
+        # 从返回值里拿出真实撮合后的数量，记到每个 bot 自己的仓位上
+        computed = order_info.get("computed", {}) if isinstance(order_info, dict) else {}
+        size_str = computed.get("size")
+        if size_str is None:
+            print("[ENTRY] WARNING: no 'computed.size' in order_info, skip BOT_POSITIONS update")
+            return jsonify({"status": "ok", "mode": "entry", "order": order_info}), 200
 
-        # 对齐到交易所允许的网格（0.01, 0.02, ...）
-        snapped_qty = _snap_quantity(symbol, theoretical_qty)
-
-        # 为了更准确，再用真正的下单数量问一次 worst price
-        price_str = get_market_price(symbol, side, str(snapped_qty))
-        price_decimal = Decimal(price_str)
-
-        # 格式化成固定小数位（例如 0.01）
-        size_str = format(snapped_qty, f".{decimals}f")
-
-        used_budget = (snapped_qty * price_decimal).quantize(
-            Decimal("0.01"), rounding=ROUND_DOWN
-        )
+        qty = Decimal(str(size_str))
 
         print(
-            f"[apex_client] budget={budget} USDT -> qty={size_str} {symbol.split('-')[0]}, "
-            f"used≈{used_budget} USDT (price {price_str})"
+            f"[ENTRY] bot={bot_id} symbol={symbol} side={side_raw} "
+            f"final snapped qty={qty}, "
+            f"entry={computed.get('entry_price')} "
+            f"tp={computed.get('tp_trigger')} "
+            f"sl={computed.get('sl_trigger')}"
         )
 
-    # -----------------------------
-    # 分支 B：旧逻辑，直接用 size 作为数量
-    # -----------------------------
-    else:
-        if size is None:
-            raise ValueError("size or size_usdt must be provided")
+        # 记住这个 bot 在这个 symbol 上“自己开的那一份仓位”
+        key = (bot_id, symbol)
+        pos = BOT_POSITIONS.get(key)
 
-        size_str = str(size)
-        price_str = get_market_price(symbol, side, size_str)
+        if pos and pos["side"] == side_raw:
+            # 同方向加仓：数量累加
+            new_qty = pos["qty"] + qty
+            BOT_POSITIONS[key] = {"side": side_raw, "qty": new_qty}
+        else:
+            # 第一次开仓/反向开仓：覆盖
+            BOT_POSITIONS[key] = {"side": side_raw, "qty": qty}
 
-    ts = int(time.time())
+        print(f"[ENTRY] BOT_POSITIONS[{key}] = {BOT_POSITIONS[key]}")
 
-    # ApeX 使用纯数字 clientId
-    apex_client_id = _random_client_id()
-    tv_client_id = client_id
-    if tv_client_id:
+        return jsonify({
+            "status": "ok",
+            "mode": "entry",
+            "order": order_info,
+            "bot_position": {
+                "bot_id": bot_id,
+                "symbol": symbol,
+                "side": BOT_POSITIONS[key]["side"],
+                "qty": str(BOT_POSITIONS[key]["qty"]),
+            },
+        }), 200
+
+    # -----------------------
+    # 3. EXIT：卖出 / 平仓
+    # -----------------------
+    if signal_type == "exit":
+        key = (bot_id, symbol)
+        pos = BOT_POSITIONS.get(key)
+
+        if not pos or pos["qty"] <= 0:
+            print(f"[EXIT] bot={bot_id} symbol={symbol}: no position to close")
+            # 返回 200，避免 TV 重试
+            return jsonify({"status": "no_position"}), 200
+
+        entry_side = pos["side"]
+        qty = pos["qty"]
+
+        exit_side = "SELL" if entry_side == "BUY" else "BUY"
+
         print(
-            f"[apex_client] tv_client_id={tv_client_id} -> apex_clientId={apex_client_id}"
+            f"[EXIT] bot={bot_id} symbol={symbol} entry_side={entry_side} "
+            f"qty={qty} -> exit_side={exit_side}"
         )
-    else:
-        print(f"[apex_client] apex_clientId={apex_client_id} (no tv_client_id)")
 
-    print(
-        "[apex_client] create_market_order params:",
-        {
-            "symbol": symbol,
-            "side": side,
-            "type": "MARKET",
-            "size": size_str,
-            "price": price_str,
-            "reduceOnly": reduce_only,
-            "clientId": apex_client_id,
-            "timestampSeconds": ts,
-        },
-    )
-
-    # 关键：参数名要和 SDK 的 create_order_v3 定义一致
-    order = client.create_order_v3(
-        symbol=symbol,
-        side=side,
-        type="MARKET",
-        size=size_str,
-        price=price_str,
-        timestampSeconds=ts,
-        reduceOnly=reduce_only,  # ✅ 驼峰写法
-        clientId=apex_client_id,  # ✅ 纯数字 ID
-    )
-
-    print("[apex_client] order response:", order)
-    return order
-
-
-# ---------------------------------------------------------
-# 市价开仓 + 同时设置 TP/SL 触发价
-# ---------------------------------------------------------
-def create_market_order_with_tpsl(
-    symbol: str,
-    side: str,
-    size_usdt: str | float | int,
-    tp_pct: float | str | Decimal = Decimal("0.019"),  # +1.9%
-    sl_pct: float | str | Decimal = Decimal("0.006"),  # -0.6%
-    client_id: str | None = None,
-):
-    """
-    市价开仓 + 附带 TP/SL 触发价（由 Apex 执行）。
-    - symbol: 例如 "ZEC-USDT"
-    - side: "BUY" / "SELL"
-    - size_usdt: 使用多少 USDT 预算建仓
-    - tp_pct: 如 0.019 / "0.019" / Decimal("0.019")
-    - sl_pct: 如 0.006 / "0.006" / Decimal("0.006")
-    """
-    client = get_client()
-
-    # 保底初始化
-    if not hasattr(client, "configV3"):
-        try:
-            client.configs_v3()
-        except Exception as e:
-            print("[apex_client] fallback configs_v3 error (tpsl):", e)
-
-    if not hasattr(client, "accountV3"):
-        try:
-            client.get_account_v3()
-        except Exception as e:
-            print("[apex_client] fallback get_account_v3 error (tpsl):", e)
-
-    side = side.upper()
-    budget = Decimal(str(size_usdt))
-    if budget <= 0:
-        raise ValueError("size_usdt must be > 0")
-
-    rules = _get_symbol_rules(symbol)
-    min_qty = rules["min_qty"]
-    decimals = rules["qty_decimals"]
-
-    # 先用最小数量估价
-    ref_price_decimal = Decimal(get_market_price(symbol, side, str(min_qty)))
-    theoretical_qty = budget / ref_price_decimal
-    snapped_qty = _snap_quantity(symbol, theoretical_qty)
-
-    # 真正下单价格（worst price）
-    price_str = get_market_price(symbol, side, str(snapped_qty))
-    price_decimal = Decimal(price_str)
-
-    size_str = format(snapped_qty, f".{decimals}f")
-    used_budget = (snapped_qty * price_decimal).quantize(
-        Decimal("0.01"), rounding=ROUND_DOWN
-    )
-
-    # ===== 计算 TP / SL 触发价 =====
-    tp_pct_dec = Decimal(str(tp_pct))
-    sl_pct_dec = Decimal(str(sl_pct))
-
-    one = Decimal("1")
-    if side == "BUY":
-        tp_price_dec = price_decimal * (one + tp_pct_dec)
-        sl_price_dec = price_decimal * (one - sl_pct_dec)
-    else:  # SELL / 做空
-        tp_price_dec = price_decimal * (one - tp_pct_dec)
-        sl_price_dec = price_decimal * (one + sl_pct_dec)
-
-    price_quantum = Decimal("0.001")
-    tp_price_dec = tp_price_dec.quantize(price_quantum, rounding=ROUND_DOWN)
-    sl_price_dec = sl_price_dec.quantize(price_quantum, rounding=ROUND_DOWN)
-
-    tp_trigger_str = str(tp_price_dec)
-    sl_trigger_str = str(sl_price_dec)
-
-    ts = int(time.time())
-    apex_client_id = _random_client_id()
-    tv_client_id = client_id
-
-    if tv_client_id:
-        print(
-            f"[apex_client] (tpsl) tv_client_id={tv_client_id} -> apex_clientId={apex_client_id}"
+        order = create_market_order(
+            symbol=symbol,
+            side=exit_side,
+            size=str(qty),
+            reduce_only=True,
+            client_id=tv_client_id,
         )
-    else:
-        print(f"[apex_client] (tpsl) apex_clientId={apex_client_id} (no tv_client_id)")
 
-    debug_params = {
-        "symbol": symbol,
-        "side": side,
-        "type": "MARKET",
-        "size": size_str,
-        "price": price_str,
-        "tpTriggerPrice": tp_trigger_str,
-        "slTriggerPrice": sl_trigger_str,
-    }
-    print("[apex_client] create_market_order_with_tpsl params:", debug_params)
+        BOT_POSITIONS[key] = {"side": entry_side, "qty": Decimal("0")}
+        print(f"[EXIT] BOT_POSITIONS[{key}] -> {BOT_POSITIONS[key]}")
 
-    # ⭐ 这里只传 SDK 支持的参数：不再传 slType / tpType
-    order = client.create_order_v3(
-        symbol=symbol,
-        side=side,
-        type="MARKET",
-        size=size_str,
-        price=price_str,
-        timestampSeconds=ts,
-        reduceOnly=False,
-        clientId=apex_client_id,
-        tpTriggerPrice=tp_trigger_str,
-        slTriggerPrice=sl_trigger_str,
-    )
+        return jsonify({
+            "status": "ok",
+            "mode": "exit",
+            "order": order,
+        }), 200
 
-    print("[apex_client] (tpsl) order response:", order)
+    # 其他类型暂时不支持
+    return "unsupported signal_type", 400
 
-    return {
-        "raw_order": order,
-        "computed": {
-            "symbol": symbol,
-            "side": side,
-            "size": size_str,
-            "entry_price": price_str,
-            "tp_trigger": tp_trigger_str,
-            "sl_trigger": sl_trigger_str,
-            "used_budget": str(used_budget),
-        },
-    }
+
+if __name__ == "__main__":
+    # DO / Render 等平台一般会注入 PORT 环境变量
+    port = int(os.getenv("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port)
