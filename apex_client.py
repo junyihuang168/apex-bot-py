@@ -363,7 +363,8 @@ def create_market_order_with_tpsl(
 
     注意：
     1）这是 position 级别的 TP/SL，会跟仓位绑定；
-    2）本函数仅支持用 USDT 金额撮合（size_usdt）。
+    2）本函数仅支持用 USDT 金额撮合（size_usdt），
+       你原来的 create_market_order 仍然可以直接用。
     """
     client = get_client()
 
@@ -445,7 +446,7 @@ def create_market_order_with_tpsl(
     else:
         print(f"[apex_client] (TP/SL) apex_clientId={apex_client_id} (no tv_client_id)")
 
-    # ★ 按官方 sample6 的写法：不再传 slType / tpType，只用 isOpenTpslOrder + isSetOpenSl/Tp 等字段
+    # ★ 使用 create_order_v3 自带的 TP/SL 参数（不再传 slType / tpType）
     print(
         "[apex_client] create_market_order_with_tpsl params:",
         {
@@ -472,19 +473,19 @@ def create_market_order_with_tpsl(
         # ====== 关键：一并设置 Position TP/SL ======
         isOpenTpslOrder=True,
 
-        # SL
+        # SL：触发价+价格（ApeX 会按默认 STOP_MARKET 行为处理）
         isSetOpenSl=True,
         slSide=sl_side,
         slSize=size_str,
-        slPrice=str(sl_trigger),
         slTriggerPrice=str(sl_trigger),
+        slPrice=str(sl_trigger),
 
-        # TP
+        # TP：触发价+价格（默认 TAKE_PROFIT_MARKET 行为）
         isSetOpenTp=True,
         tpSide=tp_side,
         tpSize=size_str,
-        tpPrice=str(tp_trigger),
         tpTriggerPrice=str(tp_trigger),
+        tpPrice=str(tp_trigger),
     )
 
     print("[apex_client] (TP/SL) order response:", order)
