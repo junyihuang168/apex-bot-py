@@ -17,9 +17,9 @@ from apexomni.constants import (
 # -------------------------------------------------------------------
 
 DEFAULT_SYMBOL_RULES = {
-    "min_qty": Decimal("0.01"),     # 最小数量
-    "step_size": Decimal("0.01"),   # 每档步长
-    "qty_decimals": 2,              # 小数位数
+    "min_qty": Decimal("0.01"),      # 最小数量
+    "step_size": Decimal("0.01"),    # 每档步长
+    "qty_decimals": 2,               # 小数位数
 }
 
 SYMBOL_RULES: dict[str, dict] = {
@@ -333,8 +333,172 @@ def create_market_order(
         price=price_str,
         timestampSeconds=ts,
         reduceOnly=reduce_only,   # ✅ 驼峰写法
-        clientId=apex_client_id,   # ✅ 使用合法的纯数字 ID
+        clientId=apex_client_id,  # ✅ 使用合法的纯数字 ID
     )
 
     print("[apex_client] order response:", order)
     return order
+
+
+# ---------------------------------------------------------
+# 新增：市价入场 + 直接挂 TP(+1.9%) / SL(-0.6%) 的封装
+# ---------------------------------------------------------
+
+def create_market_order_with_tpsl(
+    symbol: str,
+    side: str,
+    size_usdt: str | float | int,
+    tp_pct: float | str | Decimal = 0.019,  # +1.9%
+    sl_pct: float | str | Decimal = 0.006,  # -0.6%
+    client_id: str | None = None,
+):
+    """
+    市价开仓 + 同一请求里挂 position TP/SL：
+    - 对于多单(BUY)：
+        TP 价格 = 开仓价 * (1 + tp_pct)
+        SL 价格 = 开仓价 * (1 - sl_pct)
+    - 对于空单(SELL)：
+        TP 价格 = 开仓价 * (1 - tp_pct)
+        SL 价格 = 开仓价 * (1 + sl_pct)
+
+    注意：
+    1）这是 position 级别的 TP/SL，会跟仓位绑定；
+    2）本函数仅支持用 USDT 金额撮合（size_usdt），
+       你原来的 create_market_order 仍然可以直接用。
+    """
+    client = get_client()
+
+    # 再保险：兜底初始化 config/account
+    if not hasattr(client, "configV3"):
+        try:
+            client.configs_v3()
+        except Exception as e:
+            print("[apex_client] fallback configs_v3 error:", e)
+
+    if not hasattr(client, "accountV3"):
+        try:
+            client.get_account_v3()
+        except Exception as e:
+            print("[apex_client] fallback get_account_v3 error:", e)
+
+    side = side.upper()
+    budget = Decimal(str(size_usdt))
+    if budget <= 0:
+        raise ValueError("size_usdt must be > 0")
+
+    rules = _get_symbol_rules(symbol)
+    min_qty = rules["min_qty"]
+    decimals = rules["qty_decimals"]
+
+    # 1) 先用最小数量问一次价格，得到参考价
+    ref_price_decimal = Decimal(
+        get_market_price(symbol, side, str(min_qty))
+    )
+
+    theoretical_qty = budget / ref_price_decimal
+    snapped_qty = _snap_quantity(symbol, theoretical_qty)
+
+    # 2) 用真实数量再问一次价格作为开仓价
+    price_str = get_market_price(symbol, side, str(snapped_qty))
+    entry_price = Decimal(price_str)
+
+    size_str = format(snapped_qty, f".{decimals}f")
+    used_budget = (snapped_qty * entry_price).quantize(
+        Decimal("0.01"), rounding=ROUND_DOWN
+    )
+
+    print(
+        f"[apex_client] (TP/SL) budget={budget} USDT -> qty={size_str} {symbol.split('-')[0]}, "
+        f"used≈{used_budget} USDT (entry {price_str})"
+    )
+
+    tp_pct_dec = Decimal(str(tp_pct))
+    sl_pct_dec = Decimal(str(sl_pct))
+
+    if side == "BUY":
+        # 多单：价格涨 +1.9% 止盈，下跌 -0.6% 止损
+        tp_trigger = (entry_price * (Decimal("1") + tp_pct_dec)).quantize(
+            Decimal("0.1"), rounding=ROUND_DOWN
+        )
+        sl_trigger = (entry_price * (Decimal("1") - sl_pct_dec)).quantize(
+            Decimal("0.1"), rounding=ROUND_DOWN
+        )
+        tp_side = "SELL"
+        sl_side = "SELL"
+    else:
+        # 空单：价格跌 -1.9% 止盈，上涨 +0.6% 止损
+        tp_trigger = (entry_price * (Decimal("1") - tp_pct_dec)).quantize(
+            Decimal("0.1"), rounding=ROUND_DOWN
+        )
+        sl_trigger = (entry_price * (Decimal("1") + sl_pct_dec)).quantize(
+            Decimal("0.1"), rounding=ROUND_DOWN
+        )
+        tp_side = "BUY"
+        sl_side = "BUY"
+
+    ts = int(time.time())
+    apex_client_id = _random_client_id()
+    tv_client_id = client_id
+    if tv_client_id:
+        print(
+            f"[apex_client] (TP/SL) tv_client_id={tv_client_id} -> apex_clientId={apex_client_id}"
+        )
+    else:
+        print(f"[apex_client] (TP/SL) apex_clientId={apex_client_id} (no tv_client_id)")
+
+    # ★ 这里使用 create_order_v3 的 TP/SL 参数（按官方文档）
+    #   isOpenTpslOrder + isSetOpenTp/isSetOpenSl 会在开仓时帮你挂好仓位 TP/SL
+    print(
+        "[apex_client] create_market_order_with_tpsl params:",
+        {
+            "symbol": symbol,
+            "side": side,
+            "type": "MARKET",
+            "size": size_str,
+            "price": price_str,
+            "tpTriggerPrice": str(tp_trigger),
+            "slTriggerPrice": str(sl_trigger),
+        },
+    )
+
+    order = client.create_order_v3(
+        symbol=symbol,
+        side=side,
+        type="MARKET",
+        size=size_str,
+        price=price_str,
+        timestampSeconds=ts,
+        reduceOnly=False,
+        clientId=apex_client_id,
+
+        # ====== 关键：一并设置 Position TP/SL ======
+        isOpenTpslOrder=True,
+
+        # SL：市价止损（STOP_MARKET）
+        isSetOpenSl=True,
+        slSide=sl_side,
+        slSize=size_str,
+        slType="STOP_MARKET",
+        slTriggerPrice=str(sl_trigger),
+        slPrice=str(sl_trigger),
+
+        # TP：市价止盈（TAKE_PROFIT_MARKET）
+        isSetOpenTp=True,
+        tpSide=tp_side,
+        tpSize=size_str,
+        tpType="TAKE_PROFIT_MARKET",
+        tpTriggerPrice=str(tp_trigger),
+        tpPrice=str(tp_trigger),
+    )
+
+    print("[apex_client] (TP/SL) order response:", order)
+
+    return {
+        "order": order,
+        "computed": {
+            "size": size_str,
+            "entry_price": str(entry_price),
+            "tp_trigger": str(tp_trigger),
+            "sl_trigger": str(sl_trigger),
+        },
+    }
