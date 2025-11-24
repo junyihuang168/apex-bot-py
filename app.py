@@ -119,11 +119,6 @@ def get_client() -> HttpPrivateSign:
     """
     返回带 zk 签名的 HttpPrivateSign 客户端，
     用于真正的下单（create_order_v3）。
-
-    这里模仿官方 demo：
-        1) new HttpPrivateSign(...)
-        2) client.configs_v3()
-        3) client.get_account_v3()
     """
     base_url, network_id = _get_base_and_network()
     api_creds = _get_api_credentials()
@@ -339,12 +334,15 @@ def create_market_order(
     return order
 
 
+# ---------------------------------------------------------
+# 市价开仓 + 同时设置 TP/SL 触发价
+# ---------------------------------------------------------
 def create_market_order_with_tpsl(
     symbol: str,
     side: str,
     size_usdt: str | float | int,
-    tp_pct: Decimal,
-    sl_pct: Decimal,
+    tp_pct: float | str | Decimal = Decimal("0.019"),  # +1.9%
+    sl_pct: float | str | Decimal = Decimal("0.006"),  # -0.6%
     client_id: str | None = None,
 ):
     """
@@ -352,21 +350,8 @@ def create_market_order_with_tpsl(
     - symbol: 例如 "ZEC-USDT"
     - side: "BUY" / "SELL"
     - size_usdt: 使用多少 USDT 预算建仓
-    - tp_pct: 比如 Decimal("0.019") 表示 +1.9%
-    - sl_pct: 比如 Decimal("0.006") 表示 -0.6%
-
-    返回:
-    {
-      "raw_order": <SDK 返回>,
-      "computed": {
-          "size": "0.11",
-          "entry_price": "540.67",
-          "tp_trigger": "550.9",
-          "sl_trigger": "537.4",
-          "used_budget": "59.47",
-          "side": "BUY",
-      }
-    }
+    - tp_pct: 如 0.019 / "0.019" / Decimal("0.019")
+    - sl_pct: 如 0.006 / "0.006" / Decimal("0.006")
     """
     client = get_client()
 
@@ -407,15 +392,17 @@ def create_market_order_with_tpsl(
     )
 
     # ===== 计算 TP / SL 触发价 =====
+    tp_pct_dec = Decimal(str(tp_pct))
+    sl_pct_dec = Decimal(str(sl_pct))
+
     one = Decimal("1")
     if side == "BUY":
-        tp_price_dec = price_decimal * (one + tp_pct)
-        sl_price_dec = price_decimal * (one - sl_pct)
+        tp_price_dec = price_decimal * (one + tp_pct_dec)
+        sl_price_dec = price_decimal * (one - sl_pct_dec)
     else:  # SELL / 做空
-        tp_price_dec = price_decimal * (one - tp_pct)
-        sl_price_dec = price_decimal * (one + sl_pct)
+        tp_price_dec = price_decimal * (one - tp_pct_dec)
+        sl_price_dec = price_decimal * (one + sl_pct_dec)
 
-    # 粗略保留到 3 位小数（足够用，一般交易所会再校验）
     price_quantum = Decimal("0.001")
     tp_price_dec = tp_price_dec.quantize(price_quantum, rounding=ROUND_DOWN)
     sl_price_dec = sl_price_dec.quantize(price_quantum, rounding=ROUND_DOWN)
@@ -445,7 +432,7 @@ def create_market_order_with_tpsl(
     }
     print("[apex_client] create_market_order_with_tpsl params:", debug_params)
 
-    # 注意：这里 **不要** 传 slType，SDK 目前不支持这个参数
+    # ⭐ 这里只传 SDK 支持的参数：不再传 slType / tpType
     order = client.create_order_v3(
         symbol=symbol,
         side=side,
