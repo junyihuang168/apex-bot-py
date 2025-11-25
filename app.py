@@ -1,53 +1,36 @@
 # app.py
 
 import os
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal
 
 from flask import Flask, request, jsonify
 
 from apex_client import (
+    open_with_limit_tp,
     create_market_order,
-    get_market_price,
-    create_market_order_with_tpsl,
+    cancel_order_by_id,
 )
 
 app = Flask(__name__)
 
-# TradingView 里要带的 secret，用来校验
+# TradingView secret 校验
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 
-# ------------------------------------------------
-# （仅用于日志预览的撮合规则）
-# 真正生效的规则在 apex_client.DEFAULT_SYMBOL_RULES 里
-# ------------------------------------------------
-MIN_QTY = Decimal("0.01")
-STEP_SIZE = Decimal("0.01")
-QTY_DECIMALS = 2
+# ---------------------------
+# 单 bot 状态：只记一份仓位 + 一张 TP 限价单
+# ---------------------------
+# LAST_POSITION: {
+#   "symbol": "ZEC-USDT",
+#   "side": "BUY",
+#   "qty": Decimal("0.11"),
+# }
+LAST_POSITION: dict | None = None
 
-# 现在只跑一个 bot：
-# key: symbol -> {"side": "BUY"/"SELL", "qty": Decimal}
-POSITIONS: dict[str, dict] = {}
-
-
-def _snap_qty(theoretical_qty: Decimal) -> Decimal:
-    """
-    仅用于日志预览，真实撮合已在 apex_client 里实现。
-    """
-    if theoretical_qty <= 0:
-        raise ValueError("theoretical_qty must be > 0")
-
-    steps = theoretical_qty // STEP_SIZE
-    snapped = steps * STEP_SIZE
-
-    quantum = Decimal("1").scaleb(-QTY_DECIMALS)
-    snapped = snapped.quantize(quantum, rounding=ROUND_DOWN)
-
-    if snapped < MIN_QTY:
-        raise ValueError(
-            f"snapped qty {snapped} < minQty {MIN_QTY} (budget too small)"
-        )
-
-    return snapped
+# LAST_TP_ORDER: {
+#   "symbol": "ZEC-USDT",
+#   "order_id": "xxxxx"
+# }
+LAST_TP_ORDER: dict | None = None
 
 
 @app.route("/", methods=["GET"])
@@ -57,6 +40,8 @@ def index():
 
 @app.route("/webhook", methods=["POST"])
 def tv_webhook():
+    global LAST_POSITION, LAST_TP_ORDER
+
     # ---------------------------
     # 1. 解析 & 校验基础字段
     # ---------------------------
@@ -82,8 +67,7 @@ def tv_webhook():
     signal_type = str(body.get("signal_type", "")).lower()  # "entry" / "exit"
     action = str(body.get("action", "")).lower()
     size_field = body.get("size")  # 入场时的 USDT 金额
-    bot_id = str(body.get("bot_id", "BOT_1"))  # 现在只跑一个 bot，主要用于日志
-    tv_client_id = body.get("client_id")  # 只用于日志，真正给 Apex 的 ID 在 apex_client 里处理
+    tv_client_id = body.get("client_id")  # 只用于日志（我们自己生成真正的 apex clientId）
 
     if not symbol:
         return "missing symbol", 400
@@ -97,9 +81,9 @@ def tv_webhook():
         else:
             return "missing signal_type (entry/exit)", 400
 
-    # -----------------------
-    # 2. ENTRY：买入 / 开仓
-    # -----------------------
+    # ===========================
+    # 2. ENTRY：市价进场 + 真·2% LIMIT TP
+    # ===========================
     if signal_type == "entry":
         if side_raw not in ("BUY", "SELL"):
             return "missing or invalid side", 400
@@ -107,107 +91,131 @@ def tv_webhook():
         if size_field is None:
             return "missing size (USDT)", 400
 
-        # 把 size 当作 USDT 预算
         budget = Decimal(str(size_field))
         if budget <= 0:
             return "size (USDT) must be > 0", 400
 
-        # 仅日志预览：用最小数量估一下理论数量 & snapped
-        try:
-            ref_price_str = get_market_price(symbol, side_raw, str(MIN_QTY))
-            ref_price_dec = Decimal(ref_price_str)
-            theoretical_qty = budget / ref_price_dec
-            snapped_preview = _snap_qty(theoretical_qty)
-            print(
-                f"[ENTRY-preview] bot={bot_id} symbol={symbol} side={side_raw} "
-                f"budget={budget}USDT -> theoretical qty={theoretical_qty} "
-                f"preview snapped={snapped_preview} @ ref {ref_price_str}"
-            )
-        except Exception as e:
-            print("[ENTRY-preview] error:", e)
+        # 如果已经有记录的仓位，简单起见先打印 log（正常 TV 策略不会在持仓中再次 ENTRY）
+        if LAST_POSITION is not None:
+            print("[ENTRY] WARNING: LAST_POSITION already exists:", LAST_POSITION)
 
-        # ★ 真正下单：市价开仓 + 2% 限价 TP（reduce_only）
-        # 这里的 tp_pct=0.02（+2%）；sl_pct 当前忽略
-        order_info = create_market_order_with_tpsl(
-            symbol=symbol,
-            side=side_raw,
-            size_usdt=str(budget),
-            tp_pct=Decimal("0.02"),  # +2% TP
-            sl_pct=Decimal("0"),     # 暂不使用
-            client_id=tv_client_id,
+        print(
+            f"[ENTRY] symbol={symbol} side={side_raw} budget={budget}USDT, "
+            f"tv_client_id={tv_client_id}"
         )
 
-        computed = order_info.get("computed", {}) if isinstance(order_info, dict) else {}
+        # ★ 用 apex_client 里的“真·限价 TP 函数”
+        try:
+            res = open_with_limit_tp(
+                symbol=symbol,
+                side=side_raw,
+                size_usdt=str(budget),
+                tp_pct=Decimal("0.02"),  # +2% LIMIT TP
+                client_id=tv_client_id,
+            )
+        except Exception as e:
+            print("[ENTRY] open_with_limit_tp error:", e)
+            return jsonify({"status": "error", "msg": str(e)}), 500
+
+        computed = res.get("computed", {}) if isinstance(res, dict) else {}
         size_str = computed.get("size")
+        entry_side = computed.get("side", side_raw)
+        tp_order_id = computed.get("tp_order_id")
 
         if size_str is None:
-            print("[ENTRY] WARNING: no 'computed.size' in order_info, skip POSITION update")
-            return jsonify({"status": "ok", "mode": "entry", "order": order_info}), 200
+            print("[ENTRY] WARNING: no 'size' in computed, res:", res)
+            return jsonify({"status": "ok", "mode": "entry", "order": res}), 200
 
         qty = Decimal(str(size_str))
 
-        print(
-            f"[ENTRY] bot={bot_id} symbol={symbol} side={side_raw} "
-            f"final snapped qty={qty}, "
-            f"entry={computed.get('entry_price')} "
-            f"tp={computed.get('tp_price')}"
-        )
+        # 记录当前唯一仓位
+        LAST_POSITION = {
+            "symbol": symbol,
+            "side": entry_side,
+            "qty": qty,
+        }
 
-        # 只跑一个 bot：每个 symbol 记一份仓位
-        pos = POSITIONS.get(symbol)
-        if pos and pos["side"] == side_raw:
-            new_qty = pos["qty"] + qty
+        print(f"[ENTRY] LAST_POSITION = {LAST_POSITION}")
+
+        # 记录 TP 限价单（如果拿到了 order_id）
+        if tp_order_id:
+            LAST_TP_ORDER = {
+                "symbol": symbol,
+                "order_id": str(tp_order_id),
+            }
+            print(f"[ENTRY] LAST_TP_ORDER = {LAST_TP_ORDER}")
         else:
-            new_qty = qty
-        POSITIONS[symbol] = {"side": side_raw, "qty": new_qty}
-
-        print(f"[ENTRY] POSITION[{symbol}] = {POSITIONS[symbol]}")
+            LAST_TP_ORDER = None
+            print("[ENTRY] WARNING: tp_order_id is None, TP cancel later will be skip")
 
         return jsonify({
             "status": "ok",
             "mode": "entry",
-            "order": order_info,
-            "position": {
-                "symbol": symbol,
-                "side": POSITIONS[symbol]["side"],
-                "qty": str(POSITIONS[symbol]["qty"]),
-            },
+            "entry_order": res.get("entry_order"),
+            "tp_order": res.get("tp_order"),
+            "computed": computed,
         }), 200
 
-    # -----------------------
-    # 3. EXIT：卖出 / 平仓
-    # -----------------------
+    # ===========================
+    # 3. EXIT：TV 出场 / 止损信号
+    #    → 先撤 TP 限价单，再市价 reduce_only 平仓
+    # ===========================
     if signal_type == "exit":
-        pos = POSITIONS.get(symbol)
+        print(f"[EXIT] recv exit for symbol={symbol}, tv_client_id={tv_client_id}")
 
-        if not pos or pos["qty"] <= 0:
-            print(f"[EXIT] bot={bot_id} symbol={symbol}: no position to close")
-            # 返回 200，避免 TV 一直重发
+        # 3.1 先尝试撤掉 2% TP 限价单
+        if LAST_TP_ORDER and LAST_TP_ORDER.get("symbol") == symbol:
+            tp_order_id = LAST_TP_ORDER.get("order_id")
+            if tp_order_id:
+                print(f"[EXIT] try cancel TP order: {tp_order_id}")
+                cancel_res = cancel_order_by_id(symbol, tp_order_id)
+                print("[EXIT] cancel TP result:", cancel_res)
+            else:
+                print("[EXIT] LAST_TP_ORDER has no order_id")
+        else:
+            print("[EXIT] no TP order to cancel (LAST_TP_ORDER=", LAST_TP_ORDER, ")")
+
+        # 3.2 按记录的方向 & 数量市价平仓
+        if not LAST_POSITION or LAST_POSITION.get("symbol") != symbol:
+            print(f"[EXIT] no LAST_POSITION for symbol={symbol}, nothing to close")
+            # 返回 200 避免 TV 一直重发
             return jsonify({"status": "no_position"}), 200
 
-        entry_side = pos["side"]      # 之前是 BUY 还是 SELL
-        qty = pos["qty"]              # 之前记录的数量（例如 0.50 ZEC）
+        entry_side = LAST_POSITION["side"]
+        qty = LAST_POSITION["qty"]
+
+        if qty <= 0:
+            print("[EXIT] qty <= 0, skip close:", qty)
+            LAST_POSITION = None
+            LAST_TP_ORDER = None
+            return jsonify({"status": "no_position"}), 200
 
         # 平仓方向 = 反向
         exit_side = "SELL" if entry_side == "BUY" else "BUY"
 
         print(
-            f"[EXIT] bot={bot_id} symbol={symbol} entry_side={entry_side} "
-            f"qty={qty} -> exit_side={exit_side}"
+            f"[EXIT] close position: symbol={symbol}, entry_side={entry_side}, "
+            f"exit_side={exit_side}, qty={qty}"
         )
 
-        # 这里只卖出这份记录的数量，用 reduce_only=True
-        order = create_market_order(
-            symbol=symbol,
-            side=exit_side,
-            size=str(qty),
-            reduce_only=True,
-            client_id=tv_client_id,
-        )
+        try:
+            order = create_market_order(
+                symbol=symbol,
+                side=exit_side,
+                size=str(qty),
+                size_usdt=None,
+                reduce_only=True,   # ✅ 不会反向开新仓，只会减仓
+                client_id=tv_client_id,
+            )
+        except Exception as e:
+            print("[EXIT] create_market_order error:", e)
+            # 即使平仓失败，状态不要乱清，方便你看日志后手动处理
+            return jsonify({"status": "error", "msg": str(e)}), 500
 
-        # 一次 exit 直接清空这个 symbol 的这份仓
-        POSITIONS[symbol] = {"side": entry_side, "qty": Decimal("0")}
-        print(f"[EXIT] POSITION[{symbol}] -> {POSITIONS[symbol]}")
+        # 平仓成功后，把本地状态清掉
+        LAST_POSITION = None
+        LAST_TP_ORDER = None
+        print("[EXIT] position & TP cleared")
 
         return jsonify({
             "status": "ok",
@@ -215,11 +223,10 @@ def tv_webhook():
             "order": order,
         }), 200
 
-    # 其他类型暂时不支持
+    # 其他类型暂不支持
     return "unsupported signal_type", 400
 
 
 if __name__ == "__main__":
-    # DO / Render 等平台一般会注入 PORT 环境变量
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
