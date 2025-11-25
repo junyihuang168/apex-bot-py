@@ -157,7 +157,7 @@ def get_client() -> HttpPrivateSign:
 
 
 # ---------------------------
-# 对外工具函数
+# 对外工具函数（调试用）
 # ---------------------------
 def get_account():
     """查询账户信息，方便你在本地或日志里调试。"""
@@ -340,32 +340,32 @@ def create_market_order(
 
 
 # ---------------------------------------------------------
-# 新：市价开仓 + 单独挂一个 2% 限价 TP（reduce_only）
+# 新增：市价开仓 + 真·LIMIT 2% TP 单
+# 单 bot 用：返回 entry + tp_order_id
 # ---------------------------------------------------------
-def create_market_order_with_tpsl(
+def open_with_limit_tp(
     symbol: str,
     side: str,
     size_usdt: str | float | int,
-    tp_pct: Decimal,
-    sl_pct: Decimal,
+    tp_pct: Decimal = Decimal("0.02"),  # +2%
     client_id: str | None = None,
 ):
     """
-    市价开仓 + 在链上挂一个限价 TP 单（reduce_only）。
-    当前实现里 sl_pct 暂时忽略（你现在只用止盈），
-    之后如果要加限价 SL 再扩展。
+    1) 用 USDT 预算下 MARKET 市价单建仓；
+    2) 再发一张真 · LIMIT TP（+2%），reduceOnly=True。
 
     返回:
     {
-      "raw_entry": <entry_order>,
-      "raw_tp": <tp_order>,
+      "entry_order": <sdk返回>,
+      "tp_order": <sdk返回>,
       "computed": {
-          "symbol": ...,
-          "side": ...,
+          "symbol": symbol,
+          "side": "BUY",
           "size": "0.11",
-          "entry_price": "540.67",
-          "tp_price": "551.48",
-          "used_budget": "59.47",
+          "entry_price": "50.23",
+          "tp_price": "51.23",
+          "used_budget": "5.52",
+          "tp_order_id": "xxxxxxxxx",
       }
     }
     """
@@ -376,13 +376,13 @@ def create_market_order_with_tpsl(
         try:
             client.configs_v3()
         except Exception as e:
-            print("[apex_client] fallback configs_v3 error (tpsl):", e)
+            print("[apex_client] fallback configs_v3 error (open_with_limit_tp):", e)
 
     if not hasattr(client, "accountV3"):
         try:
             client.get_account_v3()
         except Exception as e:
-            print("[apex_client] fallback get_account_v3 error (tpsl):", e)
+            print("[apex_client] fallback get_account_v3 error (open_with_limit_tp):", e)
 
     side = side.upper()
     budget = Decimal(str(size_usdt))
@@ -393,64 +393,40 @@ def create_market_order_with_tpsl(
     min_qty = rules["min_qty"]
     decimals = rules["qty_decimals"]
 
-    # 先用最小数量估价
+    # 1) 先用最小数量估一个参考价
     ref_price_decimal = Decimal(get_market_price(symbol, side, str(min_qty)))
     theoretical_qty = budget / ref_price_decimal
     snapped_qty = _snap_quantity(symbol, theoretical_qty)
 
-    # 真正下单价格（worst price）
+    # 2) 用真实数量再问一次 worst price 作为 entry 价格
     price_str = get_market_price(symbol, side, str(snapped_qty))
-    price_decimal = Decimal(price_str)
+    entry_price_dec = Decimal(price_str)
 
     size_str = format(snapped_qty, f".{decimals}f")
-    used_budget = (snapped_qty * price_decimal).quantize(
+    used_budget = (snapped_qty * entry_price_dec).quantize(
         Decimal("0.01"), rounding=ROUND_DOWN
     )
 
-    one = Decimal("1")
-
-    # ===== 计算 2% TP 目标价 =====
-    # tp_pct 例如 Decimal("0.02")
-    if side == "BUY":
-        tp_price_dec = price_decimal * (one + tp_pct)
-        tp_side = "SELL"
-    else:  # SELL / 做空
-        tp_price_dec = price_decimal * (one - tp_pct)
-        tp_side = "BUY"
-
-    # 保留到 3 位小数（一般足够，交易所还有自己 tick 检查）
-    price_quantum = Decimal("0.001")
-    tp_price_dec = tp_price_dec.quantize(price_quantum, rounding=ROUND_DOWN)
-    tp_price_str = str(tp_price_dec)
-
     ts = int(time.time())
-    apex_client_id_entry = _random_client_id()
-    apex_client_id_tp = _random_client_id()
-    tv_client_id = client_id
 
+    # -------- 先发 MARKET 入场单 --------
+    entry_client_id = _random_client_id()
+    tv_client_id = client_id
     if tv_client_id:
         print(
-            f"[apex_client] (tpsl) tv_client_id={tv_client_id} "
-            f"-> entryId={apex_client_id_entry}, tpId={apex_client_id_tp}"
+            f"[apex_client] (open_with_limit_tp) tv_client_id={tv_client_id} -> apex_clientId={entry_client_id}"
         )
     else:
-        print(
-            f"[apex_client] (tpsl) entryId={apex_client_id_entry}, "
-            f"tpId={apex_client_id_tp} (no tv_client_id)"
-        )
+        print(f"[apex_client] (open_with_limit_tp) apex_clientId={entry_client_id} (no tv_client_id)")
 
-    # ===== ① 市价开仓 =====
     print(
-        "[apex_client] create_market_order_with_tpsl ENTRY params:",
+        "[apex_client] open_with_limit_tp ENTRY params:",
         {
             "symbol": symbol,
             "side": side,
             "type": "MARKET",
             "size": size_str,
             "price": price_str,
-            "reduceOnly": False,
-            "clientId": apex_client_id_entry,
-            "timestampSeconds": ts,
         },
     )
 
@@ -462,12 +438,29 @@ def create_market_order_with_tpsl(
         price=price_str,
         timestampSeconds=ts,
         reduceOnly=False,
-        clientId=apex_client_id_entry,
+        clientId=entry_client_id,
     )
 
-    # ===== ② 限价 TP（reduce_only）=====
+    print("[apex_client] open_with_limit_tp ENTRY order:", entry_order)
+
+    # -------- 再发 LIMIT TP（真正挂在订单簿上的限价单） --------
+    one = Decimal("1")
+    if side == "BUY":
+        tp_price_dec = (entry_price_dec * (one + tp_pct))
+        tp_side = "SELL"
+    else:
+        tp_price_dec = (entry_price_dec * (one - tp_pct))
+        tp_side = "BUY"
+
+    # 这里简单按 0.01 来量化，如果之后你想更精细可以加 PRICE_RULES
+    price_quantum = Decimal("0.01")
+    tp_price_dec = tp_price_dec.quantize(price_quantum, rounding=ROUND_DOWN)
+    tp_price_str = str(tp_price_dec)
+
+    tp_client_id = _random_client_id()
+
     print(
-        "[apex_client] create_market_order_with_tpsl TP params:",
+        "[apex_client] open_with_limit_tp TP params:",
         {
             "symbol": symbol,
             "side": tp_side,
@@ -475,8 +468,6 @@ def create_market_order_with_tpsl(
             "size": size_str,
             "price": tp_price_str,
             "reduceOnly": True,
-            "clientId": apex_client_id_tp,
-            "timestampSeconds": ts,
         },
     )
 
@@ -487,22 +478,56 @@ def create_market_order_with_tpsl(
         size=size_str,
         price=tp_price_str,
         timestampSeconds=ts,
-        reduceOnly=True,
-        clientId=apex_client_id_tp,
+        reduceOnly=True,     # ✅ 真正的 reduce-only 限价单
+        clientId=tp_client_id,
     )
 
-    print("[apex_client] (tpsl) entry_order response:", entry_order)
-    print("[apex_client] (tpsl) tp_order response:", tp_order)
+    print("[apex_client] open_with_limit_tp TP order:", tp_order)
+
+    # 尝试从返回里拿 orderId（不同版本字段名不一定一样，做一点兼容处理）
+    tp_order_id = None
+    if isinstance(tp_order, dict):
+        if "orderId" in tp_order:
+            tp_order_id = tp_order["orderId"]
+        elif "data" in tp_order and isinstance(tp_order["data"], dict):
+            tp_order_id = (
+                tp_order["data"].get("orderId")
+                or tp_order["data"].get("id")
+            )
 
     return {
-        "raw_entry": entry_order,
-        "raw_tp": tp_order,
+        "entry_order": entry_order,
+        "tp_order": tp_order,
         "computed": {
             "symbol": symbol,
             "side": side,
             "size": size_str,
-            "entry_price": price_str,
+            "entry_price": str(entry_price_dec),
             "tp_price": tp_price_str,
             "used_budget": str(used_budget),
+            "tp_order_id": tp_order_id,
         },
     }
+
+
+# ---------------------------------------------------------
+# 新增：按 orderId 取消 TP 限价单（单 bot 用）
+# ---------------------------------------------------------
+def cancel_order_by_id(symbol: str, order_id: str):
+    """
+    调用 apex SDK 的 cancel_order_v3 取消一张指定订单。
+    主要用来在 TV exit 时把 2% TP 单撤掉。
+    """
+    client = get_client()
+
+    print(f"[apex_client] cancel_order_by_id: symbol={symbol}, orderId={order_id}")
+
+    try:
+        # 注意：这里假设 SDK 暴露的是 cancel_order_v3(symbol=..., orderId=...)
+        res = client.cancel_order_v3(symbol=symbol, orderId=order_id)
+        print("[apex_client] cancel_order_v3 response:", res)
+        return res
+    except Exception as e:
+        # 如果订单已经成交 / 已被取消，ApeX 可能会报错，这里只打印不抛出
+        print("[apex_client] cancel_order_v3 error:", e)
+        return {"error": str(e)}
