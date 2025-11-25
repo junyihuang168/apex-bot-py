@@ -119,6 +119,11 @@ def get_client() -> HttpPrivateSign:
     """
     返回带 zk 签名的 HttpPrivateSign 客户端，
     用于真正的下单（create_order_v3）。
+
+    这里模仿官方 demo：
+        1) new HttpPrivateSign(...)
+        2) client.configs_v3()
+        3) client.get_account_v3()
     """
     base_url, network_id = _get_base_and_network()
     api_creds = _get_api_credentials()
@@ -335,23 +340,34 @@ def create_market_order(
 
 
 # ---------------------------------------------------------
-# 市价开仓 + 同时设置 TP/SL 触发价
+# 新：市价开仓 + 单独挂一个 2% 限价 TP（reduce_only）
 # ---------------------------------------------------------
 def create_market_order_with_tpsl(
     symbol: str,
     side: str,
     size_usdt: str | float | int,
-    tp_pct: float | str | Decimal = Decimal("0.019"),  # +1.9%
-    sl_pct: float | str | Decimal = Decimal("0.006"),  # -0.6%
+    tp_pct: Decimal,
+    sl_pct: Decimal,
     client_id: str | None = None,
 ):
     """
-    市价开仓 + 附带 TP/SL 触发价（由 Apex 执行）。
-    - symbol: 例如 "ZEC-USDT"
-    - side: "BUY" / "SELL"
-    - size_usdt: 使用多少 USDT 预算建仓
-    - tp_pct: 如 0.019 / "0.019" / Decimal("0.019")
-    - sl_pct: 如 0.006 / "0.006" / Decimal("0.006")
+    市价开仓 + 在链上挂一个限价 TP 单（reduce_only）。
+    当前实现里 sl_pct 暂时忽略（你现在只用止盈），
+    之后如果要加限价 SL 再扩展。
+
+    返回:
+    {
+      "raw_entry": <entry_order>,
+      "raw_tp": <tp_order>,
+      "computed": {
+          "symbol": ...,
+          "side": ...,
+          "size": "0.11",
+          "entry_price": "540.67",
+          "tp_price": "551.48",
+          "used_budget": "59.47",
+      }
+    }
     """
     client = get_client()
 
@@ -391,49 +407,54 @@ def create_market_order_with_tpsl(
         Decimal("0.01"), rounding=ROUND_DOWN
     )
 
-    # ===== 计算 TP / SL 触发价 =====
-    tp_pct_dec = Decimal(str(tp_pct))
-    sl_pct_dec = Decimal(str(sl_pct))
-
     one = Decimal("1")
-    if side == "BUY":
-        tp_price_dec = price_decimal * (one + tp_pct_dec)
-        sl_price_dec = price_decimal * (one - sl_pct_dec)
-    else:  # SELL / 做空
-        tp_price_dec = price_decimal * (one - tp_pct_dec)
-        sl_price_dec = price_decimal * (one + sl_pct_dec)
 
+    # ===== 计算 2% TP 目标价 =====
+    # tp_pct 例如 Decimal("0.02")
+    if side == "BUY":
+        tp_price_dec = price_decimal * (one + tp_pct)
+        tp_side = "SELL"
+    else:  # SELL / 做空
+        tp_price_dec = price_decimal * (one - tp_pct)
+        tp_side = "BUY"
+
+    # 保留到 3 位小数（一般足够，交易所还有自己 tick 检查）
     price_quantum = Decimal("0.001")
     tp_price_dec = tp_price_dec.quantize(price_quantum, rounding=ROUND_DOWN)
-    sl_price_dec = sl_price_dec.quantize(price_quantum, rounding=ROUND_DOWN)
-
-    tp_trigger_str = str(tp_price_dec)
-    sl_trigger_str = str(sl_price_dec)
+    tp_price_str = str(tp_price_dec)
 
     ts = int(time.time())
-    apex_client_id = _random_client_id()
+    apex_client_id_entry = _random_client_id()
+    apex_client_id_tp = _random_client_id()
     tv_client_id = client_id
 
     if tv_client_id:
         print(
-            f"[apex_client] (tpsl) tv_client_id={tv_client_id} -> apex_clientId={apex_client_id}"
+            f"[apex_client] (tpsl) tv_client_id={tv_client_id} "
+            f"-> entryId={apex_client_id_entry}, tpId={apex_client_id_tp}"
         )
     else:
-        print(f"[apex_client] (tpsl) apex_clientId={apex_client_id} (no tv_client_id)")
+        print(
+            f"[apex_client] (tpsl) entryId={apex_client_id_entry}, "
+            f"tpId={apex_client_id_tp} (no tv_client_id)"
+        )
 
-    debug_params = {
-        "symbol": symbol,
-        "side": side,
-        "type": "MARKET",
-        "size": size_str,
-        "price": price_str,
-        "tpTriggerPrice": tp_trigger_str,
-        "slTriggerPrice": sl_trigger_str,
-    }
-    print("[apex_client] create_market_order_with_tpsl params:", debug_params)
+    # ===== ① 市价开仓 =====
+    print(
+        "[apex_client] create_market_order_with_tpsl ENTRY params:",
+        {
+            "symbol": symbol,
+            "side": side,
+            "type": "MARKET",
+            "size": size_str,
+            "price": price_str,
+            "reduceOnly": False,
+            "clientId": apex_client_id_entry,
+            "timestampSeconds": ts,
+        },
+    )
 
-    # ⭐ 这里只传 SDK 支持的参数：不再传 slType / tpType
-    order = client.create_order_v3(
+    entry_order = client.create_order_v3(
         symbol=symbol,
         side=side,
         type="MARKET",
@@ -441,22 +462,47 @@ def create_market_order_with_tpsl(
         price=price_str,
         timestampSeconds=ts,
         reduceOnly=False,
-        clientId=apex_client_id,
-        tpTriggerPrice=tp_trigger_str,
-        slTriggerPrice=sl_trigger_str,
+        clientId=apex_client_id_entry,
     )
 
-    print("[apex_client] (tpsl) order response:", order)
+    # ===== ② 限价 TP（reduce_only）=====
+    print(
+        "[apex_client] create_market_order_with_tpsl TP params:",
+        {
+            "symbol": symbol,
+            "side": tp_side,
+            "type": "LIMIT",
+            "size": size_str,
+            "price": tp_price_str,
+            "reduceOnly": True,
+            "clientId": apex_client_id_tp,
+            "timestampSeconds": ts,
+        },
+    )
+
+    tp_order = client.create_order_v3(
+        symbol=symbol,
+        side=tp_side,
+        type="LIMIT",
+        size=size_str,
+        price=tp_price_str,
+        timestampSeconds=ts,
+        reduceOnly=True,
+        clientId=apex_client_id_tp,
+    )
+
+    print("[apex_client] (tpsl) entry_order response:", entry_order)
+    print("[apex_client] (tpsl) tp_order response:", tp_order)
 
     return {
-        "raw_order": order,
+        "raw_entry": entry_order,
+        "raw_tp": tp_order,
         "computed": {
             "symbol": symbol,
             "side": side,
             "size": size_str,
             "entry_price": price_str,
-            "tp_trigger": tp_trigger_str,
-            "sl_trigger": sl_trigger_str,
+            "tp_price": tp_price_str,
             "used_budget": str(used_budget),
         },
     }
