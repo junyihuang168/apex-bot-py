@@ -1,27 +1,57 @@
+# app.py
+
 import os
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
+
 from flask import Flask, request, jsonify
 
-# 从 apex_client.py 导入工具函数
 from apex_client import (
     create_market_order,
-    create_market_order_with_tpsl,
     get_market_price,
+    create_market_order_with_tpsl,
 )
 
 app = Flask(__name__)
 
-# TradingView 里的 secret，用来校验
+# TradingView 里要带的 secret，用来校验
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 
-# 记住「每个 bot 在每个 symbol 上自己开的那一份仓位」
-# key:  (bot_id, symbol) -> value: {"side": "BUY"/"SELL", "qty": Decimal}
-BOT_POSITIONS: dict[tuple[str, str], dict] = {}
+# ------------------------------------------------
+# （仅用于日志预览的撮合规则）
+# 真正生效的规则在 apex_client.DEFAULT_SYMBOL_RULES 里
+# ------------------------------------------------
+MIN_QTY = Decimal("0.01")
+STEP_SIZE = Decimal("0.01")
+QTY_DECIMALS = 2
+
+# 现在只跑一个 bot：
+# key: symbol -> {"side": "BUY"/"SELL", "qty": Decimal}
+POSITIONS: dict[str, dict] = {}
+
+
+def _snap_qty(theoretical_qty: Decimal) -> Decimal:
+    """
+    仅用于日志预览，真实撮合已在 apex_client 里实现。
+    """
+    if theoretical_qty <= 0:
+        raise ValueError("theoretical_qty must be > 0")
+
+    steps = theoretical_qty // STEP_SIZE
+    snapped = steps * STEP_SIZE
+
+    quantum = Decimal("1").scaleb(-QTY_DECIMALS)
+    snapped = snapped.quantize(quantum, rounding=ROUND_DOWN)
+
+    if snapped < MIN_QTY:
+        raise ValueError(
+            f"snapped qty {snapped} < minQty {MIN_QTY} (budget too small)"
+        )
+
+    return snapped
 
 
 @app.route("/", methods=["GET"])
 def index():
-    # DO health check 就是 GET / 看你有没有回 200
     return "OK", 200
 
 
@@ -52,8 +82,8 @@ def tv_webhook():
     signal_type = str(body.get("signal_type", "")).lower()  # "entry" / "exit"
     action = str(body.get("action", "")).lower()
     size_field = body.get("size")  # 入场时的 USDT 金额
-    bot_id = str(body.get("bot_id", "default"))             # 每个机器人要传一个 bot_id
-    tv_client_id = body.get("client_id")                    # 只用于日志
+    bot_id = str(body.get("bot_id", "BOT_1"))  # 现在只跑一个 bot，主要用于日志
+    tv_client_id = body.get("client_id")  # 只用于日志，真正给 Apex 的 ID 在 apex_client 里处理
 
     if not symbol:
         return "missing symbol", 400
@@ -77,25 +107,41 @@ def tv_webhook():
         if size_field is None:
             return "missing size (USDT)", 400
 
+        # 把 size 当作 USDT 预算
         budget = Decimal(str(size_field))
         if budget <= 0:
             return "size (USDT) must be > 0", 400
 
-        # ★ 真正下单（市价开仓 + 附带 TP/SL 触发价）
+        # 仅日志预览：用最小数量估一下理论数量 & snapped
+        try:
+            ref_price_str = get_market_price(symbol, side_raw, str(MIN_QTY))
+            ref_price_dec = Decimal(ref_price_str)
+            theoretical_qty = budget / ref_price_dec
+            snapped_preview = _snap_qty(theoretical_qty)
+            print(
+                f"[ENTRY-preview] bot={bot_id} symbol={symbol} side={side_raw} "
+                f"budget={budget}USDT -> theoretical qty={theoretical_qty} "
+                f"preview snapped={snapped_preview} @ ref {ref_price_str}"
+            )
+        except Exception as e:
+            print("[ENTRY-preview] error:", e)
+
+        # ★ 真正下单：市价开仓 + 2% 限价 TP（reduce_only）
+        # 这里的 tp_pct=0.02（+2%）；sl_pct 当前忽略
         order_info = create_market_order_with_tpsl(
             symbol=symbol,
             side=side_raw,
-            size_usdt=budget,
-            tp_pct=Decimal("0.019"),  # +1.9% TP
-            sl_pct=Decimal("0.006"),  # -0.6% SL
+            size_usdt=str(budget),
+            tp_pct=Decimal("0.02"),  # +2% TP
+            sl_pct=Decimal("0"),     # 暂不使用
             client_id=tv_client_id,
         )
 
-        # 从返回值里拿出真实撮合后的数量，记到每个 bot 自己的仓位上
         computed = order_info.get("computed", {}) if isinstance(order_info, dict) else {}
         size_str = computed.get("size")
+
         if size_str is None:
-            print("[ENTRY] WARNING: no 'computed.size' in order_info, skip BOT_POSITIONS update")
+            print("[ENTRY] WARNING: no 'computed.size' in order_info, skip POSITION update")
             return jsonify({"status": "ok", "mode": "entry", "order": order_info}), 200
 
         qty = Decimal(str(size_str))
@@ -104,33 +150,27 @@ def tv_webhook():
             f"[ENTRY] bot={bot_id} symbol={symbol} side={side_raw} "
             f"final snapped qty={qty}, "
             f"entry={computed.get('entry_price')} "
-            f"tp={computed.get('tp_trigger')} "
-            f"sl={computed.get('sl_trigger')}"
+            f"tp={computed.get('tp_price')}"
         )
 
-        # 记住这个 bot 在这个 symbol 上“自己开的那一份仓位”
-        key = (bot_id, symbol)
-        pos = BOT_POSITIONS.get(key)
-
+        # 只跑一个 bot：每个 symbol 记一份仓位
+        pos = POSITIONS.get(symbol)
         if pos and pos["side"] == side_raw:
-            # 同方向加仓：数量累加
             new_qty = pos["qty"] + qty
-            BOT_POSITIONS[key] = {"side": side_raw, "qty": new_qty}
         else:
-            # 第一次开仓/反向开仓：覆盖
-            BOT_POSITIONS[key] = {"side": side_raw, "qty": qty}
+            new_qty = qty
+        POSITIONS[symbol] = {"side": side_raw, "qty": new_qty}
 
-        print(f"[ENTRY] BOT_POSITIONS[{key}] = {BOT_POSITIONS[key]}")
+        print(f"[ENTRY] POSITION[{symbol}] = {POSITIONS[symbol]}")
 
         return jsonify({
             "status": "ok",
             "mode": "entry",
             "order": order_info,
-            "bot_position": {
-                "bot_id": bot_id,
+            "position": {
                 "symbol": symbol,
-                "side": BOT_POSITIONS[key]["side"],
-                "qty": str(BOT_POSITIONS[key]["qty"]),
+                "side": POSITIONS[symbol]["side"],
+                "qty": str(POSITIONS[symbol]["qty"]),
             },
         }), 200
 
@@ -138,17 +178,17 @@ def tv_webhook():
     # 3. EXIT：卖出 / 平仓
     # -----------------------
     if signal_type == "exit":
-        key = (bot_id, symbol)
-        pos = BOT_POSITIONS.get(key)
+        pos = POSITIONS.get(symbol)
 
         if not pos or pos["qty"] <= 0:
             print(f"[EXIT] bot={bot_id} symbol={symbol}: no position to close")
-            # 返回 200，避免 TV 重试
+            # 返回 200，避免 TV 一直重发
             return jsonify({"status": "no_position"}), 200
 
-        entry_side = pos["side"]
-        qty = pos["qty"]
+        entry_side = pos["side"]      # 之前是 BUY 还是 SELL
+        qty = pos["qty"]              # 之前记录的数量（例如 0.50 ZEC）
 
+        # 平仓方向 = 反向
         exit_side = "SELL" if entry_side == "BUY" else "BUY"
 
         print(
@@ -156,6 +196,7 @@ def tv_webhook():
             f"qty={qty} -> exit_side={exit_side}"
         )
 
+        # 这里只卖出这份记录的数量，用 reduce_only=True
         order = create_market_order(
             symbol=symbol,
             side=exit_side,
@@ -164,8 +205,9 @@ def tv_webhook():
             client_id=tv_client_id,
         )
 
-        BOT_POSITIONS[key] = {"side": entry_side, "qty": Decimal("0")}
-        print(f"[EXIT] BOT_POSITIONS[{key}] -> {BOT_POSITIONS[key]}")
+        # 一次 exit 直接清空这个 symbol 的这份仓
+        POSITIONS[symbol] = {"side": entry_side, "qty": Decimal("0")}
+        print(f"[EXIT] POSITION[{symbol}] -> {POSITIONS[symbol]}")
 
         return jsonify({
             "status": "ok",
