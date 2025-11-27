@@ -1,5 +1,7 @@
 import os
 from decimal import Decimal
+from typing import Dict, Tuple
+
 from flask import Flask, request, jsonify
 
 # 直接复用你现有的 apex_client.py 里的函数
@@ -19,7 +21,7 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 # 记住「每个 bot 在每个 symbol 上自己开的那一份仓位」
 # key:  (bot_id, symbol) -> value: {"side": "BUY"/"SELL", "qty": Decimal}
 # ------------------------------------------------
-BOT_POSITIONS: dict[tuple[str, str], dict] = {}
+BOT_POSITIONS: Dict[Tuple[str, str], dict] = {}
 
 
 # ------------------------------------------------
@@ -55,7 +57,7 @@ def _compute_entry_qty(symbol: str, side: str, budget: Decimal) -> Decimal:
     根据 USDT 预算算出 snapped_qty（合法数量）。
     """
     rules = _get_symbol_rules(symbol)
-    min_qty = rules["min_qty"]
+    min_qty = Decimal(str(rules["min_qty"]))
 
     # 先用最小数量问一次 worst price，当作当前市价参考
     ref_price_dec = Decimal(get_market_price(symbol, side, str(min_qty)))
@@ -65,7 +67,56 @@ def _compute_entry_qty(symbol: str, side: str, budget: Decimal) -> Decimal:
 
     # 对齐到交易所允许的网格（0.01, 0.02, ...）
     snapped_qty = _snap_quantity(symbol, theoretical_qty)
+
+    # 防御：如果由于精度问题导致 snapped_qty 太小，就直接报错
+    if snapped_qty <= 0:
+        raise ValueError(f"snapped_qty <= 0, symbol={symbol}, budget={budget}")
+
     return snapped_qty
+
+
+# ------------------------------------------------
+# 小工具：从 apex 返回中解析「真正成交数量」
+# ------------------------------------------------
+def _parse_filled_qty(order: dict, default_qty: Decimal) -> Decimal:
+    """
+    Try to read filled size from apex order response.
+    如果找不到，就退回 default_qty（大多数市价单会完全成交）
+    """
+    data = (order or {}).get("data", {}) or {}
+
+    candidates = [
+        "cumSuccessFillSize",
+        "cumMatchFillSize",
+        "successFillSize",
+        "fillSize",
+        "executedQty",
+    ]
+
+    for field in candidates:
+        val = data.get(field)
+        if val is not None:
+            try:
+                q = Decimal(str(val))
+                if q >= 0:
+                    return q
+            except Exception:
+                pass
+
+    # fallback
+    return Decimal(str(default_qty))
+
+
+def _order_status_and_reason(order: dict):
+    data = (order or {}).get("data", {}) or {}
+    status = str(data.get("status", "")).upper()
+    cancel_reason = str(
+        data.get("cancelReason")
+        or data.get("rejectReason")
+        or data.get("errorMessage")
+        or ""
+    )
+    return status, cancel_reason
 
 
 @app.route("/", methods=["GET"])
@@ -150,11 +201,10 @@ def tv_webhook():
         size_str = str(snapped_qty)
         print(
             f"[ENTRY] bot={bot_id} symbol={symbol} side={side_raw} "
-            f"budget={budget} -> qty={size_str}"
+            f"budget={budget} -> request_qty={size_str}"
         )
 
-        # 真正下单：这里直接用「size」模式（不再传 size_usdt），
-        # 因为数量已经算好了
+        # 真正下单
         try:
             order = create_market_order(
                 symbol=symbol,
@@ -167,17 +217,46 @@ def tv_webhook():
             print("[ENTRY] create_market_order error:", e)
             return "order error", 500
 
-        # 记录这个 bot 在这个 symbol 上自己的仓位
+        status, cancel_reason = _order_status_and_reason(order)
+        filled_qty = _parse_filled_qty(order, snapped_qty)
+
+        print(
+            f"[ENTRY] order status={status} cancelReason={cancel_reason!r} "
+            f"filled_qty={filled_qty}"
+        )
+
+        # 如果订单被拒绝 / 取消 或完全没成交，就不记录仓位
+        if status in ("CANCELED", "REJECTED") or filled_qty <= 0:
+            print(
+                f"[ENTRY] bot={bot_id} symbol={symbol}: "
+                f"not recording position (status={status}, filled={filled_qty})"
+            )
+            return jsonify({
+                "status": "order_not_filled",
+                "mode": "entry",
+                "bot_id": bot_id,
+                "symbol": symbol,
+                "side": side_raw,
+                "request_qty": size_str,
+                "filled_qty": str(filled_qty),
+                "order_status": status,
+                "cancel_reason": cancel_reason,
+                "raw_order": order,
+            }), 200
+
+        # 记录这个 bot 在这个 symbol 上自己的仓位（用真正成交数量）
         key = (bot_id, symbol)
         pos = BOT_POSITIONS.get(key)
 
         if pos and pos["side"] == side_raw:
-            # 同方向加仓：数量累加
-            new_qty = pos["qty"] + snapped_qty
-            BOT_POSITIONS[key] = {"side": side_raw, "qty": new_qty}
+            new_qty = pos["qty"] + filled_qty
+        elif pos and pos["side"] != side_raw:
+            # 之前是反向仓位，简单起见：先把旧方向当成已经在别的地方平掉
+            new_qty = filled_qty
         else:
-            # 第一次开仓，或者之前是反方向，简单起见直接覆盖
-            BOT_POSITIONS[key] = {"side": side_raw, "qty": snapped_qty}
+            new_qty = filled_qty
+
+        BOT_POSITIONS[key] = {"side": side_raw, "qty": new_qty}
 
         print(f"[ENTRY] BOT_POSITIONS[{key}] = {BOT_POSITIONS[key]}")
 
@@ -188,6 +267,9 @@ def tv_webhook():
             "symbol": symbol,
             "side": side_raw,
             "qty": str(BOT_POSITIONS[key]["qty"]),
+            "filled_last": str(filled_qty),
+            "order_status": status,
+            "cancel_reason": cancel_reason,
             "raw_order": order,
         }), 200
 
@@ -208,8 +290,8 @@ def tv_webhook():
         exit_side = "SELL" if entry_side == "BUY" else "BUY"
 
         print(
-            f"[EXIT] bot={bot_id} symbol={symbol} entry_side={entry_side} "
-            f"qty={qty} -> exit_side={exit_side}"
+            f"[EXIT] bot={bot_id} symbol={symbol} "
+            f"entry_side={entry_side} qty={qty} -> exit_side={exit_side}"
         )
 
         try:
@@ -224,8 +306,39 @@ def tv_webhook():
             print("[EXIT] create_market_order error:", e)
             return "order error", 500
 
-        # 一次 exit 直接把这个 bot 的这份仓清零
-        BOT_POSITIONS[key] = {"side": entry_side, "qty": Decimal("0")}
+        status, cancel_reason = _order_status_and_reason(order)
+        filled_qty = _parse_filled_qty(order, qty)
+
+        print(
+            f"[EXIT] order status={status} cancelReason={cancel_reason!r} "
+            f"filled_qty={filled_qty}"
+        )
+
+        if status in ("CANCELED", "REJECTED") or filled_qty <= 0:
+            # 平仓单没成交，不改本地仓位，以便下次还能继续尝试
+            print(
+                f"[EXIT] bot={bot_id} symbol={symbol}: "
+                f"exit not filled, keep position qty={qty}"
+            )
+            return jsonify({
+                "status": "exit_not_filled",
+                "mode": "exit",
+                "bot_id": bot_id,
+                "symbol": symbol,
+                "exit_side": exit_side,
+                "requested_qty": str(qty),
+                "filled_qty": str(filled_qty),
+                "order_status": status,
+                "cancel_reason": cancel_reason,
+                "raw_order": order,
+            }), 200
+
+        # 按真实成交数量减仓，避免多减 / 少减
+        remaining = qty - filled_qty
+        if remaining < 0:
+            remaining = Decimal("0")
+
+        BOT_POSITIONS[key] = {"side": entry_side, "qty": remaining}
         print(f"[EXIT] BOT_POSITIONS[{key}] -> {BOT_POSITIONS[key]}")
 
         return jsonify({
@@ -234,7 +347,10 @@ def tv_webhook():
             "bot_id": bot_id,
             "symbol": symbol,
             "exit_side": exit_side,
-            "closed_qty": str(qty),
+            "closed_qty": str(filled_qty),
+            "remaining_qty": str(remaining),
+            "order_status": status,
+            "cancel_reason": cancel_reason,
             "raw_order": order,
         }), 200
 
