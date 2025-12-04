@@ -186,10 +186,10 @@ def get_market_price(symbol: str, side: str, size: str) -> str:
 
     返回: 字符串形式的价格（比如 '532.15'）
     """
+    from apexomni.http_private_v3 import HttpPrivate_v3
+
     base_url, network_id = _get_base_and_network()
     api_creds = _get_api_credentials()
-
-    from apexomni.http_private_v3 import HttpPrivate_v3
 
     http_v3_client = HttpPrivate_v3(
         base_url,
@@ -414,7 +414,7 @@ def create_limit_order(
 
     def _pick(d: dict, *keys):
         for k in keys:
-            if k in d and d[k] is not None:
+            if isinstance(d, dict) and d.get(k) is not None:
                 return d[k]
         return None
 
@@ -438,15 +438,113 @@ def create_limit_order(
     }
 
 
+def create_stop_market_order(
+    symbol: str,
+    side: str,
+    size: NumberLike,
+    trigger_price: NumberLike,
+    reduce_only: bool = True,
+    client_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    创建一个 STOP_MARKET 条件单，用来做锁盈 / 止损：
+    - 对多单来说：side 应该是 SELL，trigger_price 是触发价（例如 entry * 1.002）
+    - 对空单来说：side 应该是 BUY，trigger_price 同理
+    - reduce_only=True 防止反向开仓
+
+    ApeX 文档中 STOP_MARKET 属于 conditional market order，
+    会在触发价被打到时，以市价立刻成交。
+    """
+    client = get_client()
+
+    # 兜底初始化（和 create_limit_order 一样）
+    try:
+        if not hasattr(client, "configV3"):
+            client.configs_v3()
+        if not hasattr(client, "accountV3"):
+            client.get_account_v3()
+    except Exception as e:
+        print("[apex_client] fallback init error (stop):", e)
+
+    side = side.upper()
+    size_str = str(size)
+    trigger_dec = Decimal(str(trigger_price))
+
+    # STOP_MARKET 也必须带一个 price，用来算 limitFee
+    # 这里就直接用触发价作为 price
+    price_str = str(trigger_dec)
+
+    ts = int(time.time())
+    apex_client_id = _random_client_id()
+    tv_client_id = client_id
+
+    if tv_client_id:
+        print(
+            f"[apex_client] (stop) tv_client_id={tv_client_id} -> apex_clientId={apex_client_id}"
+        )
+    else:
+        print(f"[apex_client] (stop) apex_clientId={apex_client_id} (no tv_client_id)")
+
+    params = {
+        "symbol": symbol,
+        "side": side,
+        "type": "STOP_MARKET",
+        "size": size_str,
+        "price": price_str,                 # 用于 limitFee 计算
+        "triggerPrice": str(trigger_dec),   # 关键：触发价
+        "reduceOnly": reduce_only,
+        "clientId": apex_client_id,
+        "timestampSeconds": ts,
+        # 如果你想指定 timeInForce 也可以加:
+        # "timeInForce": "GOOD_TIL_CANCEL",
+    }
+
+    print("[apex_client] create_stop_market_order params:", params)
+
+    order = client.create_order_v3(**params)
+    print("[apex_client] (stop) order response:", order)
+
+    data_part = order.get("data") if isinstance(order, dict) else None
+
+    def _pick(d: dict, *keys):
+        for k in keys:
+            if isinstance(d, dict) and d.get(k) is not None:
+                return d[k]
+        return None
+
+    order_id = None
+    client_order_id = None
+
+    if isinstance(order, dict):
+        order_id = _pick(order, "orderId", "id")
+        client_order_id = _pick(order, "clientOrderId", "clientId")
+
+    if isinstance(data_part, dict):
+        order_id = order_id or _pick(data_part, "orderId", "id")
+        client_order_id = client_order_id or _pick(data_part, "clientOrderId", "clientId")
+
+    return {
+        "data": data_part or order,
+        "raw_order": order,
+        "order_id": order_id,
+        "client_order_id": client_order_id,
+        "symbol": symbol,
+        "side": side,
+        "size": size_str,
+        "price": price_str,
+        "trigger_price": str(trigger_dec),
+    }
+
+
 def cancel_order(
     symbol: str,
     order_id: Optional[str] = None,
     client_order_id: Optional[str] = None,
 ):
     """
-    取消一个活动订单（主要用来取消 TP LIMIT）。
+    取消一个活动订单（主要用来取消 TP / SL 条件单或 LIMIT）。
 
-    ⚠️ Apex SDK cancel 接口的名字 / 参数可能随版本不同，
+    ⚠️ ApeX SDK cancel 接口的名字 / 参数可能随版本不同，
        这里是一个模板，你需要根据你本地的 apexomni 版本调整：
        - 有的叫 cancel_order_v3(orderId=...)
        - 有的叫 cancel_active_order_v3(symbol=..., clientOrderId=...)
