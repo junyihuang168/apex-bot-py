@@ -74,12 +74,20 @@ def _snap_quantity(symbol: str, theoretical_qty: Decimal) -> Decimal:
 def _quantize_like(ref_price: Decimal, target_price: Decimal) -> Decimal:
     """
     按照 ref_price 的小数位数，把 target_price 向下取整。
-    这样基本能对齐 Apex 的 price tick。
+    这样基本能对齐 ApeX 的 price tick。
     """
     exp = -ref_price.as_tuple().exponent
     exp = max(exp, 0)
     quantum = Decimal("1").scaleb(-exp)
     return target_price.quantize(quantum, rounding=ROUND_DOWN)
+
+
+def _pick(d: dict, *keys):
+    """从 dict 里按顺序挑第一个非 None 的 key。"""
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return None
 
 
 # ---------------------------
@@ -186,10 +194,10 @@ def get_market_price(symbol: str, side: str, size: str) -> str:
 
     返回: 字符串形式的价格（比如 '532.15'）
     """
-    from apexomni.http_private_v3 import HttpPrivate_v3
-
     base_url, network_id = _get_base_and_network()
     api_creds = _get_api_credentials()
+
+    from apexomni.http_private_v3 import HttpPrivate_v3
 
     http_v3_client = HttpPrivate_v3(
         base_url,
@@ -361,7 +369,7 @@ def create_limit_order(
     client_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    真·LIMIT 单（会在 Apex 订单簿里挂起）：
+    真·LIMIT 单（会在 ApeX 订单簿里挂起）：
     - 通常用在 TP：多单用 SELL LIMIT，空单用 BUY LIMIT
     - 建议配合 reduce_only=True，避免误开反向仓
     """
@@ -408,15 +416,10 @@ def create_limit_order(
     order = client.create_order_v3(**params)
     print("[apex_client] (limit) order response:", order)
 
-    order_id = None
-    client_order_id = None
     data_part = order.get("data") if isinstance(order, dict) else None
 
-    def _pick(d: dict, *keys):
-        for k in keys:
-            if isinstance(d, dict) and d.get(k) is not None:
-                return d[k]
-        return None
+    order_id = None
+    client_order_id = None
 
     if isinstance(order, dict):
         order_id = _pick(order, "orderId", "id")
@@ -447,32 +450,24 @@ def create_stop_market_order(
     client_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    创建一个 STOP_MARKET 条件单，用来做锁盈 / 止损：
-    - 对多单来说：side 应该是 SELL，trigger_price 是触发价（例如 entry * 1.002）
-    - 对空单来说：side 应该是 BUY，trigger_price 同理
-    - reduce_only=True 防止反向开仓
+    创建 ApeX 的 STOP_MARKET 条件单（真·硬止损挂在交易所上）：
 
-    ApeX 文档中 STOP_MARKET 属于 conditional market order，
-    会在触发价被打到时，以市价立刻成交。
+    - 用于硬 SL：
+      * 多单平仓： side='SELL'
+      * 空单平仓： side='BUY'
+    - trigger_price: 触发价（比如多单锁盈价 = entry * 1.002）
     """
     client = get_client()
-
-    # 兜底初始化（和 create_limit_order 一样）
-    try:
-        if not hasattr(client, "configV3"):
-            client.configs_v3()
-        if not hasattr(client, "accountV3"):
-            client.get_account_v3()
-    except Exception as e:
-        print("[apex_client] fallback init error (stop):", e)
-
     side = side.upper()
     size_str = str(size)
-    trigger_dec = Decimal(str(trigger_price))
 
-    # STOP_MARKET 也必须带一个 price，用来算 limitFee
-    # 这里就直接用触发价作为 price
-    price_str = str(trigger_dec)
+    # 先用 size 获取一次 worst price，既当作“市价参考”，也给 price 字段用
+    price_str = get_market_price(symbol, side, size_str)
+    ref_price_dec = Decimal(price_str)
+
+    # 按照价格精度对齐 trigger_price
+    trigger_dec = _quantize_like(ref_price_dec, Decimal(str(trigger_price)))
+    trigger_str = str(trigger_dec)
 
     ts = int(time.time())
     apex_client_id = _random_client_id()
@@ -490,13 +485,11 @@ def create_stop_market_order(
         "side": side,
         "type": "STOP_MARKET",
         "size": size_str,
-        "price": price_str,                 # 用于 limitFee 计算
-        "triggerPrice": str(trigger_dec),   # 关键：触发价
+        "price": price_str,          # ApeX 要求 MARKET/STOP 也带一个 price，用来做 zk 签名 & slippage
+        "triggerPrice": trigger_str, # 真正的触发价
+        "timestampSeconds": ts,
         "reduceOnly": reduce_only,
         "clientId": apex_client_id,
-        "timestampSeconds": ts,
-        # 如果你想指定 timeInForce 也可以加:
-        # "timeInForce": "GOOD_TIL_CANCEL",
     }
 
     print("[apex_client] create_stop_market_order params:", params)
@@ -505,12 +498,6 @@ def create_stop_market_order(
     print("[apex_client] (stop) order response:", order)
 
     data_part = order.get("data") if isinstance(order, dict) else None
-
-    def _pick(d: dict, *keys):
-        for k in keys:
-            if isinstance(d, dict) and d.get(k) is not None:
-                return d[k]
-        return None
 
     order_id = None
     client_order_id = None
@@ -532,7 +519,7 @@ def create_stop_market_order(
         "side": side,
         "size": size_str,
         "price": price_str,
-        "trigger_price": str(trigger_dec),
+        "trigger_price": trigger_str,
     }
 
 
@@ -542,7 +529,7 @@ def cancel_order(
     client_order_id: Optional[str] = None,
 ):
     """
-    取消一个活动订单（主要用来取消 TP / SL 条件单或 LIMIT）。
+    取消一个活动订单（主要用来取消 TP/SL LIMIT/STOP）。
 
     ⚠️ ApeX SDK cancel 接口的名字 / 参数可能随版本不同，
        这里是一个模板，你需要根据你本地的 apexomni 版本调整：
