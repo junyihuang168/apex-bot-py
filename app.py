@@ -11,6 +11,8 @@ from apex_client import (
     get_market_price,
     _get_symbol_rules,
     _snap_quantity,
+    create_stop_market_order,
+    cancel_order,
 )
 
 app = Flask(__name__)
@@ -21,7 +23,10 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 # 硬性锁盈止损配置（只对部分 bot 生效）
 # ------------------------------------------------------------------
 # 哪些 bot 使用 0.25% -> 0.2% 的硬性锁盈止损
-_HARD_SL_BOTS_ENV = os.getenv("HARD_SL_BOTS", "BOT_1,BOT_2,BOT_3,BOT_4,BOT_5")
+_HARD_SL_BOTS_ENV = os.getenv(
+    "HARD_SL_BOTS",
+    "BOT_1,BOT_2,BOT_3,BOT_4,BOT_5,BOT_6,BOT_7,BOT_8,BOT_9,BOT_10",
+)
 HARD_SL_BOTS = {
     b.strip()
     for b in _HARD_SL_BOTS_ENV.split(",")
@@ -31,7 +36,7 @@ HARD_SL_BOTS = {
 # 触发挂“锁盈线”的浮盈百分比（0.25%）
 HARD_SL_TRIGGER_PCT = Decimal(os.getenv("HARD_SL_TRIGGER_PCT", "0.25"))
 
-# 锁盈线水平（0.2%）：达到 0.25% 后，一旦跌回这个水平就强平
+# 锁盈线水平（0.2%）：达到 0.25% 后，在这个水平挂 STOP_MARKET
 HARD_SL_LEVEL_PCT = Decimal(os.getenv("HARD_SL_LEVEL_PCT", "0.20"))
 
 # 后台轮询 Apex 价格的时间间隔（秒）
@@ -41,8 +46,10 @@ HARD_SL_POLL_INTERVAL = float(os.getenv("HARD_SL_POLL_INTERVAL", "2.0"))
 #   "side": "BUY"/"SELL",
 #   "qty": Decimal,
 #   "entry_price": Decimal | None,
-#   "hard_sl_armed": bool,
-#   "hard_sl_level": Decimal | None,
+#   "hard_sl_armed": bool,                 # 是否已经挂出 STOP_MARKET 单
+#   "hard_sl_level": Decimal | None,       # 锁盈价（+0.2% 或 -0.2%）
+#   "hard_sl_order_id": str | None,        # 止损条件单的 orderId（如果取得到）
+#   "hard_sl_client_order_id": str | None, # 止损条件单的 clientOrderId
 # }
 BOT_POSITIONS: Dict[Tuple[str, str], dict] = {}
 
@@ -101,7 +108,7 @@ def _order_status_and_reason(order: dict):
 
 
 # ------------------------------------------------
-# 后台线程：监控浮盈并执行 0.25% -> 0.2% 锁盈止损
+# 后台线程：监控浮盈，并在 +0.25% 时挂 +0.2% STOP_MARKET 锁盈单
 # ------------------------------------------------
 def _monitor_positions_loop():
     """后台轮询 Apex 价格，对开启硬 SL 的 bot 执行 0.25% -> 0.2% 锁盈逻辑。"""
@@ -112,7 +119,7 @@ def _monitor_positions_loop():
         try:
             # 遍历当前所有 bot 的仓位
             for (bot_id, symbol), pos in list(BOT_POSITIONS.items()):
-                # 只对配置好的 bot 生效
+                # 只对配置好的 bot 生效（默认 BOT_1~BOT_10）
                 if bot_id not in HARD_SL_BOTS:
                     continue
 
@@ -121,10 +128,16 @@ def _monitor_positions_loop():
                 entry_price = pos.get("entry_price")
                 hard_sl_armed = bool(pos.get("hard_sl_armed", False))
 
+                # 没仓位就重置状态
                 if not side or qty <= 0 or entry_price is None:
-                    # 没有效仓位时，重置硬 SL 标记
                     pos["hard_sl_armed"] = False
                     pos["hard_sl_level"] = None
+                    pos["hard_sl_order_id"] = None
+                    pos["hard_sl_client_order_id"] = None
+                    continue
+
+                # 已经挂了 STOP 单，就不用再重复挂
+                if hard_sl_armed:
                     continue
 
                 # 当前价格：用 Apex 的 get_worst_price_v3 做参考价
@@ -139,59 +152,47 @@ def _monitor_positions_loop():
                     print(f"[HARD_SL] get_market_price error bot={bot_id} symbol={symbol}:", e)
                     continue
 
-                # 计算浮盈百分比
+                # 计算浮盈百分比 + 锁盈价
                 if side == "BUY":
                     pnl_pct = (current_price - entry_price) * Decimal("100") / entry_price
                     lock_price = entry_price * (Decimal("1") + HARD_SL_LEVEL_PCT / Decimal("100"))
-                    # 一旦价格回落到锁盈价或更低就触发
-                    lock_hit = current_price <= lock_price
+                    exit_side = "SELL"
                 else:
-                    # 如果以后你做空，这里也顺便兼容
+                    # 做空：涨/跌方向相反
                     pnl_pct = (entry_price - current_price) * Decimal("100") / entry_price
                     lock_price = entry_price * (Decimal("1") - HARD_SL_LEVEL_PCT / Decimal("100"))
-                    lock_hit = current_price >= lock_price
+                    exit_side = "BUY"
 
                 # 还没“武装”硬 SL，先看是否达到 0.25%
-                if not hard_sl_armed and pnl_pct >= HARD_SL_TRIGGER_PCT:
-                    pos["hard_sl_armed"] = True
-                    pos["hard_sl_level"] = lock_price
-                    print(
-                        f"[HARD_SL] ARMED bot={bot_id} symbol={symbol} "
-                        f"entry={entry_price} lock_price={lock_price} pnl={pnl_pct:.4f}%"
-                    )
-                    continue
-
-                # 已经“武装”了硬 SL，检查是否跌回锁盈价
-                if hard_sl_armed and lock_hit:
-                    exit_side = "SELL" if side == "BUY" else "BUY"
+                if pnl_pct >= HARD_SL_TRIGGER_PCT:
                     size_str = str(qty)
-                    print(
-                        f"[HARD_SL] TRIGGER EXIT bot={bot_id} symbol={symbol} "
-                        f"side={side} qty={size_str} pnl={pnl_pct:.4f}% "
-                        f"lock_price={lock_price} current={current_price}"
-                    )
+
                     try:
-                        order = create_market_order(
+                        sl_order = create_stop_market_order(
                             symbol=symbol,
                             side=exit_side,
                             size=size_str,
+                            trigger_price=str(lock_price),
                             reduce_only=True,
                             client_id=None,
                         )
-                        status, cancel_reason = _order_status_and_reason(order)
-                        print(
-                            f"[HARD_SL] exit order status={status} "
-                            f"cancelReason={cancel_reason!r}"
-                        )
+                        order_id = sl_order.get("order_id")
+                        client_oid = sl_order.get("client_order_id")
 
-                        if status not in ("CANCELED", "REJECTED"):
-                            # 认为平仓成功，清除本地仓位与硬 SL 状态
-                            pos["qty"] = Decimal("0")
-                            pos["entry_price"] = None
-                            pos["hard_sl_armed"] = False
-                            pos["hard_sl_level"] = None
+                        pos["hard_sl_armed"] = True
+                        pos["hard_sl_level"] = lock_price
+                        pos["hard_sl_order_id"] = order_id
+                        pos["hard_sl_client_order_id"] = client_oid
+
+                        print(
+                            f"[HARD_SL] ARMED (STOP_MARKET) bot={bot_id} symbol={symbol} "
+                            f"side={side} entry={entry_price} lock_price={lock_price} "
+                            f"pnl={pnl_pct:.4f}% order_id={order_id} clientOrderId={client_oid}"
+                        )
                     except Exception as e:
-                        print(f"[HARD_SL] create_market_order error bot={bot_id} symbol={symbol}:", e)
+                        print(f"[HARD_SL] create_stop_market_order error bot={bot_id} symbol={symbol}:", e)
+
+                    continue
 
         except Exception as e:
             print("[HARD_SL] monitor loop top-level error:", e)
@@ -344,7 +345,13 @@ def tv_webhook():
 
         snapped_dec = snapped_qty
 
-        if pos and pos.get("side") == side_raw and pos.get("qty", Decimal("0")) > 0 and entry_price_dec is not None and pos.get("entry_price") is not None:
+        if (
+            pos
+            and pos.get("side") == side_raw
+            and pos.get("qty", Decimal("0")) > 0
+            and entry_price_dec is not None
+            and pos.get("entry_price") is not None
+        ):
             old_qty = pos["qty"]
             old_price = pos["entry_price"]
             new_qty = old_qty + snapped_dec
@@ -354,9 +361,11 @@ def tv_webhook():
                 "side": side_raw,
                 "qty": new_qty,
                 "entry_price": new_entry_price,
-                # 加仓后，硬 SL 状态可以保留也可以重置，这里选择保留原状态：
+                # 加仓后，硬 SL 状态保留（已经挂的 STOP 单仍然有效）
                 "hard_sl_armed": pos.get("hard_sl_armed", False),
                 "hard_sl_level": pos.get("hard_sl_level"),
+                "hard_sl_order_id": pos.get("hard_sl_order_id"),
+                "hard_sl_client_order_id": pos.get("hard_sl_client_order_id"),
             }
         else:
             # 第一次开仓，或者之前是反方向，直接覆盖并重置硬 SL 状态
@@ -366,6 +375,8 @@ def tv_webhook():
                 "entry_price": entry_price_dec,
                 "hard_sl_armed": False,
                 "hard_sl_level": None,
+                "hard_sl_order_id": None,
+                "hard_sl_client_order_id": None,
             }
 
         print(f"[ENTRY] BOT_POSITIONS[{key}] = {BOT_POSITIONS[key]}")
@@ -398,6 +409,24 @@ def tv_webhook():
         entry_side = pos["side"]
         qty = pos["qty"]
         exit_side = "SELL" if entry_side == "BUY" else "BUY"
+
+        hard_sl_order_id = pos.get("hard_sl_order_id")
+        hard_sl_client_order_id = pos.get("hard_sl_client_order_id")
+
+        # 先尝试取消已经挂着的 STOP SL（如果有的话）
+        if hard_sl_order_id or hard_sl_client_order_id:
+            try:
+                print(
+                    f"[EXIT] cancel hard SL bot={bot_id} symbol={symbol} "
+                    f"order_id={hard_sl_order_id} clientOrderId={hard_sl_client_order_id}"
+                )
+                cancel_order(
+                    symbol=symbol,
+                    order_id=hard_sl_order_id,
+                    client_order_id=hard_sl_client_order_id,
+                )
+            except Exception as e:
+                print("[EXIT] cancel hard SL error:", e)
 
         print(
             f"[EXIT] bot={bot_id} symbol={symbol} "
@@ -446,6 +475,8 @@ def tv_webhook():
             "entry_price": None,
             "hard_sl_armed": False,
             "hard_sl_level": None,
+            "hard_sl_order_id": None,
+            "hard_sl_client_order_id": None,
         }
         print(f"[EXIT] BOT_POSITIONS[{key}] -> {BOT_POSITIONS[key]}")
 
