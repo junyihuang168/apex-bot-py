@@ -19,55 +19,31 @@ app = Flask(__name__)
 
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 
-# ------------------------------------------------------------------
-# 硬性锁盈止损配置（只对部分 bot 生效）
-# ------------------------------------------------------------------
-# 哪些 bot 使用 0.25% -> 0.2% 的硬性锁盈止损（默认 BOT_1 ~ BOT_10）
+# -----------------------------
+# HARD SL bots only BOT_1-10
+# -----------------------------
 _HARD_SL_BOTS_ENV = os.getenv(
     "HARD_SL_BOTS",
     "BOT_1,BOT_2,BOT_3,BOT_4,BOT_5,BOT_6,BOT_7,BOT_8,BOT_9,BOT_10",
 )
-HARD_SL_BOTS = {
-    b.strip()
-    for b in _HARD_SL_BOTS_ENV.split(",")
-    if b.strip()
-}
+HARD_SL_BOTS = {b.strip() for b in _HARD_SL_BOTS_ENV.split(",") if b.strip()}
 
-# 触发挂“锁盈 SL 单”的浮盈百分比（0.25%）
 HARD_SL_TRIGGER_PCT = Decimal(os.getenv("HARD_SL_TRIGGER_PCT", "0.25"))
-
-# 锁盈线水平（0.2%）：达到 0.25% 后，一旦回落到这个水平就由 ApeX 的 SL 单强平
 HARD_SL_LEVEL_PCT = Decimal(os.getenv("HARD_SL_LEVEL_PCT", "0.20"))
-
-# 后台轮询 Apex 价格的时间间隔（秒）——只用来检测是否到 0.25% 去挂 STOP_MARKET
 HARD_SL_POLL_INTERVAL = float(os.getenv("HARD_SL_POLL_INTERVAL", "2.0"))
 
-# key: (bot_id, symbol) -> {
-#   "side": "BUY"/"SELL",
-#   "qty": Decimal,
-#   "entry_price": Decimal | None,
-#   "hard_sl_armed": bool,               # 是否已经为这笔仓位挂过 SL 条件单
-#   "hard_sl_level": Decimal | None,     # 锁盈 SL 触发价（0.2%）
-#   "hard_sl_stop_id": str | None,       # ApeX STOP_MARKET orderId
-#   "hard_sl_client_order_id": str | None,
-# }
 BOT_POSITIONS: Dict[Tuple[str, str], dict] = {}
 
-# 后台线程启动标记
 _MONITOR_THREAD_STARTED = False
 _MONITOR_LOCK = threading.Lock()
 
 
-# ------------------------------------------------
-# 从 payload 里取 USDT 预算
-# ------------------------------------------------
 def _extract_budget_usdt(body: dict) -> Decimal:
     size_field = (
         body.get("position_size_usdt")
         or body.get("size_usdt")
         or body.get("size")
     )
-
     if size_field is None:
         raise ValueError("missing position_size_usdt / size_usdt / size")
 
@@ -78,9 +54,6 @@ def _extract_budget_usdt(body: dict) -> Decimal:
     return budget
 
 
-# ------------------------------------------------
-# 根据 USDT 预算算出 snapped qty
-# ------------------------------------------------
 def _compute_entry_qty(symbol: str, side: str, budget: Decimal) -> Decimal:
     rules = _get_symbol_rules(symbol)
     min_qty = rules["min_qty"]
@@ -96,10 +69,6 @@ def _compute_entry_qty(symbol: str, side: str, budget: Decimal) -> Decimal:
 
 
 def _order_status_and_reason(order: dict):
-    """
-    统一从 ApeX 返回里抽 status / cancelReason：
-    - 如果顶层 code != 200，也视为 ERROR
-    """
     if not isinstance(order, dict):
         return "", ""
 
@@ -114,7 +83,6 @@ def _order_status_and_reason(order: dict):
 
     code = order.get("code")
     if code not in (None, 200, "200"):
-        # 有些错误根本没有 data.status，只在 code / msg
         if not status:
             status = "ERROR"
         if not cancel_reason:
@@ -123,18 +91,45 @@ def _order_status_and_reason(order: dict):
     return status, cancel_reason
 
 
-# ------------------------------------------------
-# 后台线程：监控浮盈并在 0.25% 挂 0.2% 的 STOP_MARKET 条件止损单
-# ------------------------------------------------
+def _extract_filled_qty(data: dict):
+    """
+    尽可能兼容不同 SDK 可能出现的成交字段。
+    返回 Decimal 或 None（表示字段缺失/无法判断）。
+    """
+    keys = [
+        "cumMatchFillSize",
+        "cumSuccessFillSize",
+        "cumFilledSize",
+        "cumFillSize",
+        "filledSize",
+        "executedSize",
+    ]
+    for k in keys:
+        v = data.get(k)
+        if v not in (None, "", "0", 0):
+            try:
+                return Decimal(str(v))
+            except Exception:
+                continue
+
+    # 如果字段存在但为 0
+    for k in keys:
+        if k in data:
+            try:
+                return Decimal(str(data.get(k) or "0"))
+            except Exception:
+                return Decimal("0")
+
+    return None  # 字段完全缺失
+
+
 def _monitor_positions_loop():
-    """后台轮询 Apex 价格，对开启硬 SL 的 bot 执行 0.25% -> 0.2% 锁盈逻辑（真正挂 STOP_MARKET）。"""
     global BOT_POSITIONS
     print("[HARD_SL] monitor thread started")
 
     while True:
         try:
             for (bot_id, symbol), pos in list(BOT_POSITIONS.items()):
-                # 只对配置好的 bot 生效
                 if bot_id not in HARD_SL_BOTS:
                     continue
 
@@ -144,18 +139,11 @@ def _monitor_positions_loop():
                 hard_sl_armed = bool(pos.get("hard_sl_armed", False))
 
                 if not side or qty <= 0 or entry_price is None:
-                    # 没有效仓位时，重置本地硬 SL 标记
-                    pos["hard_sl_armed"] = False
-                    pos["hard_sl_level"] = None
-                    pos["hard_sl_stop_id"] = None
-                    pos["hard_sl_client_order_id"] = None
                     continue
 
-                # 如果已经挂过 STOP_MARKET，就不再重复挂
                 if hard_sl_armed:
                     continue
 
-                # 当前价格：用 Apex 的 get_worst_price_v3 做参考价（用平仓方向）
                 try:
                     rules = _get_symbol_rules(symbol)
                     min_qty = rules["min_qty"]
@@ -166,37 +154,29 @@ def _monitor_positions_loop():
                     print(f"[HARD_SL] get_market_price error bot={bot_id} symbol={symbol}:", e)
                     continue
 
-                # 浮盈百分比
                 if side == "BUY":
                     pnl_pct = (current_price - entry_price) * Decimal("100") / entry_price
-                else:
-                    pnl_pct = (entry_price - current_price) * Decimal("100") / entry_price
-
-                # 0.2% 锁盈触发价（基于 entry，不是 trailing）
-                if side == "BUY":
                     lock_price = entry_price * (Decimal("1") + HARD_SL_LEVEL_PCT / Decimal("100"))
                 else:
+                    pnl_pct = (entry_price - current_price) * Decimal("100") / entry_price
                     lock_price = entry_price * (Decimal("1") - HARD_SL_LEVEL_PCT / Decimal("100"))
 
-                # 未武装 & 已达到 0.25% -> 真正挂 SL
-                if not hard_sl_armed and pnl_pct >= HARD_SL_TRIGGER_PCT:
-                    trigger_price = lock_price
-                    size_str = str(qty)
-
+                if pnl_pct >= HARD_SL_TRIGGER_PCT:
                     print(
                         f"[HARD_SL] ARMED -> place STOP_MARKET "
-                        f"bot={bot_id} symbol={symbol} side={side} "
-                        f"entry={entry_price} trigger={trigger_price} pnl={pnl_pct:.4f}%"
+                        f"bot={bot_id} symbol={symbol} entry={entry_price} "
+                        f"trigger={lock_price} pnl={pnl_pct:.4f}%"
                     )
                     try:
                         stop_order = create_stop_market_order(
                             symbol=symbol,
                             side=exit_side,
-                            size=size_str,
-                            trigger_price=str(trigger_price),
+                            size=str(qty),
+                            trigger_price=str(lock_price),
                             reduce_only=True,
                             client_id=None,
                         )
+
                         status, cancel_reason = _order_status_and_reason(stop_order)
                         order_id = stop_order.get("order_id")
                         client_order_id = stop_order.get("client_order_id")
@@ -206,23 +186,14 @@ def _monitor_positions_loop():
                             f"order_id={order_id} cancelReason={cancel_reason!r}"
                         )
 
-                        # CANCELED / ERROR / REJECTED 都视为失败，下次轮询再试
-                        if status in ("CANCELED", "ERROR", "REJECTED", "EXPIRED"):
-                            print(
-                                f"[HARD_SL] bot={bot_id} symbol={symbol}: "
-                                f"STOP_MARKET not armed (status={status}, cancelReason={cancel_reason!r})"
-                            )
-                        else:
+                        if status not in ("ERROR", "CANCELED", "REJECTED", "EXPIRED"):
                             pos["hard_sl_armed"] = True
-                            pos["hard_sl_level"] = trigger_price
+                            pos["hard_sl_level"] = lock_price
                             pos["hard_sl_stop_id"] = order_id
                             pos["hard_sl_client_order_id"] = client_order_id
 
                     except Exception as e:
-                        print(
-                            f"[HARD_SL] create_stop_market_order error bot={bot_id} symbol={symbol}:",
-                            e,
-                        )
+                        print(f"[HARD_SL] create_stop_market_order error bot={bot_id} symbol={symbol}:", e)
 
         except Exception as e:
             print("[HARD_SL] monitor loop top-level error:", e)
@@ -231,7 +202,6 @@ def _monitor_positions_loop():
 
 
 def _ensure_monitor_thread():
-    """确保后台监控线程只启动一次。"""
     global _MONITOR_THREAD_STARTED
     with _MONITOR_LOCK:
         if not _MONITOR_THREAD_STARTED:
@@ -251,9 +221,6 @@ def index():
 def tv_webhook():
     _ensure_monitor_thread()
 
-    # ---------------------------
-    # 1. 解析 JSON & 校验 secret
-    # ---------------------------
     try:
         body = request.get_json(force=True, silent=False)
     except Exception as e:
@@ -280,11 +247,7 @@ def tv_webhook():
     action_raw = str(body.get("action", "")).lower()
     tv_client_id = body.get("client_id")
 
-    # ---------------------------
-    # 2. 判定 entry / exit
-    # ---------------------------
     mode: str | None = None
-
     if signal_type_raw in ("entry", "open"):
         mode = "entry"
     elif signal_type_raw.startswith("exit"):
@@ -299,7 +262,7 @@ def tv_webhook():
         return "missing or invalid signal_type / action", 400
 
     # ---------------------------
-    # 3. ENTRY
+    # ENTRY
     # ---------------------------
     if mode == "entry":
         if side_raw not in ("BUY", "SELL"):
@@ -317,14 +280,8 @@ def tv_webhook():
             print("[ENTRY] qty compute error:", e)
             return "qty compute error", 500
 
-        if snapped_qty <= 0:
-            return "snapped qty <= 0", 500
-
         size_str = str(snapped_qty)
-        print(
-            f"[ENTRY] bot={bot_id} symbol={symbol} side={side_raw} "
-            f"budget={budget} -> request_qty={size_str}"
-        )
+        print(f"[ENTRY] bot={bot_id} symbol={symbol} side={side_raw} budget={budget} -> request_qty={size_str}")
 
         try:
             order = create_market_order(
@@ -339,28 +296,18 @@ def tv_webhook():
             return "order error", 500
 
         data = (order or {}).get("data") or {}
-        filled_str = (
-            data.get("cumMatchFillSize")
-            or data.get("cumSuccessFillSize")
-            or "0"
-        )
-        try:
-            filled_qty = Decimal(str(filled_str))
-        except Exception:
-            filled_qty = Decimal("0")
-
         status, cancel_reason = _order_status_and_reason(order)
+        tif = str(data.get("timeInForce", "")).upper()
+        filled_qty = _extract_filled_qty(data)
+
         print(
             f"[ENTRY] order status={status} cancelReason={cancel_reason!r} "
-            f"filled={filled_qty}"
+            f"timeInForce={tif} filled={filled_qty}"
         )
 
-        # 没有任何成交 / 被系统取消 / ERROR：不记录仓位
-        if filled_qty <= 0 or status in ("CANCELED", "EXPIRED", "ERROR") or cancel_reason:
-            print(
-                f"[ENTRY] bot={bot_id} symbol={symbol}: "
-                f"order not filled, won't record position"
-            )
+        # 明显“没成交”的 IOC 场景仍然不记录
+        if status == "PENDING" and tif == "IMMEDIATE_OR_CANCEL" and cancel_reason and (filled_qty is None or filled_qty <= 0):
+            print("[ENTRY] IOC pending + cancelReason -> treat as not filled")
             return jsonify({
                 "status": "order_not_filled",
                 "mode": "entry",
@@ -370,13 +317,44 @@ def tv_webhook():
                 "requested_qty": size_str,
                 "order_status": status,
                 "cancel_reason": cancel_reason,
-                "filled_qty": str(filled_qty),
                 "raw_order": order,
             }), 200
 
-        # 真正有成交 -> 记录仓位
+        # 顶层 ERROR 直接不记录
+        if status in ("ERROR", "REJECTED", "CANCELED", "EXPIRED"):
+            return jsonify({
+                "status": "order_failed",
+                "mode": "entry",
+                "bot_id": bot_id,
+                "symbol": symbol,
+                "side": side_raw,
+                "requested_qty": size_str,
+                "order_status": status,
+                "cancel_reason": cancel_reason,
+                "raw_order": order,
+            }), 200
+
+        # ✅ 关键折中：
+        # - 如果 filled_qty 有且 >0 -> 记录
+        # - 如果 filled_qty 缺失 -> 只要不是明显 IOC 失败场景，也允许记录
+        should_record = (filled_qty is not None and filled_qty > 0) or (filled_qty is None)
+
+        if not should_record:
+            print("[ENTRY] filled=0 -> not recording position")
+            return jsonify({
+                "status": "order_not_filled",
+                "mode": "entry",
+                "bot_id": bot_id,
+                "symbol": symbol,
+                "side": side_raw,
+                "requested_qty": size_str,
+                "order_status": status,
+                "cancel_reason": cancel_reason,
+                "filled": str(filled_qty),
+                "raw_order": order,
+            }), 200
+
         key = (bot_id, symbol)
-        pos = BOT_POSITIONS.get(key)
 
         computed = (order or {}).get("computed") or {}
         price_str = computed.get("price")
@@ -385,39 +363,15 @@ def tv_webhook():
         except Exception:
             entry_price_dec = None
 
-        snapped_dec = snapped_qty
-
-        if (
-            pos
-            and pos.get("side") == side_raw
-            and pos.get("qty", Decimal("0")) > 0
-            and entry_price_dec is not None
-            and pos.get("entry_price") is not None
-        ):
-            old_qty = pos["qty"]
-            old_price = pos["entry_price"]
-            new_qty = old_qty + snapped_dec
-            new_entry_price = (old_price * old_qty + entry_price_dec * snapped_dec) / new_qty
-            BOT_POSITIONS[key] = {
-                "side": side_raw,
-                "qty": new_qty,
-                "entry_price": new_entry_price,
-                # 加仓后重新计算锁盈逻辑，所以重置硬 SL 状态
-                "hard_sl_armed": False,
-                "hard_sl_level": None,
-                "hard_sl_stop_id": None,
-                "hard_sl_client_order_id": None,
-            }
-        else:
-            BOT_POSITIONS[key] = {
-                "side": side_raw,
-                "qty": snapped_dec,
-                "entry_price": entry_price_dec,
-                "hard_sl_armed": False,
-                "hard_sl_level": None,
-                "hard_sl_stop_id": None,
-                "hard_sl_client_order_id": None,
-            }
+        BOT_POSITIONS[key] = {
+            "side": side_raw,
+            "qty": Decimal(size_str),
+            "entry_price": entry_price_dec,
+            "hard_sl_armed": False,
+            "hard_sl_level": None,
+            "hard_sl_stop_id": None,
+            "hard_sl_client_order_id": None,
+        }
 
         print(f"[ENTRY] BOT_POSITIONS[{key}] = {BOT_POSITIONS[key]}")
 
@@ -429,32 +383,27 @@ def tv_webhook():
             "side": side_raw,
             "qty": str(BOT_POSITIONS[key]["qty"]),
             "entry_price": str(BOT_POSITIONS[key]["entry_price"]) if BOT_POSITIONS[key]["entry_price"] is not None else None,
-            "requested_last": str(snapped_qty),
             "order_status": status,
             "cancel_reason": cancel_reason,
-            "filled_qty": str(filled_qty),
             "raw_order": order,
         }), 200
 
     # ---------------------------
-    # 4. EXIT（策略出场）
+    # EXIT
     # ---------------------------
     if mode == "exit":
         key = (bot_id, symbol)
         pos = BOT_POSITIONS.get(key)
 
         if not pos or pos.get("qty", Decimal("0")) <= 0:
-            print(f"[EXIT] bot={bot_id} symbol={symbol}: no position to close")
-            return jsonify({"status": "no_position"}), 200
+            print(f"[EXIT] bot={bot_id} symbol={symbol}: no position to close (local)")
+            return jsonify({"status": "no_position_local"}), 200
 
         entry_side = pos["side"]
         qty = pos["qty"]
         exit_side = "SELL" if entry_side == "BUY" else "BUY"
 
-        print(
-            f"[EXIT] bot={bot_id} symbol={symbol} "
-            f"entry_side={entry_side} qty={qty} -> exit_side={exit_side}"
-        )
+        print(f"[EXIT] bot={bot_id} symbol={symbol} entry_side={entry_side} qty={qty} -> exit_side={exit_side}")
 
         try:
             order = create_market_order(
@@ -468,29 +417,11 @@ def tv_webhook():
             print("[EXIT] create_market_order error:", e)
             return "order error", 500
 
-        data = (order or {}).get("data") or {}
-        filled_str = (
-            data.get("cumMatchFillSize")
-            or data.get("cumSuccessFillSize")
-            or "0"
-        )
-        try:
-            filled_qty = Decimal(str(filled_str))
-        except Exception:
-            filled_qty = Decimal("0")
-
         status, cancel_reason = _order_status_and_reason(order)
-        print(
-            f"[EXIT] order status={status} cancelReason={cancel_reason!r} "
-            f"filled={filled_qty}"
-        )
+        print(f"[EXIT] order status={status} cancelReason={cancel_reason!r}")
 
-        # EXIT 失败：不清本地仓位
-        if filled_qty <= 0 or status in ("CANCELED", "EXPIRED", "ERROR"):
-            print(
-                f"[EXIT] bot={bot_id} symbol={symbol}: "
-                f"exit order failed, keep qty={qty}"
-            )
+        if status in ("ERROR", "REJECTED", "CANCELED", "EXPIRED"):
+            print("[EXIT] exit failed -> keep local position")
             return jsonify({
                 "status": "exit_failed",
                 "mode": "exit",
@@ -500,17 +431,16 @@ def tv_webhook():
                 "requested_qty": str(qty),
                 "order_status": status,
                 "cancel_reason": cancel_reason,
-                "filled_qty": str(filled_qty),
                 "raw_order": order,
             }), 200
 
-        # EXIT 成功的话，可以尝试把之前挂的 STOP_MARKET 撤掉（可选）
+        # 尝试撤硬 SL
         hard_sl_order_id = pos.get("hard_sl_stop_id")
         hard_sl_client_order_id = pos.get("hard_sl_client_order_id")
         if hard_sl_order_id or hard_sl_client_order_id:
             try:
                 print(
-                    f"[EXIT] cancel hard SL for bot={bot_id} symbol={symbol} "
+                    f"[EXIT] cancel hard SL bot={bot_id} symbol={symbol} "
                     f"order_id={hard_sl_order_id} client_order_id={hard_sl_client_order_id}"
                 )
                 cancel_order(
@@ -519,10 +449,7 @@ def tv_webhook():
                     client_order_id=hard_sl_client_order_id,
                 )
             except Exception as e:
-                print(
-                    f"[EXIT] cancel_order (hard SL) error bot={bot_id} symbol={symbol}:",
-                    e,
-                )
+                print("[EXIT] cancel hard SL error:", e)
 
         BOT_POSITIONS[key] = {
             "side": entry_side,
@@ -533,6 +460,7 @@ def tv_webhook():
             "hard_sl_stop_id": None,
             "hard_sl_client_order_id": None,
         }
+
         print(f"[EXIT] BOT_POSITIONS[{key}] -> {BOT_POSITIONS[key]}")
 
         return jsonify({
@@ -545,7 +473,6 @@ def tv_webhook():
             "remaining_qty": "0",
             "order_status": status,
             "cancel_reason": cancel_reason,
-            "filled_qty": str(filled_qty),
             "raw_order": order,
         }), 200
 
