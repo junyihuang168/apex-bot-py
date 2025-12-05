@@ -24,29 +24,20 @@ DEFAULT_SYMBOL_RULES = {
 }
 
 SYMBOL_RULES: Dict[str, Dict[str, Any]] = {
-    # 示例：如果特定 symbol 规则不同，在这里覆盖
+    # 示例覆盖
     # "BTC-USDT": {"min_qty": Decimal("0.001"), "step_size": Decimal("0.001"), "qty_decimals": 3},
 }
 
-# 全局复用一个 HttpPrivateSign，避免每次都重新握手
 _CLIENT: Optional[HttpPrivateSign] = None
 
 
 def _get_symbol_rules(symbol: str) -> Dict[str, Any]:
-    """返回某个交易对的撮合规则（没有就用默认）"""
     s = symbol.upper()
     rules = SYMBOL_RULES.get(s, {})
-    merged = {**DEFAULT_SYMBOL_RULES, **rules}
-    return merged
+    return {**DEFAULT_SYMBOL_RULES, **rules}
 
 
 def _snap_quantity(symbol: str, theoretical_qty: Decimal) -> Decimal:
-    """
-    把理论数量对齐到交易所允许的网格：
-    - 向下取整到 step_size 的整数倍
-    - 再限制为 qty_decimals 位小数
-    - 如果小于 min_qty，就报错（预算太小）
-    """
     rules = _get_symbol_rules(symbol)
     step = rules["step_size"]
     min_qty = rules["min_qty"]
@@ -55,12 +46,10 @@ def _snap_quantity(symbol: str, theoretical_qty: Decimal) -> Decimal:
     if theoretical_qty <= 0:
         raise ValueError("calculated quantity must be > 0")
 
-    # 向下取整到 step 的整数倍
-    steps = (theoretical_qty // step)  # Decimal 的整除
+    steps = (theoretical_qty // step)
     snapped = steps * step
 
-    # 限制小数位数
-    quantum = Decimal("1").scaleb(-decimals)  # 等价于 10^-decimals，比如 0.01
+    quantum = Decimal("1").scaleb(-decimals)
     snapped = snapped.quantize(quantum, rounding=ROUND_DOWN)
 
     if snapped < min_qty:
@@ -71,28 +60,14 @@ def _snap_quantity(symbol: str, theoretical_qty: Decimal) -> Decimal:
     return snapped
 
 
-def _quantize_like(ref_price: Decimal, target_price: Decimal) -> Decimal:
-    """
-    按照 ref_price 的小数位数，把 target_price 向下取整。
-    这样基本能对齐 ApeX 的 price tick。
-    """
-    exp = -ref_price.as_tuple().exponent
-    exp = max(exp, 0)
-    quantum = Decimal("1").scaleb(-exp)
-    return target_price.quantize(quantum, rounding=ROUND_DOWN)
-
-
 def _env_bool(name: str, default: bool = False) -> bool:
-    """把环境变量字符串转成布尔值."""
     value = os.getenv(name, str(default))
     return value.lower() in ("1", "true", "yes", "y", "on")
 
 
 def _get_base_and_network():
-    """根据环境变量决定用 mainnet 还是 testnet。"""
     use_mainnet = _env_bool("APEX_USE_MAINNET", False)
 
-    # 兼容你额外加的 APEX_ENV=main
     env_name = os.getenv("APEX_ENV", "").lower()
     if env_name in ("main", "mainnet", "prod", "production"):
         use_mainnet = True
@@ -103,7 +78,6 @@ def _get_base_and_network():
 
 
 def _get_api_credentials():
-    """从环境变量里拿 API key / secret / passphrase。"""
     return {
         "key": os.environ["APEX_API_KEY"],
         "secret": os.environ["APEX_API_SECRET"],
@@ -112,29 +86,10 @@ def _get_api_credentials():
 
 
 def _random_client_id() -> str:
-    """
-    生成 ApeX 官方风格的 clientId：纯数字字符串，避免 ORDER_INVALID_CLIENT_ORDER_ID。
-    """
     return str(int(float(str(random.random())[2:])))
 
 
-def _pick(d: dict, *keys):
-    """从 dict 里按顺序挑第一个非 None 的 key。"""
-    for k in keys:
-        if k in d and d[k] is not None:
-            return d[k]
-    return None
-
-
-# ---------------------------
-# 创建 / 复用 ApeX 客户端
-# ---------------------------
-
 def get_client() -> HttpPrivateSign:
-    """
-    返回带 zk 签名的 HttpPrivateSign 客户端，
-    用于真正的下单（create_order_v3）。
-    """
     global _CLIENT
     if _CLIENT is not None:
         return _CLIENT
@@ -153,14 +108,12 @@ def get_client() -> HttpPrivateSign:
         api_key_credentials=api_creds,
     )
 
-    # ① 先拉 configs_v3，初始化 client.configV3
     try:
         cfg = client.configs_v3()
         print("[apex_client] configs_v3 ok:", cfg)
     except Exception as e:
         print("[apex_client] WARNING configs_v3 error:", e)
 
-    # ② 再拉 account_v3，初始化 client.accountV3
     try:
         acc = client.get_account_v3()
         print("[apex_client] get_account_v3 ok:", acc)
@@ -171,25 +124,11 @@ def get_client() -> HttpPrivateSign:
     return client
 
 
-# ---------------------------
-# 对外工具函数
-# ---------------------------
-
 def get_account():
-    """查询账户信息，方便你在本地或日志里调试。"""
-    client = get_client()
-    return client.get_account_v3()
+    return get_client().get_account_v3()
 
 
 def get_market_price(symbol: str, side: str, size: str) -> str:
-    """
-    使用 GET /v3/get-worst-price 获取市价单参考价格。
-    - symbol: 例如 'ZEC-USDT'
-    - side: 'BUY' 或 'SELL'
-    - size: 下单数量（字符串或数字均可）
-
-    返回: 字符串形式的价格（比如 '532.15'）
-    """
     base_url, network_id = _get_base_and_network()
     api_creds = _get_api_credentials()
 
@@ -236,48 +175,25 @@ def create_market_order(
     reduce_only: bool = False,
     client_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    创建 ApeX 的 MARKET 市价单。
-
-    两种用法：
-    1) 直接传币的数量：
-         create_market_order(symbol, side, size="0.05", ...)
-
-    2) 传 USDT 金额，自动撮合数量：
-         create_market_order(symbol, side, size_usdt="10", ...)
-    """
     client = get_client()
     side = side.upper()
 
     rules = _get_symbol_rules(symbol)
     decimals = rules["qty_decimals"]
 
-    # -----------------------------
-    # 分支 A：用 USDT 预算自动撮合
-    # -----------------------------
     if size_usdt is not None:
         budget = Decimal(str(size_usdt))
         if budget <= 0:
             raise ValueError("size_usdt must be > 0")
 
         min_qty = rules["min_qty"]
-
-        # 先用最小数量去问一次 worst price，当作当前市价参考
-        ref_price_decimal = Decimal(
-            get_market_price(symbol, side, str(min_qty))
-        )
-
-        # 理论数量 = 预算 / 价格
+        ref_price_decimal = Decimal(get_market_price(symbol, side, str(min_qty)))
         theoretical_qty = budget / ref_price_decimal
-
-        # 对齐到交易所允许的网格（0.01, 0.02, ...）
         snapped_qty = _snap_quantity(symbol, theoretical_qty)
 
-        # 为了更准确，再用真正的下单数量问一次 worst price
         price_str = get_market_price(symbol, side, str(snapped_qty))
         price_decimal = Decimal(price_str)
 
-        # 格式化成固定小数位（例如 0.01）
         size_str = format(snapped_qty, f".{decimals}f")
 
         used_budget = (snapped_qty * price_decimal).quantize(
@@ -285,13 +201,9 @@ def create_market_order(
         )
 
         print(
-            f"[apex_client] budget={budget} USDT -> qty={size_str} {symbol.split('-')[0]}, "
+            f"[apex_client] budget={budget} USDT -> qty={size_str} "
             f"used≈{used_budget} USDT (price {price_str})"
         )
-
-    # -----------------------------
-    # 分支 B：直接用 size 作为数量
-    # -----------------------------
     else:
         if size is None:
             raise ValueError("size or size_usdt must be provided")
@@ -304,14 +216,11 @@ def create_market_order(
         )
 
     ts = int(time.time())
-
-    # ApeX 使用纯数字 clientId，我们这里总是重新生成一个合法的
     apex_client_id = _random_client_id()
     tv_client_id = client_id
+
     if tv_client_id:
-        print(
-            f"[apex_client] tv_client_id={tv_client_id} -> apex_clientId={apex_client_id}"
-        )
+        print(f"[apex_client] tv_client_id={tv_client_id} -> apex_clientId={apex_client_id}")
     else:
         print(f"[apex_client] apex_clientId={apex_client_id} (no tv_client_id)")
 
@@ -327,16 +236,10 @@ def create_market_order(
     }
 
     print("[apex_client] create_market_order params:", params)
-
-    # 真正发单
     order = client.create_order_v3(**params)
-
     print("[apex_client] order response:", order)
 
-    if isinstance(order, dict) and "data" in order:
-        data = order["data"]
-    else:
-        data = order
+    data = order["data"] if isinstance(order, dict) and "data" in order else order
 
     return {
         "data": data,
@@ -352,85 +255,6 @@ def create_market_order(
     }
 
 
-def create_limit_order(
-    symbol: str,
-    side: str,
-    size: NumberLike,
-    price: NumberLike,
-    reduce_only: bool = True,
-    client_id: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    真·LIMIT 单（会在 ApeX 订单簿里挂起）：
-    - 通常用在 TP：多单用 SELL LIMIT，空单用 BUY LIMIT
-    - 建议配合 reduce_only=True，避免误开反向仓
-    """
-    client = get_client()
-
-    # 兜底初始化
-    try:
-        if not hasattr(client, "configV3"):
-            client.configs_v3()
-        if not hasattr(client, "accountV3"):
-            client.get_account_v3()
-    except Exception as e:
-        print("[apex_client] fallback init error (limit):", e)
-
-    side = side.upper()
-    size_str = str(size)
-    price_str = str(price)
-
-    ts = int(time.time())
-    apex_client_id = _random_client_id()
-    tv_client_id = client_id
-
-    if tv_client_id:
-        print(
-            f"[apex_client] (limit) tv_client_id={tv_client_id} -> apex_clientId={apex_client_id}"
-        )
-    else:
-        print(f"[apex_client] (limit) apex_clientId={apex_client_id} (no tv_client_id)")
-
-    params = {
-        "symbol": symbol,
-        "side": side,
-        "type": "LIMIT",
-        "size": size_str,
-        "price": price_str,
-        "reduceOnly": reduce_only,
-        "clientId": apex_client_id,
-        "timestampSeconds": ts,
-    }
-    print("[apex_client] create_limit_order params:", params)
-
-    order = client.create_order_v3(**params)
-    print("[apex_client] (limit) order response:", order)
-
-    data_part = order.get("data") if isinstance(order, dict) else None
-
-    order_id = None
-    client_order_id = None
-
-    if isinstance(order, dict):
-        order_id = _pick(order, "orderId", "id")
-        client_order_id = _pick(order, "clientOrderId", "clientId")
-
-    if isinstance(data_part, dict):
-        order_id = order_id or _pick(data_part, "orderId", "id")
-        client_order_id = client_order_id or _pick(data_part, "clientOrderId", "clientId")
-
-    return {
-        "data": data_part or order,
-        "raw_order": order,
-        "order_id": order_id,
-        "client_order_id": client_order_id,
-        "symbol": symbol,
-        "side": side,
-        "size": size_str,
-        "price": price_str,
-    }
-
-
 def create_stop_market_order(
     symbol: str,
     side: str,
@@ -440,20 +264,10 @@ def create_stop_market_order(
     client_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    创建真正挂在 ApeX 上的 STOP_MARKET 条件单（止损市价单）：
-    - 多单平仓：side="SELL"，type="STOP_MARKET"
-    - 空单平仓：side="BUY"， type="STOP_MARKET"
-    - trigger_price: 触发价（比如锁盈 0.2% 的价位）
-
-    ApeX 要求：
-    - 仍然要传一个 price（触发后执行的保护价），必须对用户来说是更“吃亏”的价格，
-      否则订单可能被拒绝。这里简单做法：
-        · SELL 停损：price = trigger_price * 0.99
-        · BUY  停损：price = trigger_price * 1.01
+    真正挂在 ApeX 的 STOP_MARKET 条件止损单。
     """
     client = get_client()
 
-    # 兜底初始化
     try:
         if not hasattr(client, "configV3"):
             client.configs_v3()
@@ -467,6 +281,7 @@ def create_stop_market_order(
 
     trigger_price_dec = Decimal(str(trigger_price))
 
+    # 保护价，让系统更容易接受
     if side == "SELL":
         limit_price_dec = trigger_price_dec * Decimal("0.99")
     else:
@@ -480,9 +295,7 @@ def create_stop_market_order(
     tv_client_id = client_id
 
     if tv_client_id:
-        print(
-            f"[apex_client] (stop) tv_client_id={tv_client_id} -> apex_clientId={apex_client_id}"
-        )
+        print(f"[apex_client] (stop) tv_client_id={tv_client_id} -> apex_clientId={apex_client_id}")
     else:
         print(f"[apex_client] (stop) apex_clientId={apex_client_id} (no tv_client_id)")
 
@@ -493,6 +306,7 @@ def create_stop_market_order(
         "size": size_str,
         "price": price_str,
         "triggerPrice": trigger_price_str,
+        "triggerPriceType": "MARKET",  # ✅ 增加兼容字段
         "reduceOnly": reduce_only,
         "clientId": apex_client_id,
         "timestampSeconds": ts,
@@ -502,13 +316,16 @@ def create_stop_market_order(
     order = client.create_order_v3(**params)
     print("[apex_client] (stop) order response:", order)
 
-    if isinstance(order, dict) and "data" in order:
-        data = order["data"]
-    else:
-        data = order
+    data = order["data"] if isinstance(order, dict) and "data" in order else order
 
     order_id = None
     client_order_id = None
+
+    def _pick(d: dict, *keys):
+        for k in keys:
+            if k in d and d[k] is not None:
+                return d[k]
+        return None
 
     if isinstance(order, dict):
         order_id = _pick(order, "orderId", "id")
@@ -519,7 +336,7 @@ def create_stop_market_order(
         client_order_id = client_order_id or _pick(data, "clientOrderId", "clientId")
 
     return {
-        "data": data or order,
+        "data": data,
         "raw_order": order,
         "order_id": order_id,
         "client_order_id": client_order_id,
@@ -536,46 +353,36 @@ def cancel_order(
     order_id: Optional[str] = None,
     client_order_id: Optional[str] = None,
 ):
-    """
-    取消一个活动订单（主要用来取消 TP/SL LIMIT 或 STOP）。
-
-    会尝试以下几种方法，按你本地 SDK 为准：
-    - delete_order_v3(orderId=...)
-    - cancel_order_v3(orderId=...)
-    - cancel_active_order_v3(symbol=..., clientOrderId=...)
-    如果都没有，就只打一行 log，不抛异常。
-    """
     client = get_client()
-
-    res: Any = {"info": "no cancel API used"}
 
     try:
         if hasattr(client, "delete_order_v3"):
-            kwargs: Dict[str, Any] = {}
+            kwargs = {}
             if order_id:
                 kwargs["orderId"] = order_id
-            if client_order_id and "clientOrderId" in client.delete_order_v3.__code__.co_varnames:
+            if client_order_id:
                 kwargs["clientOrderId"] = client_order_id
             print(f"[apex_client] delete_order_v3 kwargs={kwargs}")
             res = client.delete_order_v3(**kwargs)
-        elif hasattr(client, "cancel_order_v3") and order_id is not None:
-            print(f"[apex_client] cancel_order_v3 by orderId={order_id}")
+            print("[apex_client] cancel_order response:", res)
+            return res
+
+        if hasattr(client, "cancel_order_v3") and order_id:
+            print(f"[apex_client] cancel_order_v3 orderId={order_id}")
             res = client.cancel_order_v3(orderId=order_id)
-        elif hasattr(client, "cancel_active_order_v3"):
+            print("[apex_client] cancel_order response:", res)
+            return res
+
+        if hasattr(client, "cancel_active_order_v3"):
             coid = client_order_id or order_id
-            print(
-                f"[apex_client] cancel_active_order_v3 symbol={symbol}, clientOrderId={coid}"
-            )
-            res = client.cancel_active_order_v3(
-                symbol=symbol,
-                clientOrderId=coid,
-            )
-        else:
-            print("[apex_client] WARNING: no cancel/delete API found on client")
-            return {"error": "no_cancel_api"}
+            print(f"[apex_client] cancel_active_order_v3 symbol={symbol} clientOrderId={coid}")
+            res = client.cancel_active_order_v3(symbol=symbol, clientOrderId=coid)
+            print("[apex_client] cancel_order response:", res)
+            return res
+
+        print("[apex_client] WARNING: no cancel/delete API found on client")
+        return {"error": "no_cancel_api"}
+
     except Exception as e:
         print("[apex_client] cancel_order error:", e)
         return {"error": str(e)}
-
-    print("[apex_client] cancel_order response:", res)
-    return res
