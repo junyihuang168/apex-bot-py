@@ -82,18 +82,6 @@ def _quantize_like(ref_price: Decimal, target_price: Decimal) -> Decimal:
     return target_price.quantize(quantum, rounding=ROUND_DOWN)
 
 
-def _pick(d: dict, *keys):
-    """从 dict 里按顺序挑第一个非 None 的 key。"""
-    for k in keys:
-        if k in d and d[k] is not None:
-            return d[k]
-    return None
-
-
-# ---------------------------
-# 内部小工具函数
-# ---------------------------
-
 def _env_bool(name: str, default: bool = False) -> bool:
     """把环境变量字符串转成布尔值."""
     value = os.getenv(name, str(default))
@@ -128,6 +116,14 @@ def _random_client_id() -> str:
     生成 ApeX 官方风格的 clientId：纯数字字符串，避免 ORDER_INVALID_CLIENT_ORDER_ID。
     """
     return str(int(float(str(random.random())[2:])))
+
+
+def _pick(d: dict, *keys):
+    """从 dict 里按顺序挑第一个非 None 的 key。"""
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return None
 
 
 # ---------------------------
@@ -337,10 +333,6 @@ def create_market_order(
 
     print("[apex_client] order response:", order)
 
-    # 为了让 app.py 能直接读到 data/status/cancelReason，
-    # 这里返回一个 wrapper：
-    # - data:   真实 apex 返回（带 data 字段或本身就是订单对象）
-    # - raw_order: 保持兼容你之前的写法
     if isinstance(order, dict) and "data" in order:
         data = order["data"]
     else:
@@ -408,8 +400,6 @@ def create_limit_order(
         "reduceOnly": reduce_only,
         "clientId": apex_client_id,
         "timestampSeconds": ts,
-        # 如果你想指定 timeInForce，也可以在这里加上:
-        # "timeInForce": "GOOD_TIL_CANCEL",
     }
     print("[apex_client] create_limit_order params:", params)
 
@@ -450,24 +440,40 @@ def create_stop_market_order(
     client_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    创建 ApeX 的 STOP_MARKET 条件单（真·硬止损挂在交易所上）：
+    创建真正挂在 ApeX 上的 STOP_MARKET 条件单（止损市价单）：
+    - 多单平仓：side="SELL"，type="STOP_MARKET"
+    - 空单平仓：side="BUY"， type="STOP_MARKET"
+    - trigger_price: 触发价（比如锁盈 0.2% 的价位）
 
-    - 用于硬 SL：
-      * 多单平仓： side='SELL'
-      * 空单平仓： side='BUY'
-    - trigger_price: 触发价（比如多单锁盈价 = entry * 1.002）
+    ApeX 要求：
+    - 仍然要传一个 price（触发后执行的保护价），必须对用户来说是更“吃亏”的价格，
+      否则订单可能被拒绝。这里简单做法：
+        · SELL 停损：price = trigger_price * 0.99
+        · BUY  停损：price = trigger_price * 1.01
     """
     client = get_client()
+
+    # 兜底初始化
+    try:
+        if not hasattr(client, "configV3"):
+            client.configs_v3()
+        if not hasattr(client, "accountV3"):
+            client.get_account_v3()
+    except Exception as e:
+        print("[apex_client] fallback init error (stop):", e)
+
     side = side.upper()
     size_str = str(size)
 
-    # 先用 size 获取一次 worst price，既当作“市价参考”，也给 price 字段用
-    price_str = get_market_price(symbol, side, size_str)
-    ref_price_dec = Decimal(price_str)
+    trigger_price_dec = Decimal(str(trigger_price))
 
-    # 按照价格精度对齐 trigger_price
-    trigger_dec = _quantize_like(ref_price_dec, Decimal(str(trigger_price)))
-    trigger_str = str(trigger_dec)
+    if side == "SELL":
+        limit_price_dec = trigger_price_dec * Decimal("0.99")
+    else:
+        limit_price_dec = trigger_price_dec * Decimal("1.01")
+
+    price_str = str(limit_price_dec)
+    trigger_price_str = str(trigger_price_dec)
 
     ts = int(time.time())
     apex_client_id = _random_client_id()
@@ -485,19 +491,21 @@ def create_stop_market_order(
         "side": side,
         "type": "STOP_MARKET",
         "size": size_str,
-        "price": price_str,          # ApeX 要求 MARKET/STOP 也带一个 price，用来做 zk 签名 & slippage
-        "triggerPrice": trigger_str, # 真正的触发价
-        "timestampSeconds": ts,
+        "price": price_str,
+        "triggerPrice": trigger_price_str,
         "reduceOnly": reduce_only,
         "clientId": apex_client_id,
+        "timestampSeconds": ts,
     }
 
     print("[apex_client] create_stop_market_order params:", params)
-
     order = client.create_order_v3(**params)
     print("[apex_client] (stop) order response:", order)
 
-    data_part = order.get("data") if isinstance(order, dict) else None
+    if isinstance(order, dict) and "data" in order:
+        data = order["data"]
+    else:
+        data = order
 
     order_id = None
     client_order_id = None
@@ -506,20 +514,20 @@ def create_stop_market_order(
         order_id = _pick(order, "orderId", "id")
         client_order_id = _pick(order, "clientOrderId", "clientId")
 
-    if isinstance(data_part, dict):
-        order_id = order_id or _pick(data_part, "orderId", "id")
-        client_order_id = client_order_id or _pick(data_part, "clientOrderId", "clientId")
+    if isinstance(data, dict):
+        order_id = order_id or _pick(data, "orderId", "id")
+        client_order_id = client_order_id or _pick(data, "clientOrderId", "clientId")
 
     return {
-        "data": data_part or order,
+        "data": data or order,
         "raw_order": order,
         "order_id": order_id,
         "client_order_id": client_order_id,
         "symbol": symbol,
         "side": side,
         "size": size_str,
+        "trigger_price": trigger_price_str,
         "price": price_str,
-        "trigger_price": trigger_str,
     }
 
 
@@ -529,30 +537,42 @@ def cancel_order(
     client_order_id: Optional[str] = None,
 ):
     """
-    取消一个活动订单（主要用来取消 TP/SL LIMIT/STOP）。
+    取消一个活动订单（主要用来取消 TP/SL LIMIT 或 STOP）。
 
-    ⚠️ ApeX SDK cancel 接口的名字 / 参数可能随版本不同，
-       这里是一个模板，你需要根据你本地的 apexomni 版本调整：
-       - 有的叫 cancel_order_v3(orderId=...)
-       - 有的叫 cancel_active_order_v3(symbol=..., clientOrderId=...)
+    会尝试以下几种方法，按你本地 SDK 为准：
+    - delete_order_v3(orderId=...)
+    - cancel_order_v3(orderId=...)
+    - cancel_active_order_v3(symbol=..., clientOrderId=...)
+    如果都没有，就只打一行 log，不抛异常。
     """
     client = get_client()
 
+    res: Any = {"info": "no cancel API used"}
+
     try:
-        if hasattr(client, "cancel_order_v3") and order_id is not None:
+        if hasattr(client, "delete_order_v3"):
+            kwargs: Dict[str, Any] = {}
+            if order_id:
+                kwargs["orderId"] = order_id
+            if client_order_id and "clientOrderId" in client.delete_order_v3.__code__.co_varnames:
+                kwargs["clientOrderId"] = client_order_id
+            print(f"[apex_client] delete_order_v3 kwargs={kwargs}")
+            res = client.delete_order_v3(**kwargs)
+        elif hasattr(client, "cancel_order_v3") and order_id is not None:
             print(f"[apex_client] cancel_order_v3 by orderId={order_id}")
             res = client.cancel_order_v3(orderId=order_id)
         elif hasattr(client, "cancel_active_order_v3"):
+            coid = client_order_id or order_id
             print(
-                f"[apex_client] cancel_active_order_v3 symbol={symbol}, "
-                f"clientOrderId={client_order_id or order_id}"
+                f"[apex_client] cancel_active_order_v3 symbol={symbol}, clientOrderId={coid}"
             )
             res = client.cancel_active_order_v3(
                 symbol=symbol,
-                clientOrderId=client_order_id or order_id,
+                clientOrderId=coid,
             )
         else:
-            raise RuntimeError("No cancel_* API found on HttpPrivateSign client")
+            print("[apex_client] WARNING: no cancel/delete API found on client")
+            return {"error": "no_cancel_api"}
     except Exception as e:
         print("[apex_client] cancel_order error:", e)
         return {"error": str(e)}
