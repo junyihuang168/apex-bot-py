@@ -2,7 +2,7 @@ import os
 import time
 import random
 from decimal import Decimal, ROUND_DOWN
-from typing import Dict, Any, Optional, Union
+from typing import Dict, Any, Optional, Union, Tuple
 
 from apexomni.http_private_sign import HttpPrivateSign
 from apexomni.constants import (
@@ -14,21 +14,19 @@ from apexomni.constants import (
 
 # -------------------------------------------------------------------
 # 交易规则（默认：最小数量 0.01，步长 0.01，小数点后 2 位）
-# 如果以后某个币不一样，可以在 SYMBOL_RULES 里单独覆盖
 # -------------------------------------------------------------------
 
 DEFAULT_SYMBOL_RULES = {
-    "min_qty": Decimal("0.01"),      # 最小数量
-    "step_size": Decimal("0.01"),    # 每档步长
-    "qty_decimals": 2,               # 小数位数
+    "min_qty": Decimal("0.01"),
+    "step_size": Decimal("0.01"),
+    "qty_decimals": 2,
 }
 
-SYMBOL_RULES: Dict[str, Dict[str, Any]] = {
-    # 示例覆盖
-    # "BTC-USDT": {"min_qty": Decimal("0.001"), "step_size": Decimal("0.001"), "qty_decimals": 3},
-}
+SYMBOL_RULES: Dict[str, Dict[str, Any]] = {}
 
 _CLIENT: Optional[HttpPrivateSign] = None
+
+NumberLike = Union[str, float, int]
 
 
 def _get_symbol_rules(symbol: str) -> Dict[str, Any]:
@@ -116,7 +114,7 @@ def get_client() -> HttpPrivateSign:
 
     try:
         acc = client.get_account_v3()
-        print("[apex_client] get_account_v3 ok:", acc)
+        print("[apex_client] get_account_v3 ok")
     except Exception as e:
         print("[apex_client] WARNING get_account_v3 error:", e)
 
@@ -125,7 +123,8 @@ def get_client() -> HttpPrivateSign:
 
 
 def get_account():
-    return get_client().get_account_v3()
+    client = get_client()
+    return client.get_account_v3()
 
 
 def get_market_price(symbol: str, side: str, size: str) -> str:
@@ -164,9 +163,6 @@ def get_market_price(symbol: str, side: str, size: str) -> str:
     return price_str
 
 
-NumberLike = Union[str, float, int]
-
-
 def create_market_order(
     symbol: str,
     side: str,
@@ -201,7 +197,7 @@ def create_market_order(
         )
 
         print(
-            f"[apex_client] budget={budget} USDT -> qty={size_str} "
+            f"[apex_client] budget={budget} USDT -> qty={size_str}, "
             f"used≈{used_budget} USDT (price {price_str})"
         )
     else:
@@ -255,134 +251,67 @@ def create_market_order(
     }
 
 
-def create_stop_market_order(
-    symbol: str,
-    side: str,
-    size: NumberLike,
-    trigger_price: NumberLike,
-    reduce_only: bool = True,
-    client_id: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    真正挂在 ApeX 的 STOP_MARKET 条件止损单。
-    """
-    client = get_client()
+# -------------------------------------------------------------------
+# ✅ 新增：读取真实持仓（用于 exit/自恢复/虚拟止损兜底）
+# -------------------------------------------------------------------
 
+def get_open_position_for_symbol(symbol: str) -> Optional[Dict[str, Any]]:
+    """
+    从 account_v3 里提取某个 symbol 的真实持仓。
+    兼容你日志里出现过的字段结构：
+    - side: LONG/SHORT
+    - size
+    - entryPrice
+    """
     try:
-        if not hasattr(client, "configV3"):
-            client.configs_v3()
-        if not hasattr(client, "accountV3"):
-            client.get_account_v3()
+        acc = get_account()
     except Exception as e:
-        print("[apex_client] fallback init error (stop):", e)
-
-    side = side.upper()
-    size_str = str(size)
-
-    trigger_price_dec = Decimal(str(trigger_price))
-
-    # 保护价，让系统更容易接受
-    if side == "SELL":
-        limit_price_dec = trigger_price_dec * Decimal("0.99")
-    else:
-        limit_price_dec = trigger_price_dec * Decimal("1.01")
-
-    price_str = str(limit_price_dec)
-    trigger_price_str = str(trigger_price_dec)
-
-    ts = int(time.time())
-    apex_client_id = _random_client_id()
-    tv_client_id = client_id
-
-    if tv_client_id:
-        print(f"[apex_client] (stop) tv_client_id={tv_client_id} -> apex_clientId={apex_client_id}")
-    else:
-        print(f"[apex_client] (stop) apex_clientId={apex_client_id} (no tv_client_id)")
-
-    params = {
-        "symbol": symbol,
-        "side": side,
-        "type": "STOP_MARKET",
-        "size": size_str,
-        "price": price_str,
-        "triggerPrice": trigger_price_str,
-        "triggerPriceType": "MARKET",  # ✅ 增加兼容字段
-        "reduceOnly": reduce_only,
-        "clientId": apex_client_id,
-        "timestampSeconds": ts,
-    }
-
-    print("[apex_client] create_stop_market_order params:", params)
-    order = client.create_order_v3(**params)
-    print("[apex_client] (stop) order response:", order)
-
-    data = order["data"] if isinstance(order, dict) and "data" in order else order
-
-    order_id = None
-    client_order_id = None
-
-    def _pick(d: dict, *keys):
-        for k in keys:
-            if k in d and d[k] is not None:
-                return d[k]
+        print("[apex_client] get_account error:", e)
         return None
 
-    if isinstance(order, dict):
-        order_id = _pick(order, "orderId", "id")
-        client_order_id = _pick(order, "clientOrderId", "clientId")
+    data = acc.get("data") if isinstance(acc, dict) else None
+    if not isinstance(data, dict):
+        data = acc if isinstance(acc, dict) else {}
 
-    if isinstance(data, dict):
-        order_id = order_id or _pick(data, "orderId", "id")
-        client_order_id = client_order_id or _pick(data, "clientOrderId", "clientId")
+    positions = data.get("positions") or data.get("openPositions") or []
+    if not isinstance(positions, list):
+        return None
 
-    return {
-        "data": data,
-        "raw_order": order,
-        "order_id": order_id,
-        "client_order_id": client_order_id,
-        "symbol": symbol,
-        "side": side,
-        "size": size_str,
-        "trigger_price": trigger_price_str,
-        "price": price_str,
-    }
+    sym_u = symbol.upper()
+
+    for p in positions:
+        if not isinstance(p, dict):
+            continue
+        if str(p.get("symbol", "")).upper() != sym_u:
+            continue
+
+        size = p.get("size")
+        side = str(p.get("side", "")).upper()
+        entry = p.get("entryPrice")
+
+        try:
+            size_dec = Decimal(str(size or "0"))
+        except Exception:
+            size_dec = Decimal("0")
+
+        if size_dec <= 0 or side not in ("LONG", "SHORT"):
+            continue
+
+        return {
+            "symbol": sym_u,
+            "side": side,
+            "size": size_dec,
+            "entryPrice": Decimal(str(entry or "0")) if entry is not None else None,
+            "raw": p,
+        }
+
+    return None
 
 
-def cancel_order(
-    symbol: str,
-    order_id: Optional[str] = None,
-    client_order_id: Optional[str] = None,
-):
-    client = get_client()
-
-    try:
-        if hasattr(client, "delete_order_v3"):
-            kwargs = {}
-            if order_id:
-                kwargs["orderId"] = order_id
-            if client_order_id:
-                kwargs["clientOrderId"] = client_order_id
-            print(f"[apex_client] delete_order_v3 kwargs={kwargs}")
-            res = client.delete_order_v3(**kwargs)
-            print("[apex_client] cancel_order response:", res)
-            return res
-
-        if hasattr(client, "cancel_order_v3") and order_id:
-            print(f"[apex_client] cancel_order_v3 orderId={order_id}")
-            res = client.cancel_order_v3(orderId=order_id)
-            print("[apex_client] cancel_order response:", res)
-            return res
-
-        if hasattr(client, "cancel_active_order_v3"):
-            coid = client_order_id or order_id
-            print(f"[apex_client] cancel_active_order_v3 symbol={symbol} clientOrderId={coid}")
-            res = client.cancel_active_order_v3(symbol=symbol, clientOrderId=coid)
-            print("[apex_client] cancel_order response:", res)
-            return res
-
-        print("[apex_client] WARNING: no cancel/delete API found on client")
-        return {"error": "no_cancel_api"}
-
-    except Exception as e:
-        print("[apex_client] cancel_order error:", e)
-        return {"error": str(e)}
+def map_position_to_order_side(pos_side: str) -> str:
+    """
+    LONG -> SELL 平仓
+    SHORT -> BUY 平仓
+    """
+    s = str(pos_side).upper()
+    return "SELL" if s == "LONG" else "BUY"
