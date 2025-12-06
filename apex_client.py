@@ -2,7 +2,7 @@ import os
 import time
 import random
 from decimal import Decimal, ROUND_DOWN
-from typing import Dict, Any, Optional, Union, Tuple
+from typing import Dict, Any, Optional, Union
 
 from apexomni.http_private_sign import HttpPrivateSign
 from apexomni.constants import (
@@ -12,9 +12,10 @@ from apexomni.constants import (
     NETWORKID_TEST,
 )
 
-# -------------------------------------------------------------------
+# ============================================================
 # 交易规则（默认：最小数量 0.01，步长 0.01，小数点后 2 位）
-# -------------------------------------------------------------------
+# Default symbol rules
+# ============================================================
 
 DEFAULT_SYMBOL_RULES = {
     "min_qty": Decimal("0.01"),
@@ -22,7 +23,10 @@ DEFAULT_SYMBOL_RULES = {
     "qty_decimals": 2,
 }
 
-SYMBOL_RULES: Dict[str, Dict[str, Any]] = {}
+SYMBOL_RULES: Dict[str, Dict[str, Any]] = {
+    # Example override:
+    # "BTC-USDT": {"min_qty": Decimal("0.001"), "step_size": Decimal("0.001"), "qty_decimals": 3},
+}
 
 _CLIENT: Optional[HttpPrivateSign] = None
 
@@ -30,12 +34,23 @@ NumberLike = Union[str, float, int]
 
 
 def _get_symbol_rules(symbol: str) -> Dict[str, Any]:
+    """返回某个交易对的撮合规则（没有就用默认）
+       Get merged symbol rules.
+    """
     s = symbol.upper()
     rules = SYMBOL_RULES.get(s, {})
     return {**DEFAULT_SYMBOL_RULES, **rules}
 
 
 def _snap_quantity(symbol: str, theoretical_qty: Decimal) -> Decimal:
+    """
+    把理论数量对齐到交易所允许的网格：
+    - 向下取整到 step_size 的整数倍
+    - 再限制为 qty_decimals 位小数
+    - 如果小于 min_qty，就报错
+
+    Snap quantity to exchange grid.
+    """
     rules = _get_symbol_rules(symbol)
     step = rules["step_size"]
     min_qty = rules["min_qty"]
@@ -64,6 +79,9 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def _get_base_and_network():
+    """根据环境变量决定用 mainnet 还是 testnet
+       Decide mainnet/testnet by env.
+    """
     use_mainnet = _env_bool("APEX_USE_MAINNET", False)
 
     env_name = os.getenv("APEX_ENV", "").lower()
@@ -76,6 +94,9 @@ def _get_base_and_network():
 
 
 def _get_api_credentials():
+    """从环境变量里拿 API key / secret / passphrase
+       Read API creds from env.
+    """
     return {
         "key": os.environ["APEX_API_KEY"],
         "secret": os.environ["APEX_API_SECRET"],
@@ -84,10 +105,17 @@ def _get_api_credentials():
 
 
 def _random_client_id() -> str:
+    """纯数字 clientId
+       Numeric clientId.
+    """
     return str(int(float(str(random.random())[2:])))
 
 
 def get_client() -> HttpPrivateSign:
+    """
+    返回带 zk 签名的 HttpPrivateSign 客户端
+    Cached HttpPrivateSign client.
+    """
     global _CLIENT
     if _CLIENT is not None:
         return _CLIENT
@@ -106,9 +134,10 @@ def get_client() -> HttpPrivateSign:
         api_key_credentials=api_creds,
     )
 
+    # Initialize configs/account if possible (best effort)
     try:
         cfg = client.configs_v3()
-        print("[apex_client] configs_v3 ok:", cfg)
+        print("[apex_client] configs_v3 ok")
     except Exception as e:
         print("[apex_client] WARNING configs_v3 error:", e)
 
@@ -123,11 +152,18 @@ def get_client() -> HttpPrivateSign:
 
 
 def get_account():
+    """查询账户信息
+       Get account info.
+    """
     client = get_client()
     return client.get_account_v3()
 
 
 def get_market_price(symbol: str, side: str, size: str) -> str:
+    """
+    使用 GET /v3/get-worst-price 获取市价单参考价格
+    Get worst price quote for market order.
+    """
     base_url, network_id = _get_base_and_network()
     api_creds = _get_api_credentials()
 
@@ -156,7 +192,7 @@ def get_market_price(symbol: str, side: str, size: str) -> str:
             price = res["data"]["worstPrice"]
 
     if price is None:
-        raise RuntimeError(f"[apex_client] get_worst_price_v3 返回异常: {res}")
+        raise RuntimeError(f"[apex_client] get_worst_price_v3 returned abnormal: {res}")
 
     price_str = str(price)
     print(f"[apex_client] worst price for {symbol} {side} size={size_str}: {price_str}")
@@ -171,6 +207,13 @@ def create_market_order(
     reduce_only: bool = False,
     client_id: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """
+    创建 MARKET 市价单
+    Create MARKET order.
+
+    - size: coin quantity
+    - size_usdt: budget in USDT (auto compute qty)
+    """
     client = get_client()
     side = side.upper()
 
@@ -183,6 +226,7 @@ def create_market_order(
             raise ValueError("size_usdt must be > 0")
 
         min_qty = rules["min_qty"]
+
         ref_price_decimal = Decimal(get_market_price(symbol, side, str(min_qty)))
         theoretical_qty = budget / ref_price_decimal
         snapped_qty = _snap_quantity(symbol, theoretical_qty)
@@ -251,15 +295,18 @@ def create_market_order(
     }
 
 
-# -------------------------------------------------------------------
-# ✅ 新增：读取真实持仓（用于 exit/自恢复/虚拟止损兜底）
-# -------------------------------------------------------------------
+# ============================================================
+# ✅ Real position helpers (for exit fallback & state patch)
+# ============================================================
 
 def get_open_position_for_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     """
-    从 account_v3 里提取某个 symbol 的真实持仓。
-    兼容你日志里出现过的字段结构：
-    - side: LONG/SHORT
+    从 account_v3 中提取某个 symbol 的真实持仓（best effort）
+    Return real open position for a symbol from account_v3.
+
+    Expected fields in position object:
+    - symbol
+    - side: LONG / SHORT
     - size
     - entryPrice
     """
@@ -297,21 +344,25 @@ def get_open_position_for_symbol(symbol: str) -> Optional[Dict[str, Any]]:
         if size_dec <= 0 or side not in ("LONG", "SHORT"):
             continue
 
+        entry_dec = None
+        try:
+            if entry is not None:
+                entry_dec = Decimal(str(entry))
+        except Exception:
+            entry_dec = None
+
         return {
             "symbol": sym_u,
             "side": side,
             "size": size_dec,
-            "entryPrice": Decimal(str(entry or "0")) if entry is not None else None,
+            "entryPrice": entry_dec,
             "raw": p,
         }
 
     return None
 
 
-def map_position_to_order_side(pos_side: str) -> str:
-    """
-    LONG -> SELL 平仓
-    SHORT -> BUY 平仓
-    """
+def map_position_side_to_exit_order_side(pos_side: str) -> str:
+    """LONG -> SELL, SHORT -> BUY"""
     s = str(pos_side).upper()
     return "SELL" if s == "LONG" else "BUY"
