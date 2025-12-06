@@ -22,7 +22,6 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 
 # ============================================================
 # BOT 分组
-# Bot groups
 # ============================================================
 
 _LONG_BOTS_ENV = os.getenv(
@@ -36,12 +35,10 @@ _SHORT_BOTS_ENV = os.getenv(
 
 LONG_HARD_SL_BOTS = {b.strip() for b in _LONG_BOTS_ENV.split(",") if b.strip()}
 SHORT_HARD_SL_BOTS = {b.strip() for b in _SHORT_BOTS_ENV.split(",") if b.strip()}
-
 ALL_HARD_SL_BOTS = LONG_HARD_SL_BOTS | SHORT_HARD_SL_BOTS
 
 # ============================================================
 # 虚拟锁盈参数
-# Virtual hard-lock params
 # ============================================================
 
 HARD_SL_TRIGGER_PCT = Decimal(os.getenv("HARD_SL_TRIGGER_PCT", "0.25"))
@@ -51,20 +48,13 @@ HARD_SL_POLL_INTERVAL = float(os.getenv("HARD_SL_POLL_INTERVAL", "1.5"))
 STATE_FILE = os.getenv("HARD_SL_STATE_FILE", "bot_state.json")
 
 # 风控范围：
-# - bot_symbol：按本地 (bot_id, symbol) 追踪（镜像分 bot 最直观）
+# - bot_symbol：按本地 (bot_id, symbol)
 # - symbol：以 symbol 真实仓位为优先兜底（更稳，但同币多 bot 会互相影响）
 HARD_SL_SCOPE = os.getenv("HARD_SL_SCOPE", "bot_symbol").lower().strip()
 if HARD_SL_SCOPE not in ("bot_symbol", "symbol"):
     HARD_SL_SCOPE = "bot_symbol"
 
-# key: (bot_id, symbol) -> {
-#   "side": "BUY"/"SELL",
-#   "qty": Decimal,
-#   "entry_price": Decimal | None,
-#   "armed": bool,
-#   "lock_price": Decimal | None,
-#   "last_update": int
-# }
+# key: (bot_id, symbol) -> state
 BOT_POSITIONS: Dict[Tuple[str, str], dict] = {}
 
 _STATE_LOCK = threading.Lock()
@@ -130,29 +120,21 @@ def _state_update(key: Tuple[str, str], updater):
         _save_state()
 
 
-def _state_delete(key: Tuple[str, str]):
-    with _STATE_LOCK:
-        if key in BOT_POSITIONS:
-            del BOT_POSITIONS[key]
-            _save_state()
-
-
 # ============================================================
 # Mirror-safe cleanup
-# When a new entry comes, clear other bots' stale state for same symbol
+# 同币新入场 -> 清理其它 hard-SL bot 的残留状态
 # ============================================================
 
 def _clear_other_bots_same_symbol(symbol: str, current_bot_id: str):
-    sym_u = symbol.upper()
+    sym_u = str(symbol).upper()
     to_clear = []
 
     with _STATE_LOCK:
-        for (bid, sym), pos in BOT_POSITIONS.items():
-            if sym.upper() != sym_u:
+        for (bid, sym) in list(BOT_POSITIONS.keys()):
+            if str(sym).upper() != sym_u:
                 continue
             if bid == current_bot_id:
                 continue
-            # Only clear hard-SL bots' state to avoid messing other strategy bots
             if bid in ALL_HARD_SL_BOTS:
                 to_clear.append((bid, sym))
 
@@ -222,9 +204,9 @@ def _order_status_and_reason(order: dict):
 
 def _bot_allows_hard_sl(bot_id: str, side: str) -> bool:
     """
-    long bots -> only BUY
-    short bots -> only SELL
-    others -> False
+    BOT1-10: long hard SL only -> BUY
+    BOT11-20: short hard SL only -> SELL
+    Others: False
     """
     side_u = side.upper()
     if bot_id in LONG_HARD_SL_BOTS:
@@ -247,16 +229,16 @@ def _monitor_positions_loop():
                 items = list(BOT_POSITIONS.items())
 
             for (bot_id, symbol), pos in items:
+                # Only manage hard-SL bots
+                if bot_id not in ALL_HARD_SL_BOTS:
+                    continue
+
                 side = str(pos.get("side") or "").upper()  # BUY/SELL
                 qty = pos.get("qty") or Decimal("0")
                 entry_price = pos.get("entry_price")
                 armed = bool(pos.get("armed", False))
 
-                # Only bots 1-20 (per your design)
-                if bot_id not in ALL_HARD_SL_BOTS:
-                    continue
-
-                # Side must match group (long bots only BUY, short bots only SELL)
+                # Side must match group rule
                 if not _bot_allows_hard_sl(bot_id, side):
                     continue
 
@@ -266,13 +248,12 @@ def _monitor_positions_loop():
                 remote_side = str(remote["side"]).upper() if remote else None  # LONG/SHORT
                 remote_entry = remote.get("entryPrice") if remote else None
 
-                # Patch missing local entry/qty from remote (best effort)
+                # Patch missing local entry/qty from remote
                 if entry_price is None and remote_entry and remote_qty > 0:
                     def _patch(p):
-                        # If local side missing, infer from remote
                         if not p.get("side"):
                             p["side"] = "BUY" if remote_side == "LONG" else "SELL"
-                        # only keep patch if it still matches group rule
+
                         if _bot_allows_hard_sl(bot_id, p["side"]):
                             p["entry_price"] = remote_entry
                             if (p.get("qty") or Decimal("0")) <= 0:
@@ -281,7 +262,7 @@ def _monitor_positions_loop():
 
                     _state_update((bot_id, symbol), _patch)
 
-                    # refresh local read
+                    # Refresh local read
                     pos = BOT_POSITIONS.get((bot_id, symbol), {})
                     side = str(pos.get("side") or "").upper()
                     qty = pos.get("qty") or Decimal("0")
@@ -293,7 +274,7 @@ def _monitor_positions_loop():
                 if qty <= 0 or entry_price is None:
                     continue
 
-                # Get current price using worst quote with exit direction
+                # Current price via worst quote with exit direction
                 try:
                     rules = _get_symbol_rules(symbol)
                     min_qty = rules["min_qty"]
@@ -404,9 +385,7 @@ def index():
 def tv_webhook():
     _ensure_monitor_thread()
 
-    # ---------------------------
     # 1) Parse JSON & secret
-    # ---------------------------
     try:
         body = request.get_json(force=True, silent=False)
     except Exception as e:
@@ -432,9 +411,7 @@ def tv_webhook():
     action_raw = str(body.get("action", "")).lower()
     tv_client_id = body.get("client_id")
 
-    # ---------------------------
-    # 2) Determine mode entry/exit
-    # ---------------------------
+    # 2) Determine mode
     mode: Optional[str] = None
     if signal_type_raw in ("entry", "open"):
         mode = "entry"
@@ -449,27 +426,15 @@ def tv_webhook():
     if mode is None:
         return "missing or invalid signal_type / action", 400
 
-    # ---------------------------
-    # 3) ENTRY
-    # ---------------------------
+    # ========================================================
+    # ENTRY
+    # ========================================================
     if mode == "entry":
         if side_raw not in ("BUY", "SELL"):
             return "missing or invalid side", 400
 
-        # Budget -> qty
         try:
-            size_field = (
-                body.get("position_size_usdt")
-                or body.get("size_usdt")
-                or body.get("size")
-            )
-            if size_field is None:
-                return "missing size_usdt", 400
-
-            budget = Decimal(str(size_field))
-            if budget <= 0:
-                return "size_usdt must be > 0", 400
-
+            budget = _extract_budget_usdt(body)
             snapped_qty = _compute_entry_qty(symbol, side_raw, budget)
         except Exception as e:
             print("[ENTRY] prepare error:", e)
@@ -478,7 +443,6 @@ def tv_webhook():
         size_str = str(snapped_qty)
         print(f"[ENTRY] bot={bot_id} symbol={symbol} side={side_raw} budget={budget} -> qty={size_str}")
 
-        # Place order
         try:
             order = create_market_order(
                 symbol=symbol,
@@ -524,15 +488,13 @@ def tv_webhook():
             p["side"] = side_raw
             p["qty"] = Decimal(size_str)
             p["entry_price"] = entry_price_dec
-            # Only enable hard-lock state machine for bots 1-20 groups
             p["armed"] = False
             p["lock_price"] = None
             p["last_update"] = now
 
         _state_update(key, _set_entry)
 
-        # ✅ Mirror-safe cleanup:
-        # When this bot enters a symbol, clear stale hard-SL states of other bots for same symbol.
+        # Mirror-safe cleanup
         _clear_other_bots_same_symbol(symbol, bot_id)
 
         return jsonify({
@@ -548,9 +510,9 @@ def tv_webhook():
             "hard_sl_enabled_for_bot": _bot_allows_hard_sl(bot_id, side_raw),
         }), 200
 
-    # ---------------------------
-    # 4) EXIT
-    # ---------------------------
+    # ========================================================
+    # EXIT
+    # ========================================================
     if mode == "exit":
         key = (bot_id, symbol)
         pos = BOT_POSITIONS.get(key) or {}
@@ -558,6 +520,7 @@ def tv_webhook():
         local_qty = pos.get("qty", Decimal("0"))
         local_side = str(pos.get("side") or "").upper()
 
+        # Remote fallback
         remote = get_open_position_for_symbol(symbol)
         remote_qty = remote["size"] if remote else Decimal("0")
         remote_side = str(remote["side"]).upper() if remote else None  # LONG/SHORT
@@ -566,12 +529,11 @@ def tv_webhook():
             print(f"[EXIT] bot={bot_id} symbol={symbol}: no position local+remote")
             return jsonify({"status": "no_position"}), 200
 
-        # Decide exit side & quantity
         if remote_qty > 0 and remote_side:
             exit_side = map_position_side_to_exit_order_side(remote_side)
             close_qty = remote_qty if HARD_SL_SCOPE == "symbol" else max(remote_qty, local_qty)
         else:
-            # Use local fallback
+            # local fallback
             if local_side not in ("BUY", "SELL"):
                 local_side = "BUY"
             exit_side = "SELL" if local_side == "BUY" else "BUY"
