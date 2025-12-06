@@ -14,7 +14,6 @@ from apexomni.constants import (
 
 # ============================================================
 # 交易规则（默认：最小数量 0.01，步长 0.01，小数点后 2 位）
-# Default symbol rules
 # ============================================================
 
 DEFAULT_SYMBOL_RULES = {
@@ -34,23 +33,12 @@ NumberLike = Union[str, float, int]
 
 
 def _get_symbol_rules(symbol: str) -> Dict[str, Any]:
-    """返回某个交易对的撮合规则（没有就用默认）
-       Get merged symbol rules.
-    """
     s = symbol.upper()
     rules = SYMBOL_RULES.get(s, {})
     return {**DEFAULT_SYMBOL_RULES, **rules}
 
 
 def _snap_quantity(symbol: str, theoretical_qty: Decimal) -> Decimal:
-    """
-    把理论数量对齐到交易所允许的网格：
-    - 向下取整到 step_size 的整数倍
-    - 再限制为 qty_decimals 位小数
-    - 如果小于 min_qty，就报错
-
-    Snap quantity to exchange grid.
-    """
     rules = _get_symbol_rules(symbol)
     step = rules["step_size"]
     min_qty = rules["min_qty"]
@@ -79,9 +67,6 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def _get_base_and_network():
-    """根据环境变量决定用 mainnet 还是 testnet
-       Decide mainnet/testnet by env.
-    """
     use_mainnet = _env_bool("APEX_USE_MAINNET", False)
 
     env_name = os.getenv("APEX_ENV", "").lower()
@@ -94,9 +79,6 @@ def _get_base_and_network():
 
 
 def _get_api_credentials():
-    """从环境变量里拿 API key / secret / passphrase
-       Read API creds from env.
-    """
     return {
         "key": os.environ["APEX_API_KEY"],
         "secret": os.environ["APEX_API_SECRET"],
@@ -105,17 +87,10 @@ def _get_api_credentials():
 
 
 def _random_client_id() -> str:
-    """纯数字 clientId
-       Numeric clientId.
-    """
     return str(int(float(str(random.random())[2:])))
 
 
 def get_client() -> HttpPrivateSign:
-    """
-    返回带 zk 签名的 HttpPrivateSign 客户端
-    Cached HttpPrivateSign client.
-    """
     global _CLIENT
     if _CLIENT is not None:
         return _CLIENT
@@ -134,15 +109,14 @@ def get_client() -> HttpPrivateSign:
         api_key_credentials=api_creds,
     )
 
-    # Initialize configs/account if possible (best effort)
     try:
-        cfg = client.configs_v3()
+        client.configs_v3()
         print("[apex_client] configs_v3 ok")
     except Exception as e:
         print("[apex_client] WARNING configs_v3 error:", e)
 
     try:
-        acc = client.get_account_v3()
+        client.get_account_v3()
         print("[apex_client] get_account_v3 ok")
     except Exception as e:
         print("[apex_client] WARNING get_account_v3 error:", e)
@@ -152,18 +126,11 @@ def get_client() -> HttpPrivateSign:
 
 
 def get_account():
-    """查询账户信息
-       Get account info.
-    """
     client = get_client()
     return client.get_account_v3()
 
 
 def get_market_price(symbol: str, side: str, size: str) -> str:
-    """
-    使用 GET /v3/get-worst-price 获取市价单参考价格
-    Get worst price quote for market order.
-    """
     base_url, network_id = _get_base_and_network()
     api_creds = _get_api_credentials()
 
@@ -207,13 +174,6 @@ def create_market_order(
     reduce_only: bool = False,
     client_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    创建 MARKET 市价单
-    Create MARKET order.
-
-    - size: coin quantity
-    - size_usdt: budget in USDT (auto compute qty)
-    """
     client = get_client()
     side = side.upper()
 
@@ -226,7 +186,6 @@ def create_market_order(
             raise ValueError("size_usdt must be > 0")
 
         min_qty = rules["min_qty"]
-
         ref_price_decimal = Decimal(get_market_price(symbol, side, str(min_qty)))
         theoretical_qty = budget / ref_price_decimal
         snapped_qty = _snap_quantity(symbol, theoretical_qty)
@@ -257,10 +216,9 @@ def create_market_order(
 
     ts = int(time.time())
     apex_client_id = _random_client_id()
-    tv_client_id = client_id
 
-    if tv_client_id:
-        print(f"[apex_client] tv_client_id={tv_client_id} -> apex_clientId={apex_client_id}")
+    if client_id:
+        print(f"[apex_client] tv_client_id={client_id} -> apex_clientId={apex_client_id}")
     else:
         print(f"[apex_client] apex_clientId={apex_client_id} (no tv_client_id)")
 
@@ -296,13 +254,18 @@ def create_market_order(
 
 
 # ============================================================
-# ✅ Real position helpers (for exit fallback & state patch)
+# ✅ Real position helpers (critical)
+# - Fix symbol format mismatch: ZEC-USDT vs ZECUSDT
 # ============================================================
+
+def _norm_symbol(s: str) -> str:
+    return str(s or "").upper().replace("-", "").replace("_", "").strip()
+
 
 def get_open_position_for_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     """
     从 account_v3 中提取某个 symbol 的真实持仓（best effort）
-    Return real open position for a symbol from account_v3.
+    支持 symbol 形态不一致（ZEC-USDT / ZECUSDT）。
 
     Expected fields in position object:
     - symbol
@@ -320,16 +283,25 @@ def get_open_position_for_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     if not isinstance(data, dict):
         data = acc if isinstance(acc, dict) else {}
 
-    positions = data.get("positions") or data.get("openPositions") or []
+    positions = (
+        data.get("positions")
+        or data.get("openPositions")
+        or data.get("position")
+        or data.get("positionV3")
+        or []
+    )
+
     if not isinstance(positions, list):
         return None
 
-    sym_u = symbol.upper()
+    target = _norm_symbol(symbol)
 
     for p in positions:
         if not isinstance(p, dict):
             continue
-        if str(p.get("symbol", "")).upper() != sym_u:
+
+        psym = _norm_symbol(p.get("symbol", ""))
+        if psym != target:
             continue
 
         size = p.get("size")
@@ -352,8 +324,8 @@ def get_open_position_for_symbol(symbol: str) -> Optional[Dict[str, Any]]:
             entry_dec = None
 
         return {
-            "symbol": sym_u,
-            "side": side,
+            "symbol": str(p.get("symbol", symbol)),
+            "side": side,  # LONG/SHORT
             "size": size_dec,
             "entryPrice": entry_dec,
             "raw": p,
