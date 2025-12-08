@@ -38,13 +38,19 @@ SHORT_HARD_SL_BOTS = {b.strip() for b in _SHORT_BOTS_ENV.split(",") if b.strip()
 ALL_HARD_SL_BOTS = LONG_HARD_SL_BOTS | SHORT_HARD_SL_BOTS
 
 # ============================================================
-# 虚拟锁盈参数
+# ✅ 阶梯式锁盈参数（percent）
+# 你的默认要求：
+#  0.18 -> +0.00
+#  0.38 -> +0.20
+#  0.58 -> +0.40
+#  ... step = 0.20
 # ============================================================
 
-HARD_SL_TRIGGER_PCT = Decimal(os.getenv("HARD_SL_TRIGGER_PCT", "0.25"))
-HARD_SL_LEVEL_PCT = Decimal(os.getenv("HARD_SL_LEVEL_PCT", "0.20"))
-HARD_SL_POLL_INTERVAL = float(os.getenv("HARD_SL_POLL_INTERVAL", "1.5"))
+LADDER_START_TRIGGER_PCT = Decimal(os.getenv("HARD_SL_LADDER_START_TRIGGER_PCT", "0.18"))
+LADDER_START_LOCK_PCT = Decimal(os.getenv("HARD_SL_LADDER_START_LOCK_PCT", "0.00"))
+LADDER_STEP_PCT = Decimal(os.getenv("HARD_SL_LADDER_STEP_PCT", "0.20"))
 
+HARD_SL_POLL_INTERVAL = float(os.getenv("HARD_SL_POLL_INTERVAL", "1.5"))
 STATE_FILE = os.getenv("HARD_SL_STATE_FILE", "bot_state.json")
 
 # 风控范围：
@@ -55,6 +61,7 @@ if HARD_SL_SCOPE not in ("bot_symbol", "symbol"):
     HARD_SL_SCOPE = "bot_symbol"
 
 # key: (bot_id, symbol) -> state
+# "ladder_n": int 当前最高阶
 BOT_POSITIONS: Dict[Tuple[str, str], dict] = {}
 
 _STATE_LOCK = threading.Lock()
@@ -83,7 +90,7 @@ def _load_state():
                 "side": v.get("side"),
                 "qty": Decimal(str(v.get("qty", "0"))),
                 "entry_price": Decimal(str(v["entry_price"])) if v.get("entry_price") else None,
-                "armed": bool(v.get("armed", False)),
+                "ladder_n": int(v.get("ladder_n", -1)),
                 "lock_price": Decimal(str(v["lock_price"])) if v.get("lock_price") else None,
                 "last_update": int(v.get("last_update", 0)),
             }
@@ -102,7 +109,7 @@ def _save_state():
                 "side": pos.get("side"),
                 "qty": str(pos.get("qty", Decimal("0"))),
                 "entry_price": str(pos["entry_price"]) if pos.get("entry_price") else None,
-                "armed": bool(pos.get("armed", False)),
+                "ladder_n": int(pos.get("ladder_n", -1)),
                 "lock_price": str(pos["lock_price"]) if pos.get("lock_price") else None,
                 "last_update": int(pos.get("last_update", 0)),
             }
@@ -142,7 +149,7 @@ def _clear_other_bots_same_symbol(symbol: str, current_bot_id: str):
             p = BOT_POSITIONS.get(key) or {}
             p["qty"] = Decimal("0")
             p["entry_price"] = None
-            p["armed"] = False
+            p["ladder_n"] = -1
             p["lock_price"] = None
             p["last_update"] = int(time.time())
             BOT_POSITIONS[key] = p
@@ -204,8 +211,8 @@ def _order_status_and_reason(order: dict):
 
 def _bot_allows_hard_sl(bot_id: str, side: str) -> bool:
     """
-    BOT1-10: long hard SL only -> BUY
-    BOT11-20: short hard SL only -> SELL
+    BOT1-10: long lock only -> BUY
+    BOT11-20: short lock only -> SELL
     Others: False
     """
     side_u = side.upper()
@@ -216,12 +223,41 @@ def _bot_allows_hard_sl(bot_id: str, side: str) -> bool:
     return False
 
 
+def _calc_ladder_n(pnl_pct: Decimal) -> int:
+    """
+    按你的阶梯公式：
+      T_n = start_trigger + step * n
+      L_n = start_lock    + step * n
+
+    返回应当处于的最高阶 n（>=0），
+    若未达到首档触发，则返回 -1
+    """
+    if pnl_pct < LADDER_START_TRIGGER_PCT:
+        return -1
+
+    # n = floor((pnl - start_trigger) / step)
+    try:
+        n = int((pnl_pct - LADDER_START_TRIGGER_PCT) // LADDER_STEP_PCT)
+    except Exception:
+        n = 0
+
+    if n < 0:
+        n = 0
+    return n
+
+
+def _lock_pct_for_n(n: int) -> Decimal:
+    if n < 0:
+        return Decimal("0")
+    return LADDER_START_LOCK_PCT + LADDER_STEP_PCT * Decimal(n)
+
+
 # ============================================================
-# Virtual hard-lock monitor loop
+# Ladder virtual monitor loop
 # ============================================================
 
 def _monitor_positions_loop():
-    print("[HARD_SL] virtual monitor thread started")
+    print("[HARD_SL] ladder virtual monitor thread started")
 
     while True:
         try:
@@ -229,16 +265,15 @@ def _monitor_positions_loop():
                 items = list(BOT_POSITIONS.items())
 
             for (bot_id, symbol), pos in items:
-                # Only manage hard-SL bots
                 if bot_id not in ALL_HARD_SL_BOTS:
                     continue
 
                 side = str(pos.get("side") or "").upper()  # BUY/SELL
                 qty = pos.get("qty") or Decimal("0")
                 entry_price = pos.get("entry_price")
-                armed = bool(pos.get("armed", False))
+                ladder_n = int(pos.get("ladder_n", -1))
+                lock_price_state = pos.get("lock_price")
 
-                # Side must match group rule
                 if not _bot_allows_hard_sl(bot_id, side):
                     continue
 
@@ -248,7 +283,7 @@ def _monitor_positions_loop():
                 remote_side = str(remote["side"]).upper() if remote else None  # LONG/SHORT
                 remote_entry = remote.get("entryPrice") if remote else None
 
-                # Patch missing local entry/qty from remote
+                # Patch missing local state from remote
                 if entry_price is None and remote_entry and remote_qty > 0:
                     def _patch(p):
                         if not p.get("side"):
@@ -258,16 +293,18 @@ def _monitor_positions_loop():
                             p["entry_price"] = remote_entry
                             if (p.get("qty") or Decimal("0")) <= 0:
                                 p["qty"] = remote_qty
+                            if "ladder_n" not in p:
+                                p["ladder_n"] = -1
                             p["last_update"] = int(time.time())
 
                     _state_update((bot_id, symbol), _patch)
 
-                    # Refresh local read
                     pos = BOT_POSITIONS.get((bot_id, symbol), {})
                     side = str(pos.get("side") or "").upper()
                     qty = pos.get("qty") or Decimal("0")
                     entry_price = pos.get("entry_price")
-                    armed = bool(pos.get("armed", False))
+                    ladder_n = int(pos.get("ladder_n", -1))
+                    lock_price_state = pos.get("lock_price")
 
                 if side not in ("BUY", "SELL"):
                     continue
@@ -285,74 +322,95 @@ def _monitor_positions_loop():
                     print(f"[HARD_SL] get_market_price error bot={bot_id} symbol={symbol}:", e)
                     continue
 
-                # Symmetric PnL & lock computation
+                # Compute pnl %
                 if side == "BUY":
                     pnl_pct = (current_price - entry_price) * Decimal("100") / entry_price
-                    lock_price = entry_price * (Decimal("1") + HARD_SL_LEVEL_PCT / Decimal("100"))
-                    lock_hit = current_price <= lock_price
                 else:
                     pnl_pct = (entry_price - current_price) * Decimal("100") / entry_price
-                    lock_price = entry_price * (Decimal("1") - HARD_SL_LEVEL_PCT / Decimal("100"))
-                    lock_hit = current_price >= lock_price
 
-                # 1) Arm at >= 0.25% profit
-                if not armed and pnl_pct >= HARD_SL_TRIGGER_PCT:
-                    def _arm(p):
-                        p["armed"] = True
-                        p["lock_price"] = lock_price
+                # Determine target ladder level
+                target_n = _calc_ladder_n(pnl_pct)
+
+                # If we moved up levels, update lock_price
+                if target_n > ladder_n:
+                    lock_pct = _lock_pct_for_n(target_n)
+
+                    if side == "BUY":
+                        new_lock_price = entry_price * (Decimal("1") + lock_pct / Decimal("100"))
+                    else:
+                        new_lock_price = entry_price * (Decimal("1") - lock_pct / Decimal("100"))
+
+                    def _upgrade(p):
+                        p["ladder_n"] = target_n
+                        p["lock_price"] = new_lock_price
                         p["last_update"] = int(time.time())
 
-                    _state_update((bot_id, symbol), _arm)
+                    _state_update((bot_id, symbol), _upgrade)
+
                     print(
-                        f"[HARD_SL] ARMED bot={bot_id} symbol={symbol} side={side} "
-                        f"entry={entry_price} lock={lock_price} pnl={pnl_pct:.4f}%"
+                        f"[HARD_SL] LADDER UP bot={bot_id} symbol={symbol} side={side} "
+                        f"pnl={pnl_pct:.4f}% -> n={target_n} lock_pct={lock_pct}% "
+                        f"lock_price={new_lock_price}"
                     )
+
+                    lock_price_state = new_lock_price
+                    ladder_n = target_n
+
+                # If no ladder armed yet, nothing to lock against
+                if ladder_n < 0 or lock_price_state is None:
                     continue
 
-                # 2) Trigger close when retrace hits lock line
-                if armed and lock_hit:
-                    close_qty = qty
+                # Check lock hit
+                if side == "BUY":
+                    lock_hit = current_price <= lock_price_state
+                else:
+                    lock_hit = current_price >= lock_price_state
 
-                    if remote_qty > 0:
-                        if HARD_SL_SCOPE == "symbol":
-                            close_qty = remote_qty
-                        else:
-                            close_qty = min(qty, remote_qty)
+                if not lock_hit:
+                    continue
 
-                    if close_qty <= 0:
-                        continue
+                # Decide close qty
+                close_qty = qty
+                if remote_qty > 0:
+                    if HARD_SL_SCOPE == "symbol":
+                        close_qty = remote_qty
+                    else:
+                        close_qty = min(qty, remote_qty)
 
-                    exit_side = "SELL" if side == "BUY" else "BUY"
+                if close_qty <= 0:
+                    continue
 
-                    print(
-                        f"[HARD_SL] TRIGGER EXIT bot={bot_id} symbol={symbol} "
-                        f"side={side} exit_side={exit_side} qty={close_qty} "
-                        f"lock={lock_price} current={current_price} pnl={pnl_pct:.4f}%"
+                exit_side = "SELL" if side == "BUY" else "BUY"
+
+                print(
+                    f"[HARD_SL] TRIGGER EXIT bot={bot_id} symbol={symbol} "
+                    f"side={side} exit_side={exit_side} qty={close_qty} "
+                    f"n={ladder_n} lock_price={lock_price_state} current={current_price} pnl={pnl_pct:.4f}%"
+                )
+
+                try:
+                    order = create_market_order(
+                        symbol=symbol,
+                        side=exit_side,
+                        size=str(close_qty),
+                        reduce_only=True,
+                        client_id=None,
                     )
+                    status, cancel_reason = _order_status_and_reason(order)
+                    print(f"[HARD_SL] exit order status={status} cancelReason={cancel_reason!r}")
 
-                    try:
-                        order = create_market_order(
-                            symbol=symbol,
-                            side=exit_side,
-                            size=str(close_qty),
-                            reduce_only=True,
-                            client_id=None,
-                        )
-                        status, cancel_reason = _order_status_and_reason(order)
-                        print(f"[HARD_SL] exit order status={status} cancelReason={cancel_reason!r}")
+                    if status not in ("CANCELED", "REJECTED", "ERROR", "EXPIRED"):
+                        def _clear(p):
+                            p["qty"] = Decimal("0")
+                            p["entry_price"] = None
+                            p["ladder_n"] = -1
+                            p["lock_price"] = None
+                            p["last_update"] = int(time.time())
 
-                        if status not in ("CANCELED", "REJECTED", "ERROR", "EXPIRED"):
-                            def _clear(p):
-                                p["qty"] = Decimal("0")
-                                p["entry_price"] = None
-                                p["armed"] = False
-                                p["lock_price"] = None
-                                p["last_update"] = int(time.time())
+                        _state_update((bot_id, symbol), _clear)
 
-                            _state_update((bot_id, symbol), _clear)
-
-                    except Exception as e:
-                        print(f"[HARD_SL] create_market_order error bot={bot_id} symbol={symbol}:", e)
+                except Exception as e:
+                    print(f"[HARD_SL] create_market_order error bot={bot_id} symbol={symbol}:", e)
 
         except Exception as e:
             print("[HARD_SL] monitor top-level error:", e)
@@ -368,7 +426,7 @@ def _ensure_monitor_thread():
             t = threading.Thread(target=_monitor_positions_loop, daemon=True)
             t.start()
             _MONITOR_THREAD_STARTED = True
-            print("[HARD_SL] virtual monitor thread created")
+            print("[HARD_SL] ladder virtual monitor thread created")
 
 
 # ============================================================
@@ -434,7 +492,18 @@ def tv_webhook():
             return "missing or invalid side", 400
 
         try:
-            budget = _extract_budget_usdt(body)
+            size_field = (
+                body.get("position_size_usdt")
+                or body.get("size_usdt")
+                or body.get("size")
+            )
+            if size_field is None:
+                return "missing size_usdt", 400
+
+            budget = Decimal(str(size_field))
+            if budget <= 0:
+                return "size_usdt must be > 0", 400
+
             snapped_qty = _compute_entry_qty(symbol, side_raw, budget)
         except Exception as e:
             print("[ENTRY] prepare error:", e)
@@ -458,7 +527,6 @@ def tv_webhook():
         status, cancel_reason = _order_status_and_reason(order)
         print(f"[ENTRY] order status={status} cancelReason={cancel_reason!r}")
 
-        # Treat only explicit hard failures as failure
         if status in ("REJECTED", "ERROR"):
             return jsonify({
                 "status": "order_failed",
@@ -488,7 +556,7 @@ def tv_webhook():
             p["side"] = side_raw
             p["qty"] = Decimal(size_str)
             p["entry_price"] = entry_price_dec
-            p["armed"] = False
+            p["ladder_n"] = -1
             p["lock_price"] = None
             p["last_update"] = now
 
@@ -508,10 +576,12 @@ def tv_webhook():
             "order_status": status,
             "cancel_reason": cancel_reason,
             "hard_sl_enabled_for_bot": _bot_allows_hard_sl(bot_id, side_raw),
+            "ladder_start_trigger_pct": str(LADDER_START_TRIGGER_PCT),
+            "ladder_step_pct": str(LADDER_STEP_PCT),
         }), 200
 
     # ========================================================
-    # EXIT
+    # EXIT（策略出场）
     # ========================================================
     if mode == "exit":
         key = (bot_id, symbol)
@@ -520,7 +590,6 @@ def tv_webhook():
         local_qty = pos.get("qty", Decimal("0"))
         local_side = str(pos.get("side") or "").upper()
 
-        # Remote fallback
         remote = get_open_position_for_symbol(symbol)
         remote_qty = remote["size"] if remote else Decimal("0")
         remote_side = str(remote["side"]).upper() if remote else None  # LONG/SHORT
@@ -533,7 +602,6 @@ def tv_webhook():
             exit_side = map_position_side_to_exit_order_side(remote_side)
             close_qty = remote_qty if HARD_SL_SCOPE == "symbol" else max(remote_qty, local_qty)
         else:
-            # local fallback
             if local_side not in ("BUY", "SELL"):
                 local_side = "BUY"
             exit_side = "SELL" if local_side == "BUY" else "BUY"
@@ -564,7 +632,7 @@ def tv_webhook():
             def _clear(p):
                 p["qty"] = Decimal("0")
                 p["entry_price"] = None
-                p["armed"] = False
+                p["ladder_n"] = -1
                 p["lock_price"] = None
                 p["last_update"] = int(time.time())
 
