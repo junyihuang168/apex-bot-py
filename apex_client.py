@@ -254,7 +254,7 @@ def create_market_order(
 
 
 # ============================================================
-# ✅ Real position helpers (critical)
+# ✅ Real position helpers
 # - Fix symbol format mismatch: ZEC-USDT vs ZECUSDT
 # ============================================================
 
@@ -263,16 +263,6 @@ def _norm_symbol(s: str) -> str:
 
 
 def get_open_position_for_symbol(symbol: str) -> Optional[Dict[str, Any]]:
-    """
-    从 account_v3 中提取某个 symbol 的真实持仓（best effort）
-    支持 symbol 形态不一致（ZEC-USDT / ZECUSDT）。
-
-    Expected fields in position object:
-    - symbol
-    - side: LONG / SHORT
-    - size
-    - entryPrice
-    """
     try:
         acc = get_account()
     except Exception as e:
@@ -305,7 +295,7 @@ def get_open_position_for_symbol(symbol: str) -> Optional[Dict[str, Any]]:
             continue
 
         size = p.get("size")
-        side = str(p.get("side", "")).upper()
+        side = str(p.get("side", "")).upper()  # LONG/SHORT
         entry = p.get("entryPrice")
 
         try:
@@ -325,7 +315,7 @@ def get_open_position_for_symbol(symbol: str) -> Optional[Dict[str, Any]]:
 
         return {
             "symbol": str(p.get("symbol", symbol)),
-            "side": side,  # LONG/SHORT
+            "side": side,
             "size": size_dec,
             "entryPrice": entry_dec,
             "raw": p,
@@ -335,6 +325,5 @@ def get_open_position_for_symbol(symbol: str) -> Optional[Dict[str, Any]]:
 
 
 def map_position_side_to_exit_order_side(pos_side: str) -> str:
-    """LONG -> SELL, SHORT -> BUY"""
     s = str(pos_side).upper()
     return "SELL" if s == "LONG" else "BUY"
