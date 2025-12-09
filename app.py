@@ -59,8 +59,8 @@ SHORT_LADDER_BOTS = _parse_bot_list(
               ",".join([f"BOT_{i}" for i in range(11, 21)]))
 )
 
-# 基础止损百分比（你要求 0.35%）
-BASE_SL_PCT = Decimal(os.getenv("BASE_SL_PCT", "0.35"))
+# ✅ 基础止损百分比（你要求改为 0.6%）
+BASE_SL_PCT = Decimal(os.getenv("BASE_SL_PCT", "0.6"))
 
 # 轮询间隔
 RISK_POLL_INTERVAL = float(os.getenv("RISK_POLL_INTERVAL", "2.0"))
@@ -145,9 +145,6 @@ def _desired_lock_level_pct(pnl_pct: Decimal) -> Decimal:
     if pnl_pct < TRIGGER_2:
         return LOCK_1
 
-    # pnl >= 0.38
-    # n = floor((pnl - 0.38)/0.20)
-    # lock = 0.20 + 0.20*n
     n = (pnl_pct - TRIGGER_2) // STEP
     return LOCK_2 + STEP * n
 
@@ -165,7 +162,6 @@ def _get_current_price(symbol: str, direction: str) -> Optional[Decimal]:
     try:
         rules = _get_symbol_rules(symbol)
         min_qty = rules["min_qty"]
-        # 用平仓方向的 worst price 作为 mark 参考
         exit_side = "SELL" if direction.upper() == "LONG" else "BUY"
         px_str = get_market_price(symbol, exit_side, str(min_qty))
         return Decimal(str(px_str))
@@ -206,16 +202,12 @@ def _lock_hit(direction: str, entry_price: Decimal, current_price: Decimal, lock
 
 
 def _execute_virtual_exit(bot_id: str, symbol: str, direction: str, qty: Decimal, reason: str):
-    """
-    真正发 reduceOnly 市价单，并用 FIFO 从该 bot 的 lots 里记账扣减。
-    """
     if qty <= 0:
         return
 
     entry_side = "BUY" if direction.upper() == "LONG" else "SELL"
     exit_side = "SELL" if direction.upper() == "LONG" else "BUY"
 
-    # 用 worst price 作为 exit 参考价写 PnL
     exit_price = _get_current_price(symbol, direction)
     if exit_price is None:
         print(f"[RISK] skip exit due to no price bot={bot_id} symbol={symbol}")
@@ -240,7 +232,6 @@ def _execute_virtual_exit(bot_id: str, symbol: str, direction: str, qty: Decimal
         if status in ("CANCELED", "REJECTED"):
             return
 
-        # ✅ PnL FIFO 记账
         try:
             record_exit_fifo(
                 bot_id=bot_id,
@@ -253,13 +244,11 @@ def _execute_virtual_exit(bot_id: str, symbol: str, direction: str, qty: Decimal
         except Exception as e:
             print("[PNL] record_exit_fifo error (risk):", e)
 
-        # ✅ 清理 ladder 状态
         try:
             clear_lock_level_pct(bot_id, symbol, direction.upper())
         except Exception:
             pass
 
-        # ✅ 同步清一下本地 cache（如果存在）
         key = (bot_id, symbol)
         pos = BOT_POSITIONS.get(key)
         if pos:
@@ -282,7 +271,6 @@ def _risk_loop():
     print("[RISK] ladder/baseSL thread started")
     while True:
         try:
-            # 只扫描你定义的风控组
             bots = sorted(list(LONG_LADDER_BOTS | SHORT_LADDER_BOTS))
 
             for bot_id in bots:
@@ -306,7 +294,7 @@ def _risk_loop():
 
                     pnl_pct = _calc_pnl_pct(direction, entry_price, current_price)
 
-                    # 1) ✅ 基础止损优先
+                    # 1) ✅ 基础止损优先（现在是 0.6%）
                     if _base_sl_hit(direction, entry_price, current_price):
                         _execute_virtual_exit(
                             bot_id=bot_id,
@@ -317,10 +305,9 @@ def _risk_loop():
                         )
                         continue
 
-                    # 2) ✅ 计算“希望达到的锁盈档位”
+                    # 2) ✅ 计算希望锁盈档位
                     desired_lock = _desired_lock_level_pct(pnl_pct)
 
-                    # 当前已生效锁盈档位（持久化）
                     current_lock = get_lock_level_pct(bot_id, symbol, direction)
 
                     # 只上不下
@@ -432,7 +419,7 @@ def api_pnl():
 
 
 # =========================
-# ✅ Dashboard 页面（保持你之前的版本即可）
+# ✅ Dashboard 页面
 # =========================
 @app.route("/dashboard", methods=["GET"])
 def dashboard():
@@ -482,7 +469,7 @@ def dashboard():
 <header>
   <div>
     <h1>Bot PnL Dashboard</h1>
-    <div class="muted">bot 独立 lots 记账 · 含基础止损/阶梯锁盈线程</div>
+    <div class="muted">bot 独立 lots 记账 · 基础止损=0.6% · 阶梯锁盈</div>
   </div>
   <div class="muted" id="lastUpdate">Loading...</div>
 </header>
@@ -504,8 +491,8 @@ def dashboard():
     <div class="card full">
       <div class="row">
         <div class="group">
-          <span class="pill">BOT 1-10: LONG 阶梯锁盈 + 基础SL</span>
-          <span class="pill">BOT 11-20: SHORT 阶梯锁盈 + 基础SL</span>
+          <span class="pill">BOT 1-10: LONG 阶梯锁盈 + 基础SL(0.6%)</span>
+          <span class="pill">BOT 11-20: SHORT 阶梯锁盈 + 基础SL(0.6%)</span>
           <span class="pill">Others: Strategy-only</span>
         </div>
         <div class="small">数据来自 /api/pnl</div>
@@ -650,7 +637,6 @@ setInterval(refresh, 15000);
 def tv_webhook():
     _ensure_monitor_thread()
 
-    # 1) Parse JSON & secret
     try:
         body = request.get_json(force=True, silent=False)
     except Exception as e:
@@ -677,7 +663,6 @@ def tv_webhook():
     action_raw = str(body.get("action", "")).lower()
     tv_client_id = body.get("client_id")
 
-    # 2) Determine mode
     mode: Optional[str] = None
     if signal_type_raw in ("entry", "open"):
         mode = "entry"
@@ -692,9 +677,9 @@ def tv_webhook():
     if mode is None:
         return "missing or invalid signal_type / action", 400
 
-    # ========================================================
+    # ------------------------
     # ENTRY
-    # ========================================================
+    # ------------------------
     if mode == "entry":
         if side_raw not in ("BUY", "SELL"):
             return "missing or invalid side", 400
@@ -751,7 +736,6 @@ def tv_webhook():
         except Exception:
             entry_price_dec = None
 
-        # 本地 cache
         key = (bot_id, symbol)
         BOT_POSITIONS[key] = {
             "side": side_raw,
@@ -759,7 +743,6 @@ def tv_webhook():
             "entry_price": entry_price_dec,
         }
 
-        # ✅ PnL ENTRY 记账
         if entry_price_dec is not None:
             try:
                 record_entry(
@@ -785,30 +768,21 @@ def tv_webhook():
             "cancel_reason": cancel_reason,
         }), 200
 
-    # ========================================================
+    # ------------------------
     # EXIT（策略出场）
-    # ========================================================
+    # ------------------------
     if mode == "exit":
-        # ✅ 这里不再只依赖本地 cache
-        # 以 PnL lots 为准来决定“这个 bot 真正该平多少”
-        entry_side_hint = side_raw if side_raw in ("BUY", "SELL") else "BUY"
-
-        # 从 lots 汇总出该 bot 在这个 symbol 的两边数量
         opens = get_bot_open_positions(bot_id)
 
-        # 判断你这次 exit 想平哪边（用本地 side + 习惯：exit 通常是平当前方向）
-        # 我们优先尝试平 LONG，然后再 SHORT（更保守）
         long_key = (symbol, "LONG")
         short_key = (symbol, "SHORT")
 
         long_qty = opens.get(long_key, {}).get("qty", Decimal("0")) if long_key in opens else Decimal("0")
         short_qty = opens.get(short_key, {}).get("qty", Decimal("0")) if short_key in opens else Decimal("0")
 
-        # 如果本地 cache 有 side，就按那边优先
         key_local = (bot_id, symbol)
         local = BOT_POSITIONS.get(key_local)
         if local and str(local.get("side", "")).upper() == "SELL":
-            # 本地认为是空方向
             preferred = "SHORT"
         else:
             preferred = "LONG"
@@ -833,7 +807,6 @@ def tv_webhook():
             print(f"[EXIT] bot={bot_id} symbol={symbol}: no lots position to close")
             return jsonify({"status": "no_position"}), 200
 
-        # 用当前方向决定 entry_side
         entry_side = "BUY" if direction_to_close == "LONG" else "SELL"
         exit_side = "SELL" if direction_to_close == "LONG" else "BUY"
 
@@ -869,7 +842,6 @@ def tv_webhook():
                 "cancel_reason": cancel_reason,
             }), 200
 
-        # 用 worst 价作为参考 exit 价
         exit_price = _get_current_price(symbol, direction_to_close) or Decimal("0")
 
         try:
@@ -889,7 +861,6 @@ def tv_webhook():
         except Exception:
             pass
 
-        # 清本地 cache
         if key_local in BOT_POSITIONS:
             BOT_POSITIONS[key_local]["qty"] = Decimal("0")
             BOT_POSITIONS[key_local]["entry_price"] = None
