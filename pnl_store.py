@@ -15,7 +15,6 @@ def _now_ts() -> int:
 
 
 def _conn():
-    # check_same_thread=False 允许你在 Flask + 监控线程里共用
     c = sqlite3.connect(PNL_DB_PATH, check_same_thread=False)
     c.row_factory = sqlite3.Row
     return c
@@ -25,7 +24,7 @@ def init_db():
     con = _conn()
     cur = con.cursor()
 
-    # 交易事件表（每次 entry/exit 都记一条）
+    # 交易事件表
     cur.execute("""
     CREATE TABLE IF NOT EXISTS trades (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -37,11 +36,11 @@ def init_db():
         qty TEXT NOT NULL,
         price TEXT NOT NULL,
         reason TEXT,
-        realized_pnl TEXT                 -- EXIT 记录时写入（可为空）
+        realized_pnl TEXT
     )
     """)
 
-    # 虚拟 lots 账本（每个 bot 独立）
+    # 虚拟 lots 账本
     cur.execute("""
     CREATE TABLE IF NOT EXISTS lots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -50,11 +49,22 @@ def init_db():
         direction TEXT NOT NULL,          -- LONG / SHORT
         entry_ts INTEGER NOT NULL,
         entry_price TEXT NOT NULL,
-        qty_open TEXT NOT NULL            -- 该 lot 剩余数量
+        qty_open TEXT NOT NULL
     )
     """)
 
-    # 索引让查询更快
+    # ✅ 阶梯锁盈状态表（持久化“当前锁盈档位”）
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS ladder_state (
+        bot_id TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        direction TEXT NOT NULL,
+        lock_level_pct TEXT NOT NULL,     -- Decimal string, e.g. "0.20"
+        updated_ts INTEGER NOT NULL,
+        PRIMARY KEY (bot_id, symbol, direction)
+    )
+    """)
+
     cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_bot ON trades(bot_id, ts)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_lots_bot ON lots(bot_id, symbol, direction)")
 
@@ -71,8 +81,12 @@ def side_to_direction(side: str) -> str:
         return "LONG"
     if s == "SELL":
         return "SHORT"
-    # fallback
     return "LONG"
+
+
+def direction_to_entry_side(direction: str) -> str:
+    d = str(direction).upper()
+    return "BUY" if d == "LONG" else "SELL"
 
 
 # -----------------------------
@@ -92,14 +106,12 @@ def record_entry(
     con = _conn()
     cur = con.cursor()
 
-    # 1) 写 trades
     cur.execute("""
         INSERT INTO trades (ts, bot_id, symbol, direction, action, qty, price, reason, realized_pnl)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (ts, bot_id, symbol, direction, "ENTRY",
           str(qty), str(price), reason, None))
 
-    # 2) 加一个 lot
     cur.execute("""
         INSERT INTO lots (bot_id, symbol, direction, entry_ts, entry_price, qty_open)
         VALUES (?, ?, ?, ?, ?, ?)
@@ -132,29 +144,20 @@ def record_exit_fifo(
     exit_price: Decimal,
     reason: str = "strategy_exit",
 ) -> Decimal:
-    """
-    按 FIFO 用该 bot 自己的 lots 扣减。
-    只计算并记录“该 bot 自己的已实现 PnL”。
-
-    返回：本次 exit 的 realized pnl（Decimal）
-    """
     direction = side_to_direction(entry_side)
     ts = _now_ts()
 
-    # 硬约束：不允许负数或 0
     if exit_qty <= 0:
         return Decimal("0")
 
     con = _conn()
     cur = con.cursor()
 
-    # 拿该 bot 的 open lots
     lots = _fetch_open_lots(cur, bot_id, symbol, direction)
 
     remaining = exit_qty
     realized = Decimal("0")
 
-    # FIFO 扣减
     for lot in lots:
         if remaining <= 0:
             break
@@ -168,13 +171,11 @@ def record_exit_fifo(
 
         match_qty = lot_open if lot_open <= remaining else remaining
 
-        # 计算该 lot 的 realized
         if direction == "LONG":
             realized += (exit_price - lot_price) * match_qty
         else:
             realized += (lot_price - exit_price) * match_qty
 
-        # 更新 lot 剩余
         new_open = lot_open - match_qty
         cur.execute("""
             UPDATE lots SET qty_open=? WHERE id=?
@@ -182,10 +183,6 @@ def record_exit_fifo(
 
         remaining -= match_qty
 
-    # 记录 trades（EXIT）
-    # 注意：这里允许 “退出数量 > 自己 lots 的剩余” 的情况被自然截断为 FIFO 匹配结果
-    # 你要的独立性铁律在“执行层”应当配合 size clamp；
-    # 这里仍然记录原始 exit_qty，方便你之后审计
     cur.execute("""
         INSERT INTO trades (ts, bot_id, symbol, direction, action, qty, price, reason, realized_pnl)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -234,7 +231,6 @@ def _fetch_open_lots_all(cur, bot_id: str) -> List[sqlite3.Row]:
 
 def get_bot_open_positions(bot_id: str) -> Dict[Tuple[str, str], Dict[str, Decimal]]:
     """
-    返回该 bot 的 open lots 汇总：
     key = (symbol, direction)
     value = {qty, weighted_entry}
     """
@@ -257,7 +253,6 @@ def get_bot_open_positions(bot_id: str) -> Dict[Tuple[str, str], Dict[str, Decim
         agg[key]["qty"] += qty
         agg[key]["cost"] += qty * price
 
-    # cost -> weighted entry
     out: Dict[Tuple[str, str], Dict[str, Decimal]] = {}
     for key, v in agg.items():
         qty = v["qty"]
@@ -270,9 +265,6 @@ def get_bot_open_positions(bot_id: str) -> Dict[Tuple[str, str], Dict[str, Decim
 
 
 def get_bot_summary(bot_id: str) -> Dict[str, Any]:
-    """
-    不含未实现（由上层用当前价格计算更合理）
-    """
     con = _conn()
     cur = con.cursor()
 
@@ -284,7 +276,6 @@ def get_bot_summary(bot_id: str) -> Dict[str, Any]:
     realized_day = _sum_realized(cur, bot_id, day_from)
     realized_week = _sum_realized(cur, bot_id, week_from)
 
-    # 交易次数
     cur.execute("""
         SELECT COUNT(*) AS c FROM trades WHERE bot_id=?
     """, (bot_id,))
@@ -313,3 +304,54 @@ def list_bots_with_activity() -> List[str]:
     con.close()
 
     return [str(r["bot_id"]) for r in rows]
+
+
+# -----------------------------
+# ✅ Ladder state helpers
+# -----------------------------
+def get_lock_level_pct(bot_id: str, symbol: str, direction: str) -> Decimal:
+    con = _conn()
+    cur = con.cursor()
+
+    cur.execute("""
+        SELECT lock_level_pct FROM ladder_state
+        WHERE bot_id=? AND symbol=? AND direction=?
+    """, (bot_id, symbol, direction))
+    row = cur.fetchone()
+    con.close()
+
+    if not row:
+        return Decimal("0")
+    try:
+        return Decimal(str(row["lock_level_pct"]))
+    except Exception:
+        return Decimal("0")
+
+
+def set_lock_level_pct(bot_id: str, symbol: str, direction: str, lock_level_pct: Decimal):
+    ts = _now_ts()
+    con = _conn()
+    cur = con.cursor()
+
+    cur.execute("""
+        INSERT INTO ladder_state (bot_id, symbol, direction, lock_level_pct, updated_ts)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(bot_id, symbol, direction)
+        DO UPDATE SET lock_level_pct=excluded.lock_level_pct, updated_ts=excluded.updated_ts
+    """, (bot_id, symbol, direction, str(lock_level_pct), ts))
+
+    con.commit()
+    con.close()
+
+
+def clear_lock_level_pct(bot_id: str, symbol: str, direction: str):
+    con = _conn()
+    cur = con.cursor()
+
+    cur.execute("""
+        DELETE FROM ladder_state
+        WHERE bot_id=? AND symbol=? AND direction=?
+    """, (bot_id, symbol, direction))
+
+    con.commit()
+    con.close()
