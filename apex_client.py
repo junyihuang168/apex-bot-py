@@ -125,6 +125,10 @@ def get_account():
 
 
 def get_market_price(symbol: str, side: str, size: str) -> str:
+    """
+    获取市价单预估的最差成交价 (Worst Price)。
+    包含滑点和点差，适合用于下单前的 budget 计算，但不适合做风控监控。
+    """
     base_url, network_id = _get_base_and_network()
     api_creds = _get_api_credentials()
 
@@ -156,8 +160,48 @@ def get_market_price(symbol: str, side: str, size: str) -> str:
         raise RuntimeError(f"[apex_client] get_worst_price_v3 返回异常: {res}")
 
     price_str = str(price)
-    print(f"[apex_client] worst price for {symbol} {side} size={size_str}: {price_str}")
+    # print(f"[apex_client] worst price for {symbol} {side} size={size_str}: {price_str}")
     return price_str
+
+
+def get_ticker_price(symbol: str) -> str:
+    """
+    【新增函数】获取市场标记价格 (Oracle Price) 或 最新成交价 (Last Price)。
+    用于风控监控，避免因为滑点导致提前止损。
+    """
+    base_url, network_id = _get_base_and_network()
+    
+    # 这里使用 Public Client 即可
+    from apexomni.http_public_v3 import HttpPublic_v3
+    
+    http_public = HttpPublic_v3(base_url, network_id=network_id)
+    
+    # 获取 Ticker
+    res = http_public.get_tickers_v3(symbol=symbol)
+    
+    price = None
+    
+    # 解析 Ticker 数据，结构通常是 {"data": [...]} 或 直接列表
+    data_list = []
+    if isinstance(res, dict):
+        d = res.get("data")
+        if isinstance(d, list):
+            data_list = d
+        elif isinstance(d, dict):
+            data_list = [d]
+    elif isinstance(res, list):
+        data_list = res
+        
+    if data_list:
+        item = data_list[0]
+        # 优先取 oraclePrice (标记价格)，其次 lastPrice (最新成交价)
+        price = item.get("oraclePrice") or item.get("lastPrice")
+
+    if price is None:
+        print(f"[apex_client] WARNING: get_ticker_price failed for {symbol}, res={res}")
+        raise RuntimeError(f"Ticker price unavailable for {symbol}")
+
+    return str(price)
 
 
 NumberLike = Union[str, float, int]
@@ -351,6 +395,7 @@ def create_market_order(
             raise ValueError("size_usdt must be > 0")
 
         min_qty = rules["min_qty"]
+        # 计算 budget 时仍然使用 worst_price (get_market_price) 是对的，保证余额充足
         ref_price_decimal = Decimal(get_market_price(symbol, side, str(min_qty)))
         theoretical_qty = budget / ref_price_decimal
         snapped_qty = _snap_quantity(symbol, theoretical_qty)
