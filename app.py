@@ -9,7 +9,8 @@ from flask import Flask, request, jsonify, Response
 from apex_client import (
     create_market_order,
     get_market_price,
-    get_fill_summary,      # ✅ 新增：真实成交回写
+    get_ticker_price,      # ✅ 引入新函数
+    get_fill_summary,
     _get_symbol_rules,
     _snap_quantity,
 )
@@ -91,6 +92,7 @@ def _compute_entry_qty(symbol: str, side: str, budget: Decimal) -> Decimal:
     rules = _get_symbol_rules(symbol)
     min_qty = rules["min_qty"]
 
+    # 下单计算预算时，继续用 get_market_price (Worst Price) 是安全的
     ref_price_dec = Decimal(get_market_price(symbol, side, str(min_qty)))
     theoretical_qty = budget / ref_price_dec
     snapped_qty = _snap_quantity(symbol, theoretical_qty)
@@ -141,14 +143,16 @@ def _bot_allows_direction(bot_id: str, direction: str) -> bool:
 
 
 def _get_current_price(symbol: str, direction: str) -> Optional[Decimal]:
+    """
+    【修改】这里使用 get_ticker_price 获取不含滑点的公允市场价格。
+    direction 参数现在主要用于日志（如果有的话），因为 Ticker 不分方向。
+    """
     try:
-        rules = _get_symbol_rules(symbol)
-        min_qty = rules["min_qty"]
-        exit_side = "SELL" if direction.upper() == "LONG" else "BUY"
-        px_str = get_market_price(symbol, exit_side, str(min_qty))
-        return Decimal(str(px_str))
+        # 使用 Oracle/Last Price 避免提前止损
+        px_str = get_ticker_price(symbol)
+        return Decimal(px_str)
     except Exception as e:
-        print(f"[RISK] get_market_price error symbol={symbol} direction={direction}:", e)
+        print(f"[RISK] get_ticker_price error symbol={symbol} direction={direction}:", e)
         return None
 
 
@@ -191,6 +195,7 @@ def _execute_virtual_exit(bot_id: str, symbol: str, direction: str, qty: Decimal
     entry_side = "BUY" if direction_u == "LONG" else "SELL"
     exit_side = "SELL" if direction_u == "LONG" else "BUY"
 
+    # 平仓时依然获取当前价格来记账
     exit_price = _get_current_price(symbol, direction_u)
     if exit_price is None:
         print(f"[RISK] skip exit due to no price bot={bot_id} symbol={symbol}")
@@ -847,6 +852,7 @@ def tv_webhook():
                 "cancel_reason": cancel_reason,
             }), 200
 
+        # 平仓记账也尽量用 Ticker Price 或 Fill，这里简单起见用当前 Ticker
         exit_price = _get_current_price(symbol, direction_to_close) or Decimal("0")
 
         try:
