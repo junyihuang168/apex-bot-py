@@ -4,9 +4,6 @@ import sqlite3
 from decimal import Decimal
 from typing import Optional, Dict, Any, List, Tuple
 
-# -----------------------------
-# SQLite configuration
-# -----------------------------
 PNL_DB_PATH = os.getenv("PNL_DB", "bot_pnl.sqlite")
 
 
@@ -24,7 +21,7 @@ def init_db():
     con = _conn()
     cur = con.cursor()
 
-    # 交易事件表
+    # trades: ENTRY/EXIT 事件
     cur.execute("""
     CREATE TABLE IF NOT EXISTS trades (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -40,7 +37,7 @@ def init_db():
     )
     """)
 
-    # 虚拟 lots 账本
+    # lots: 虚拟独立仓位账本
     cur.execute("""
     CREATE TABLE IF NOT EXISTS lots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -53,7 +50,7 @@ def init_db():
     )
     """)
 
-    # ✅ 阶梯锁盈状态表（持久化“当前锁盈档位”）
+    # ladder_state: 当前锁盈档位（百分比）
     cur.execute("""
     CREATE TABLE IF NOT EXISTS ladder_state (
         bot_id TEXT NOT NULL,
@@ -90,7 +87,7 @@ def direction_to_entry_side(direction: str) -> str:
 
 
 # -----------------------------
-# Trade logging
+# Trades & lots
 # -----------------------------
 def record_entry(
     bot_id: str,
@@ -177,9 +174,7 @@ def record_exit_fifo(
             realized += (lot_price - exit_price) * match_qty
 
         new_open = lot_open - match_qty
-        cur.execute("""
-            UPDATE lots SET qty_open=? WHERE id=?
-        """, (str(new_open), lot_id))
+        cur.execute("UPDATE lots SET qty_open=? WHERE id=?", (str(new_open), lot_id))
 
         remaining -= match_qty
 
@@ -196,7 +191,7 @@ def record_exit_fifo(
 
 
 # -----------------------------
-# PnL summary helpers
+# Summaries
 # -----------------------------
 def _sum_realized(cur, bot_id: str, ts_from: Optional[int] = None) -> Decimal:
     if ts_from is None:
@@ -276,9 +271,7 @@ def get_bot_summary(bot_id: str) -> Dict[str, Any]:
     realized_day = _sum_realized(cur, bot_id, day_from)
     realized_week = _sum_realized(cur, bot_id, week_from)
 
-    cur.execute("""
-        SELECT COUNT(*) AS c FROM trades WHERE bot_id=?
-    """, (bot_id,))
+    cur.execute("SELECT COUNT(*) AS c FROM trades WHERE bot_id=?", (bot_id,))
     trades_count = int(cur.fetchone()["c"] or 0)
 
     con.close()
@@ -296,10 +289,7 @@ def list_bots_with_activity() -> List[str]:
     con = _conn()
     cur = con.cursor()
 
-    cur.execute("""
-        SELECT DISTINCT bot_id FROM trades
-        ORDER BY bot_id ASC
-    """)
+    cur.execute("SELECT DISTINCT bot_id FROM trades ORDER BY bot_id ASC")
     rows = cur.fetchall()
     con.close()
 
@@ -307,7 +297,7 @@ def list_bots_with_activity() -> List[str]:
 
 
 # -----------------------------
-# ✅ Ladder state helpers
+# Ladder state
 # -----------------------------
 def get_lock_level_pct(bot_id: str, symbol: str, direction: str) -> Decimal:
     con = _conn()
