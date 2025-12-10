@@ -1,8 +1,6 @@
 import os
 import time
 import threading
-import io
-import contextlib
 from decimal import Decimal
 from typing import Dict, Tuple, Optional, Set
 
@@ -31,12 +29,12 @@ app = Flask(__name__)
 
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 
-# -------------------------
-# Dashboard token (optional)
-# -------------------------
+# =========================
+# Dashboard auth (optional)
+# =========================
 DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "")
 
-def _require_token():
+def _require_token() -> bool:
     if not DASHBOARD_TOKEN:
         return True
     token = request.args.get("token") or request.headers.get("X-Dashboard-Token")
@@ -49,38 +47,39 @@ def _require_token():
 def _parse_bot_list(env_val: str) -> Set[str]:
     return {b.strip() for b in env_val.split(",") if b.strip()}
 
-# BOT_1..BOT_10: LONG 风控
+# 默认：BOT_1..BOT_10 走多风控
 LONG_LADDER_BOTS = _parse_bot_list(
-    os.getenv("LONG_LADDER_BOTS",
-              ",".join([f"BOT_{i}" for i in range(1, 11)]))
+    os.getenv(
+        "LONG_LADDER_BOTS",
+        ",".join([f"BOT_{i}" for i in range(1, 11)])
+    )
 )
 
-# BOT_11..BOT_20: SHORT 风控
+# 默认：BOT_11..BOT_20 走空风控
 SHORT_LADDER_BOTS = _parse_bot_list(
-    os.getenv("SHORT_LADDER_BOTS",
-              ",".join([f"BOT_{i}" for i in range(11, 21)]))
+    os.getenv(
+        "SHORT_LADDER_BOTS",
+        ",".join([f"BOT_{i}" for i in range(11, 21)])
+    )
 )
 
-# ✅ 基础止损 0.6%
-BASE_SL_PCT = Decimal(os.getenv("BASE_SL_PCT", "0.6"))
+# ✅ 基础止损百分比（默认 0.5%）
+# 环境变量 BASE_SL_PCT 可覆盖
+BASE_SL_PCT = Decimal(os.getenv("BASE_SL_PCT", "0.5"))
 
-# 风控轮询间隔
+# 轮询间隔（秒）
 RISK_POLL_INTERVAL = float(os.getenv("RISK_POLL_INTERVAL", "2.0"))
 
-# ✅ 展示请求是否静默（默认 True）
-DASHBOARD_SILENT = os.getenv("DASHBOARD_SILENT", "1").lower() in ("1", "true", "yes", "y", "on")
-
-# =========================
-# Local cache (non-authoritative)
-# =========================
+# 本地 cache（非风控真相源，只是辅助）
 BOT_POSITIONS: Dict[Tuple[str, str], dict] = {}
 
+# 线程控制
 _MONITOR_THREAD_STARTED = False
 _MONITOR_LOCK = threading.Lock()
 
 
 # ------------------------------------------------
-# Budget extraction
+# 从 payload 里取 USDT 预算
 # ------------------------------------------------
 def _extract_budget_usdt(body: dict) -> Decimal:
     size_field = (
@@ -94,11 +93,12 @@ def _extract_budget_usdt(body: dict) -> Decimal:
     budget = Decimal(str(size_field))
     if budget <= 0:
         raise ValueError("size_usdt must be > 0")
+
     return budget
 
 
 # ------------------------------------------------
-# Entry qty compute
+# 根据 USDT 预算算出 snapped qty
 # ------------------------------------------------
 def _compute_entry_qty(symbol: str, side: str, budget: Decimal) -> Decimal:
     rules = _get_symbol_rules(symbol)
@@ -127,7 +127,11 @@ def _order_status_and_reason(order: dict):
 
 
 # ------------------------------------------------
-# Ladder rules (your latest)
+# 阶梯锁盈（你最新版本）
+# 0.18 -> 0.10
+# 0.38 -> 0.20
+# 0.58 -> 0.40
+# 之后每 +0.20 触发，锁盈线 +0.20
 # ------------------------------------------------
 TRIGGER_1 = Decimal("0.18")
 LOCK_1 = Decimal("0.10")
@@ -135,16 +139,10 @@ TRIGGER_2 = Decimal("0.38")
 LOCK_2 = Decimal("0.20")
 STEP = Decimal("0.20")
 
+
 def _desired_lock_level_pct(pnl_pct: Decimal) -> Decimal:
-    """
-    0.18 -> 0.10
-    0.38 -> 0.20
-    0.58 -> 0.40
-    then +0.20 steps
-    """
     if pnl_pct < TRIGGER_1:
         return Decimal("0")
-
     if pnl_pct < TRIGGER_2:
         return LOCK_1
 
@@ -161,45 +159,16 @@ def _bot_allows_direction(bot_id: str, direction: str) -> bool:
     return False
 
 
-# ------------------------------------------------
-# ✅ Quiet wrapper for get_market_price
-# ------------------------------------------------
-def _get_market_price_any(symbol: str, side: str, size_str: str, silent: bool) -> str:
-    if not silent:
-        return get_market_price(symbol, side, size_str)
-
-    # 静默：不让 dashboard /api/pnl 刷屏
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        return get_market_price(symbol, side, size_str)
-
-
-def _get_current_price(
-    symbol: str,
-    direction: str,
-    ref_qty: Optional[Decimal] = None,
-    silent: bool = False
-) -> Optional[Decimal]:
-    """
-    ✅ 改进点 1：
-    - 风控场景传入 ref_qty，用真实虚拟 qty 去问 worst price
-    - 展示场景不传 ref_qty，默认用 min_qty
-    ✅ 改进点 2：
-    - silent=True 时屏蔽 apex_client 的打印
-    """
+def _get_current_price(symbol: str, direction: str) -> Optional[Decimal]:
     try:
         rules = _get_symbol_rules(symbol)
         min_qty = rules["min_qty"]
-
+        # 用平仓方向 worst price 作为参考价
         exit_side = "SELL" if direction.upper() == "LONG" else "BUY"
-
-        ask_qty = ref_qty if (ref_qty is not None and ref_qty > 0) else min_qty
-        px_str = _get_market_price_any(symbol, exit_side, str(ask_qty), silent=silent)
-
+        px_str = get_market_price(symbol, exit_side, str(min_qty))
         return Decimal(str(px_str))
     except Exception as e:
-        if not silent:
-            print(f"[RISK] get_market_price error symbol={symbol} direction={direction}:", e)
+        print(f"[RISK] get_market_price error symbol={symbol} direction={direction}:", e)
         return None
 
 
@@ -225,6 +194,7 @@ def _base_sl_hit(direction: str, entry_price: Decimal, current_price: Decimal) -
 def _lock_hit(direction: str, entry_price: Decimal, current_price: Decimal, lock_level_pct: Decimal) -> bool:
     if lock_level_pct <= 0:
         return False
+
     pct = lock_level_pct / Decimal("100")
     if direction.upper() == "LONG":
         lock_price = entry_price * (Decimal("1") + pct)
@@ -234,25 +204,31 @@ def _lock_hit(direction: str, entry_price: Decimal, current_price: Decimal, lock
         return current_price >= lock_price
 
 
-def _execute_virtual_exit(bot_id: str, symbol: str, direction: str, qty: Decimal, reason: str):
+def _execute_virtual_exit(
+    bot_id: str,
+    symbol: str,
+    direction: str,
+    qty: Decimal,
+    reason: str
+):
     """
-    核心铁律：
-    - 永远只平该 bot 自己 lots 里记账的 qty
+    真正发 reduceOnly MARKET 平仓，
+    并用 FIFO 从该 bot 的 lots 里记账扣减。
     """
     if qty <= 0:
         return
 
-    entry_side = "BUY" if direction.upper() == "LONG" else "SELL"
-    exit_side = "SELL" if direction.upper() == "LONG" else "BUY"
+    direction_u = direction.upper()
+    entry_side = "BUY" if direction_u == "LONG" else "SELL"
+    exit_side = "SELL" if direction_u == "LONG" else "BUY"
 
-    # 风控用真实 qty 取价（不静默）
-    exit_price = _get_current_price(symbol, direction, ref_qty=qty, silent=False)
+    exit_price = _get_current_price(symbol, direction_u)
     if exit_price is None:
         print(f"[RISK] skip exit due to no price bot={bot_id} symbol={symbol}")
         return
 
     print(
-        f"[RISK] EXIT bot={bot_id} symbol={symbol} direction={direction} "
+        f"[RISK] EXIT bot={bot_id} symbol={symbol} direction={direction_u} "
         f"qty={qty} reason={reason}"
     )
 
@@ -270,6 +246,7 @@ def _execute_virtual_exit(bot_id: str, symbol: str, direction: str, qty: Decimal
         if status in ("CANCELED", "REJECTED"):
             return
 
+        # ✅ 记账出场
         try:
             record_exit_fifo(
                 bot_id=bot_id,
@@ -282,32 +259,31 @@ def _execute_virtual_exit(bot_id: str, symbol: str, direction: str, qty: Decimal
         except Exception as e:
             print("[PNL] record_exit_fifo error (risk):", e)
 
+        # ✅ 清理阶梯状态
         try:
-            clear_lock_level_pct(bot_id, symbol, direction.upper())
+            clear_lock_level_pct(bot_id, symbol, direction_u)
         except Exception:
             pass
 
-        # best-effort local cache sync
+        # ✅ 辅助清理本地 cache
         key = (bot_id, symbol)
         pos = BOT_POSITIONS.get(key)
         if pos:
-            try:
-                pos_qty = Decimal(str(pos.get("qty") or "0"))
-                new_qty = pos_qty - qty
-                if new_qty < 0:
-                    new_qty = Decimal("0")
-                pos["qty"] = new_qty
-                if new_qty == 0:
-                    pos["entry_price"] = None
-            except Exception:
-                pass
+            pos_qty = Decimal(str(pos.get("qty") or "0"))
+            new_qty = pos_qty - qty
+            if new_qty < 0:
+                new_qty = Decimal("0")
+            pos["qty"] = new_qty
+            if new_qty == 0:
+                pos["entry_price"] = None
 
     except Exception as e:
         print(f"[RISK] create_market_order error bot={bot_id} symbol={symbol}:", e)
 
 
 # ------------------------------------------------
-# ✅ Risk monitor thread (Base SL + Ladder)
+# ✅ 风控线程：基础止损 + 阶梯锁盈
+# 以 pnl_store 的 open lots 为真相源
 # ------------------------------------------------
 def _risk_loop():
     print("[RISK] ladder/baseSL thread started")
@@ -319,10 +295,9 @@ def _risk_loop():
                 opens = get_bot_open_positions(bot_id)
 
                 for (symbol, direction), v in opens.items():
-                    direction = direction.upper()
+                    direction_u = direction.upper()
 
-                    # 方向隔离
-                    if not _bot_allows_direction(bot_id, direction):
+                    if not _bot_allows_direction(bot_id, direction_u):
                         continue
 
                     qty = v["qty"]
@@ -331,45 +306,44 @@ def _risk_loop():
                     if qty <= 0 or entry_price <= 0:
                         continue
 
-                    # ✅ 改进点：风控用真实 qty 取价
-                    current_price = _get_current_price(symbol, direction, ref_qty=qty, silent=False)
+                    current_price = _get_current_price(symbol, direction_u)
                     if current_price is None:
                         continue
 
-                    pnl_pct = _calc_pnl_pct(direction, entry_price, current_price)
+                    pnl_pct = _calc_pnl_pct(direction_u, entry_price, current_price)
 
-                    # 1) 基础止损优先
-                    if _base_sl_hit(direction, entry_price, current_price):
+                    # 1) ✅ 基础止损优先（默认 0.5%）
+                    if _base_sl_hit(direction_u, entry_price, current_price):
                         _execute_virtual_exit(
                             bot_id=bot_id,
                             symbol=symbol,
-                            direction=direction,
+                            direction=direction_u,
                             qty=qty,
                             reason="base_sl_exit",
                         )
                         continue
 
-                    # 2) 计算目标锁盈档位
+                    # 2) ✅ 计算希望锁盈档位
                     desired_lock = _desired_lock_level_pct(pnl_pct)
 
-                    # 当前锁盈档位（持久化）
-                    current_lock = get_lock_level_pct(bot_id, symbol, direction)
+                    # 当前已生效锁盈档位（持久化）
+                    current_lock = get_lock_level_pct(bot_id, symbol, direction_u)
 
                     # 只上不下
                     if desired_lock > current_lock:
-                        set_lock_level_pct(bot_id, symbol, direction, desired_lock)
+                        set_lock_level_pct(bot_id, symbol, direction_u, desired_lock)
                         current_lock = desired_lock
                         print(
-                            f"[RISK] LOCK UP bot={bot_id} symbol={symbol} direction={direction} "
+                            f"[RISK] LOCK UP bot={bot_id} symbol={symbol} direction={direction_u} "
                             f"pnl={pnl_pct:.4f}% lock_level={current_lock}%"
                         )
 
-                    # 3) 锁盈触发
-                    if _lock_hit(direction, entry_price, current_price, current_lock):
+                    # 3) ✅ 锁盈触发
+                    if _lock_hit(direction_u, entry_price, current_price, current_lock):
                         _execute_virtual_exit(
                             bot_id=bot_id,
                             symbol=symbol,
-                            direction=direction,
+                            direction=direction_u,
                             qty=qty,
                             reason="ladder_lock_exit",
                         )
@@ -391,18 +365,18 @@ def _ensure_monitor_thread():
             print("[RISK] thread created")
 
 
-# ------------------------------------------------
-# Index
-# ------------------------------------------------
+# =========================
+# Basic health
+# =========================
 @app.route("/", methods=["GET"])
 def index():
     _ensure_monitor_thread()
     return "OK", 200
 
 
-# ------------------------------------------------
-# PnL API
-# ------------------------------------------------
+# =========================
+# ✅ PnL API
+# =========================
 @app.route("/api/pnl", methods=["GET"])
 def api_pnl():
     if not _require_token():
@@ -429,13 +403,7 @@ def api_pnl():
             if qty <= 0:
                 continue
 
-            # 展示：默认静默 + 用 min_qty 取价
-            px = _get_current_price(
-                symbol,
-                direction,
-                ref_qty=None,
-                silent=DASHBOARD_SILENT
-            )
+            px = _get_current_price(symbol, direction)
             if px is None:
                 continue
 
@@ -458,6 +426,7 @@ def api_pnl():
         })
         out.append(base)
 
+    # 排序：按总已实现
     def _rt(x):
         try:
             return Decimal(str(x.get("realized_total", "0")))
@@ -472,9 +441,9 @@ def api_pnl():
     }), 200
 
 
-# ------------------------------------------------
-# Dashboard
-# ------------------------------------------------
+# =========================
+# ✅ Dashboard
+# =========================
 @app.route("/dashboard", methods=["GET"])
 def dashboard():
     if not _require_token():
@@ -523,7 +492,7 @@ def dashboard():
 <header>
   <div>
     <h1>Bot PnL Dashboard</h1>
-    <div class="muted">bot 独立 lots 记账 · 基础止损=0.6% · 阶梯锁盈 (0.18→0.10, 0.38→0.20 ...)</div>
+    <div class="muted">bot 独立 lots 记账 · 基础止损默认 0.5% · 阶梯锁盈</div>
   </div>
   <div class="muted" id="lastUpdate">Loading...</div>
 </header>
@@ -545,8 +514,8 @@ def dashboard():
     <div class="card full">
       <div class="row">
         <div class="group">
-          <span class="pill">BOT 1-10: LONG 阶梯锁盈 + 基础SL(0.6%)</span>
-          <span class="pill">BOT 11-20: SHORT 阶梯锁盈 + 基础SL(0.6%)</span>
+          <span class="pill">BOT 1-10: LONG 阶梯锁盈 + 基础SL(0.5%)</span>
+          <span class="pill">BOT 11-20: SHORT 阶梯锁盈 + 基础SL(0.5%)</span>
           <span class="pill">Others: Strategy-only</span>
         </div>
         <div class="small">数据来自 /api/pnl</div>
@@ -590,7 +559,6 @@ function render() {
     const realized_week = b.realized_week ?? "0";
     const unrealized = b.unrealized ?? "0";
     const trades = b.trades_count ?? 0;
-
     const open = b.open_positions || [];
 
     const div = document.createElement("div");
@@ -684,13 +652,14 @@ setInterval(refresh, 15000);
     return Response(html, mimetype="text/html")
 
 
-# ------------------------------------------------
-# Webhook
-# ------------------------------------------------
+# =========================
+# ✅ TradingView Webhook
+# =========================
 @app.route("/webhook", methods=["POST"])
 def tv_webhook():
     _ensure_monitor_thread()
 
+    # 1) Parse JSON & secret
     try:
         body = request.get_json(force=True, silent=False)
     except Exception as e:
@@ -717,6 +686,7 @@ def tv_webhook():
     action_raw = str(body.get("action", "")).lower()
     tv_client_id = body.get("client_id")
 
+    # 2) Determine mode
     mode: Optional[str] = None
     if signal_type_raw in ("entry", "open"):
         mode = "entry"
@@ -731,9 +701,9 @@ def tv_webhook():
     if mode is None:
         return "missing or invalid signal_type / action", 400
 
-    # ------------------------
+    # ------------------------------------------------
     # ENTRY
-    # ------------------------
+    # ------------------------------------------------
     if mode == "entry":
         if side_raw not in ("BUY", "SELL"):
             return "missing or invalid side", 400
@@ -751,7 +721,10 @@ def tv_webhook():
             return "qty compute error", 500
 
         size_str = str(snapped_qty)
-        print(f"[ENTRY] bot={bot_id} symbol={symbol} side={side_raw} budget={budget} -> qty={size_str}")
+        print(
+            f"[ENTRY] bot={bot_id} symbol={symbol} side={side_raw} "
+            f"budget={budget} -> qty={size_str}"
+        )
 
         try:
             order = create_market_order(
@@ -790,7 +763,7 @@ def tv_webhook():
         except Exception:
             entry_price_dec = None
 
-        # best-effort local cache
+        # 本地 cache
         key = (bot_id, symbol)
         BOT_POSITIONS[key] = {
             "side": side_raw,
@@ -798,7 +771,7 @@ def tv_webhook():
             "entry_price": entry_price_dec,
         }
 
-        # ✅ lots 记账（风控的真实依据）
+        # ✅ PnL ENTRY 记账（bot 独立 lots）
         if entry_price_dec is not None:
             try:
                 record_entry(
@@ -824,9 +797,10 @@ def tv_webhook():
             "cancel_reason": cancel_reason,
         }), 200
 
-    # ------------------------
+    # ------------------------------------------------
     # EXIT（策略出场）
-    # ------------------------
+    # 以 lots 为准，不依赖本地 cache
+    # ------------------------------------------------
     if mode == "exit":
         opens = get_bot_open_positions(bot_id)
 
@@ -836,10 +810,12 @@ def tv_webhook():
         long_qty = opens.get(long_key, {}).get("qty", Decimal("0")) if long_key in opens else Decimal("0")
         short_qty = opens.get(short_key, {}).get("qty", Decimal("0")) if short_key in opens else Decimal("0")
 
-        # 优先方向选择
         key_local = (bot_id, symbol)
         local = BOT_POSITIONS.get(key_local)
-        preferred = "SHORT" if (local and str(local.get("side", "")).upper() == "SELL") else "LONG"
+        if local and str(local.get("side", "")).upper() == "SELL":
+            preferred = "SHORT"
+        else:
+            preferred = "LONG"
 
         direction_to_close = None
         qty_to_close = Decimal("0")
@@ -896,8 +872,7 @@ def tv_webhook():
                 "cancel_reason": cancel_reason,
             }), 200
 
-        # 策略出场也用真实 qty 取价（不静默）
-        exit_price = _get_current_price(symbol, direction_to_close, ref_qty=qty_to_close, silent=False) or Decimal("0")
+        exit_price = _get_current_price(symbol, direction_to_close) or Decimal("0")
 
         try:
             record_exit_fifo(
