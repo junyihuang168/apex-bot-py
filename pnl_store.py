@@ -4,8 +4,11 @@ import time
 from decimal import Decimal, ROUND_DOWN
 from typing import Dict, Tuple, Any, List
 
-DB_PATH = os.getenv("PNL_DB_PATH", "pnl.sqlite3")
+# ✅ 修改：使用绝对路径，避免不同运行环境找不到文件
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, os.getenv("PNL_DB_PATH", "pnl.sqlite3"))
 
+print(f"[PNL] Database path set to: {DB_PATH}")
 
 def _now() -> int:
     return int(time.time())
@@ -20,65 +23,70 @@ def _d(x) -> Decimal:
 
 
 def _connect():
+    # check_same_thread=False 允许在多线程(Webhook线程 vs 风控线程)中共享连接
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def init_db():
-    conn = _connect()
-    cur = conn.cursor()
+    try:
+        conn = _connect()
+        cur = conn.cursor()
 
-    # lots: 每次 entry 一条
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS lots (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        bot_id TEXT NOT NULL,
-        symbol TEXT NOT NULL,
-        direction TEXT NOT NULL,        -- LONG / SHORT
-        entry_side TEXT NOT NULL,       -- BUY / SELL
-        qty TEXT NOT NULL,              -- Decimal as text
-        entry_price TEXT NOT NULL,      -- Decimal as text
-        remaining_qty TEXT NOT NULL,    -- Decimal as text
-        reason TEXT,
-        ts INTEGER NOT NULL
-    )
-    """)
+        # lots: 每次 entry 一条
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS lots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            direction TEXT NOT NULL,        -- LONG / SHORT
+            entry_side TEXT NOT NULL,       -- BUY / SELL
+            qty TEXT NOT NULL,              -- Decimal as text
+            entry_price TEXT NOT NULL,      -- Decimal as text
+            remaining_qty TEXT NOT NULL,    -- Decimal as text
+            reason TEXT,
+            ts INTEGER NOT NULL
+        )
+        """)
 
-    # exits: 每次出场记录（可多笔 lot 贡献）
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS exits (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        bot_id TEXT NOT NULL,
-        symbol TEXT NOT NULL,
-        direction TEXT NOT NULL,
-        entry_side TEXT NOT NULL,
-        exit_side TEXT NOT NULL,
-        exit_qty TEXT NOT NULL,
-        entry_price TEXT NOT NULL,
-        exit_price TEXT NOT NULL,
-        realized_pnl TEXT NOT NULL,
-        reason TEXT,
-        ts INTEGER NOT NULL
-    )
-    """)
+        # exits: 每次出场记录（可多笔 lot 贡献）
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS exits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            entry_side TEXT NOT NULL,
+            exit_side TEXT NOT NULL,
+            exit_qty TEXT NOT NULL,
+            entry_price TEXT NOT NULL,
+            exit_price TEXT NOT NULL,
+            realized_pnl TEXT NOT NULL,
+            reason TEXT,
+            ts INTEGER NOT NULL
+        )
+        """)
 
-    # lock levels
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS lock_levels (
-        bot_id TEXT NOT NULL,
-        symbol TEXT NOT NULL,
-        direction TEXT NOT NULL,
-        lock_level_pct TEXT NOT NULL,
-        updated_ts INTEGER NOT NULL,
-        PRIMARY KEY (bot_id, symbol, direction)
-    )
-    """)
+        # lock levels
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS lock_levels (
+            bot_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            lock_level_pct TEXT NOT NULL,
+            updated_ts INTEGER NOT NULL,
+            PRIMARY KEY (bot_id, symbol, direction)
+        )
+        """)
 
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_lots_bot_symbol ON lots(bot_id, symbol, direction, ts)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_exits_bot_ts ON exits(bot_id, ts)")
-    conn.commit()
-    conn.close()
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_lots_bot_symbol ON lots(bot_id, symbol, direction, ts)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_exits_bot_ts ON exits(bot_id, ts)")
+        conn.commit()
+        conn.close()
+        print("[PNL] Database initialized successfully.")
+    except Exception as e:
+        print(f"[PNL] CRITICAL ERROR initializing database at {DB_PATH}: {e}")
 
 
 def _side_to_direction(entry_side: str) -> str:
@@ -112,6 +120,9 @@ def record_entry(
     ))
     conn.commit()
     conn.close()
+    
+    # ✅ 增加日志确认
+    print(f"[PNL] record_entry SUCCESS: bot={bot_id} {direction} {symbol} qty={q} @ {p}")
 
 
 def record_exit_fifo(
@@ -122,11 +133,6 @@ def record_exit_fifo(
     exit_price: Decimal,
     reason: str = "strategy_exit",
 ):
-    """
-    核心独立性：
-    - 只从该 bot 的该方向 lots 里 FIFO 扣 remaining_qty
-    - 只记自己卖出的数量
-    """
     direction = _side_to_direction(entry_side)
     exit_side = "SELL" if direction == "LONG" else "BUY"
 
@@ -148,6 +154,7 @@ def record_exit_fifo(
     rows = cur.fetchall()
     if not rows:
         conn.close()
+        print(f"[PNL] WARNING: record_exit_fifo found NO open lots for {bot_id} {symbol}")
         return
 
     ts = _now()
@@ -194,6 +201,7 @@ def record_exit_fifo(
 
     conn.commit()
     conn.close()
+    print(f"[PNL] record_exit_fifo DONE for {bot_id} {symbol}. Remaining need={need}")
 
 
 def get_bot_open_positions(bot_id: str) -> Dict[Tuple[str, str], Dict[str, Any]]:
@@ -219,7 +227,9 @@ def get_bot_open_positions(bot_id: str) -> Dict[Tuple[str, str], Dict[str, Any]]
     """, (bot_id,))
 
     out: Dict[Tuple[str, str], Dict[str, Any]] = {}
-    for r in cur.fetchall():
+    rows = cur.fetchall()
+    
+    for r in rows:
         symbol = r["symbol"]
         direction = r["direction"]
         qty_sum = _d(r["qty_sum"] or "0")
@@ -255,12 +265,6 @@ def list_bots_with_activity() -> List[str]:
 
 
 def get_bot_summary(bot_id: str) -> Dict[str, Any]:
-    """
-    realized_day: 24h
-    realized_week: 7d
-    realized_total: all
-    trades_count: exits count
-    """
     conn = _connect()
     cur = conn.cursor()
 
