@@ -1,6 +1,5 @@
 import os
 import time
-import json
 import threading
 from decimal import Decimal
 from typing import Dict, Tuple, Optional, Set
@@ -10,8 +9,8 @@ from flask import Flask, request, jsonify, Response
 from apex_client import (
     create_market_order,
     get_market_price,
-    get_fill_summary,              # ✅ 真实价格
-    get_open_position_for_symbol,  # ✅ 远程仓位查询
+    get_fill_summary,              # ✅ 新增：仓库逻辑-真实成交回写
+    get_open_position_for_symbol,  # ✅ 新增：仓库逻辑-远程查仓
     map_position_side_to_exit_order_side,
     _get_symbol_rules,
     _snap_quantity,
@@ -24,390 +23,618 @@ from pnl_store import (
     list_bots_with_activity,
     get_bot_summary,
     get_bot_open_positions,
+    get_lock_level_pct,
+    set_lock_level_pct,
+    clear_lock_level_pct,
 )
 
 app = Flask(__name__)
 
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+
+# Dashboard token（可选）
 DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "")
 
-# ------------------------------------------------------------
-# 1. 配置区域：Bot 定义与阶梯参数
-# ------------------------------------------------------------
-def _parse_bot_list(env_val: str) -> Set[str]:
-    return {b.strip() for b in env_val.split(",") if b.strip()}
-
-# 兼容两种 Bot 定义方式，取并集确保覆盖
-_LONG_BOTS_ENV = os.getenv("LONG_HARD_SL_BOTS", os.getenv("LONG_LADDER_BOTS", "BOT_1,BOT_2,BOT_3,BOT_4,BOT_5,BOT_6,BOT_7,BOT_8,BOT_9,BOT_10"))
-_SHORT_BOTS_ENV = os.getenv("SHORT_HARD_SL_BOTS", os.getenv("SHORT_LADDER_BOTS", "BOT_11,BOT_12,BOT_13,BOT_14,BOT_15,BOT_16,BOT_17,BOT_18,BOT_19,BOT_20"))
-
-LONG_HARD_SL_BOTS = _parse_bot_list(_LONG_BOTS_ENV)
-SHORT_HARD_SL_BOTS = _parse_bot_list(_SHORT_BOTS_ENV)
-ALL_HARD_SL_BOTS = LONG_HARD_SL_BOTS | SHORT_HARD_SL_BOTS
-
-# ✅ 阶梯式锁盈参数 (Local Ladder Logic)
-LADDER_START_TRIGGER_PCT = Decimal(os.getenv("HARD_SL_LADDER_START_TRIGGER_PCT", "0.18"))
-LADDER_START_LOCK_PCT = Decimal(os.getenv("HARD_SL_LADDER_START_LOCK_PCT", "0.00"))
-LADDER_STEP_PCT = Decimal(os.getenv("HARD_SL_LADDER_STEP_PCT", "0.20"))
-
-HARD_SL_POLL_INTERVAL = float(os.getenv("HARD_SL_POLL_INTERVAL", "1.5"))
-STATE_FILE = os.getenv("HARD_SL_STATE_FILE", "bot_state.json")
-HARD_SL_SCOPE = os.getenv("HARD_SL_SCOPE", "bot_symbol").lower().strip() # "bot_symbol" or "symbol"
-
-# ------------------------------------------------------------
-# 2. 状态管理 (JSON Persistence for Ladder Logic)
-# ------------------------------------------------------------
-BOT_POSITIONS: Dict[Tuple[str, str], dict] = {}
-_STATE_LOCK = threading.Lock()
-_MONITOR_THREAD_STARTED = False
-_MONITOR_LOCK = threading.Lock()
-
-def _load_state():
-    global BOT_POSITIONS
-    if not os.path.exists(STATE_FILE):
-        return
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        restored = {}
-        for k, v in (raw or {}).items():
-            if "|" not in k or not isinstance(v, dict): continue
-            bot_id, symbol = k.split("|", 1)
-            restored[(bot_id, symbol)] = {
-                "side": v.get("side"),
-                "qty": Decimal(str(v.get("qty", "0"))),
-                "entry_price": Decimal(str(v["entry_price"])) if v.get("entry_price") else None,
-                "ladder_n": int(v.get("ladder_n", -1)),
-                "lock_price": Decimal(str(v["lock_price"])) if v.get("lock_price") else None,
-                "last_update": int(v.get("last_update", 0)),
-            }
-        BOT_POSITIONS = restored
-        print(f"[STATE] loaded {len(BOT_POSITIONS)} records from {STATE_FILE}")
-    except Exception as e:
-        print("[STATE] load error:", e)
-
-def _save_state():
-    try:
-        raw = {}
-        for (bot_id, symbol), pos in BOT_POSITIONS.items():
-            raw[f"{bot_id}|{symbol}"] = {
-                "side": pos.get("side"),
-                "qty": str(pos.get("qty", Decimal("0"))),
-                "entry_price": str(pos["entry_price"]) if pos.get("entry_price") else None,
-                "ladder_n": int(pos.get("ladder_n", -1)),
-                "lock_price": str(pos["lock_price"]) if pos.get("lock_price") else None,
-                "last_update": int(pos.get("last_update", 0)),
-            }
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(raw, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print("[STATE] save error:", e)
-
-def _state_update(key: Tuple[str, str], updater):
-    with _STATE_LOCK:
-        pos = BOT_POSITIONS.get(key) or {}
-        updater(pos)
-        BOT_POSITIONS[key] = pos
-        _save_state()
-
-def _clear_other_bots_same_symbol(symbol: str, current_bot_id: str):
-    sym_u = str(symbol).upper()
-    to_clear = []
-    with _STATE_LOCK:
-        for (bid, sym) in list(BOT_POSITIONS.keys()):
-            if str(sym).upper() != sym_u: continue
-            if bid == current_bot_id: continue
-            if bid in ALL_HARD_SL_BOTS:
-                to_clear.append((bid, sym))
-        for key in to_clear:
-            p = BOT_POSITIONS.get(key) or {}
-            p["qty"] = Decimal("0")
-            p["entry_price"] = None
-            p["ladder_n"] = -1
-            p["lock_price"] = None
-            p["last_update"] = int(time.time())
-            BOT_POSITIONS[key] = p
-        if to_clear:
-            _save_state()
-            print(f"[MIRROR] cleared stale states for symbol={sym_u}: {to_clear}")
-
-# ------------------------------------------------------------
-# 3. 辅助函数
-# ------------------------------------------------------------
 def _require_token() -> bool:
-    if not DASHBOARD_TOKEN: return True
+    if not DASHBOARD_TOKEN:
+        return True
     token = request.args.get("token") or request.headers.get("X-Dashboard-Token")
     return token == DASHBOARD_TOKEN
 
+
+def _parse_bot_list(env_val: str) -> Set[str]:
+    return {b.strip() for b in env_val.split(",") if b.strip()}
+
+# BOT 1-10：做多风控
+LONG_LADDER_BOTS = _parse_bot_list(
+    os.getenv("LONG_LADDER_BOTS", ",".join([f"BOT_{i}" for i in range(1, 11)]))
+)
+
+# BOT 11-20：做空风控
+SHORT_LADDER_BOTS = _parse_bot_list(
+    os.getenv("SHORT_LADDER_BOTS", ",".join([f"BOT_{i}" for i in range(11, 21)]))
+)
+
+# ✅ 基础止损默认 0.5%
+BASE_SL_PCT = Decimal(os.getenv("BASE_SL_PCT", "0.5"))
+
+# 风控轮询间隔
+RISK_POLL_INTERVAL = float(os.getenv("RISK_POLL_INTERVAL", "2.0"))
+
+# 本地 cache（仅辅助）
+BOT_POSITIONS: Dict[Tuple[str, str], dict] = {}
+
+_MONITOR_THREAD_STARTED = False
+_MONITOR_LOCK = threading.Lock()
+
+
+# ----------------------------
+# 预算提取
+# ----------------------------
 def _extract_budget_usdt(body: dict) -> Decimal:
-    size_field = (body.get("position_size_usdt") or body.get("size_usdt") or body.get("size"))
-    if size_field is None: raise ValueError("missing position_size_usdt / size_usdt / size")
+    size_field = (
+        body.get("position_size_usdt")
+        or body.get("size_usdt")
+        or body.get("size")
+    )
+    if size_field is None:
+        raise ValueError("missing position_size_usdt / size_usdt / size")
+
     budget = Decimal(str(size_field))
-    if budget <= 0: raise ValueError("size_usdt must be > 0")
+    if budget <= 0:
+        raise ValueError("size_usdt must be > 0")
     return budget
 
+
+# ----------------------------
+# 预算 -> snapped qty
+# ----------------------------
 def _compute_entry_qty(symbol: str, side: str, budget: Decimal) -> Decimal:
     rules = _get_symbol_rules(symbol)
     min_qty = rules["min_qty"]
+
     ref_price_dec = Decimal(get_market_price(symbol, side, str(min_qty)))
     theoretical_qty = budget / ref_price_dec
     snapped_qty = _snap_quantity(symbol, theoretical_qty)
-    if snapped_qty <= 0: raise ValueError("snapped_qty <= 0")
+
+    if snapped_qty <= 0:
+        raise ValueError(f"snapped_qty <= 0, symbol={symbol}, budget={budget}")
+
     return snapped_qty
+
 
 def _order_status_and_reason(order: dict):
     data = (order or {}).get("data", {}) or {}
     status = str(data.get("status", "")).upper()
-    cancel_reason = str(data.get("cancelReason") or data.get("rejectReason") or data.get("errorMessage") or "")
-    code = (order or {}).get("code")
-    msg = (order or {}).get("msg")
-    if code not in (None, 200, "200") and not cancel_reason:
-        cancel_reason = str(msg or "")
-        if not status: status = "ERROR"
+    cancel_reason = str(
+        data.get("cancelReason")
+        or data.get("rejectReason")
+        or data.get("errorMessage")
+        or ""
+    )
     return status, cancel_reason
 
-def _bot_allows_hard_sl(bot_id: str, side: str) -> bool:
-    side_u = side.upper()
-    if bot_id in LONG_HARD_SL_BOTS: return side_u == "BUY"
-    if bot_id in SHORT_HARD_SL_BOTS: return side_u == "SELL"
+
+# ----------------------------
+# 你的阶梯锁盈规则 (Local Ladder Logic - Original)
+# ----------------------------
+TRIGGER_1 = Decimal("0.18")
+LOCK_1 = Decimal("0.10")
+TRIGGER_2 = Decimal("0.38")
+LOCK_2 = Decimal("0.20")
+STEP = Decimal("0.20")
+
+def _desired_lock_level_pct(pnl_pct: Decimal) -> Decimal:
+    if pnl_pct < TRIGGER_1:
+        return Decimal("0")
+    if pnl_pct < TRIGGER_2:
+        return LOCK_1
+    n = (pnl_pct - TRIGGER_2) // STEP
+    return LOCK_2 + STEP * n
+
+
+def _bot_allows_direction(bot_id: str, direction: str) -> bool:
+    d = direction.upper()
+    if bot_id in LONG_LADDER_BOTS and d == "LONG":
+        return True
+    if bot_id in SHORT_LADDER_BOTS and d == "SHORT":
+        return True
     return False
 
-def _calc_ladder_n(pnl_pct: Decimal) -> int:
-    if pnl_pct < LADDER_START_TRIGGER_PCT: return -1
+
+def _get_current_price(symbol: str, direction: str) -> Optional[Decimal]:
     try:
-        n = int((pnl_pct - LADDER_START_TRIGGER_PCT) // LADDER_STEP_PCT)
-    except Exception:
-        n = 0
-    return max(0, n)
+        rules = _get_symbol_rules(symbol)
+        min_qty = rules["min_qty"]
+        exit_side = "SELL" if direction.upper() == "LONG" else "BUY"
+        px_str = get_market_price(symbol, exit_side, str(min_qty))
+        return Decimal(str(px_str))
+    except Exception as e:
+        print(f"[RISK] get_market_price error symbol={symbol} direction={direction}:", e)
+        return None
 
-def _lock_pct_for_n(n: int) -> Decimal:
-    if n < 0: return Decimal("0")
-    return LADDER_START_LOCK_PCT + LADDER_STEP_PCT * Decimal(n)
 
-# ------------------------------------------------------------
-# 4. 虚拟监控线程 (The Polling Loop) - 来自仓库逻辑
-# ------------------------------------------------------------
-def _monitor_positions_loop():
-    print("[HARD_SL] ladder virtual monitor thread started")
+def _calc_pnl_pct(direction: str, entry_price: Decimal, current_price: Decimal) -> Decimal:
+    if entry_price <= 0:
+        return Decimal("0")
+    if direction.upper() == "LONG":
+        return (current_price - entry_price) * Decimal("100") / entry_price
+    else:
+        return (entry_price - current_price) * Decimal("100") / entry_price
+
+
+def _base_sl_hit(direction: str, entry_price: Decimal, current_price: Decimal) -> bool:
+    pct = BASE_SL_PCT / Decimal("100")
+    if direction.upper() == "LONG":
+        stop_price = entry_price * (Decimal("1") - pct)
+        return current_price <= stop_price
+    else:
+        stop_price = entry_price * (Decimal("1") + pct)
+        return current_price >= stop_price
+
+
+def _lock_hit(direction: str, entry_price: Decimal, current_price: Decimal, lock_level_pct: Decimal) -> bool:
+    if lock_level_pct <= 0:
+        return False
+    pct = lock_level_pct / Decimal("100")
+    if direction.upper() == "LONG":
+        lock_price = entry_price * (Decimal("1") + pct)
+        return current_price <= lock_price
+    else:
+        lock_price = entry_price * (Decimal("1") - pct)
+        return current_price >= lock_price
+
+
+def _execute_virtual_exit(bot_id: str, symbol: str, direction: str, qty: Decimal, reason: str):
+    if qty <= 0:
+        return
+
+    direction_u = direction.upper()
+    entry_side = "BUY" if direction_u == "LONG" else "SELL"
+    exit_side = "SELL" if direction_u == "LONG" else "BUY"
+
+    exit_price = _get_current_price(symbol, direction_u)
+    if exit_price is None:
+        print(f"[RISK] skip exit due to no price bot={bot_id} symbol={symbol}")
+        return
+
+    print(
+        f"[RISK] EXIT bot={bot_id} symbol={symbol} direction={direction_u} "
+        f"qty={qty} reason={reason}"
+    )
+
+    try:
+        order = create_market_order(
+            symbol=symbol,
+            side=exit_side,
+            size=str(qty),
+            reduce_only=True,
+            client_id=None,
+        )
+        status, cancel_reason = _order_status_and_reason(order)
+        print(f"[RISK] exit order status={status} cancelReason={cancel_reason!r}")
+
+        if status in ("CANCELED", "REJECTED"):
+            return
+
+        # ✅ FIFO 记账，仅扣该 bot 自己的 lots
+        try:
+            record_exit_fifo(
+                bot_id=bot_id,
+                symbol=symbol,
+                entry_side=entry_side,
+                exit_qty=qty,
+                exit_price=exit_price,
+                reason=reason,
+            )
+        except Exception as e:
+            print("[PNL] record_exit_fifo error (risk):", e)
+
+        # 清理锁盈状态
+        try:
+            clear_lock_level_pct(bot_id, symbol, direction_u)
+        except Exception:
+            pass
+
+        # 本地 cache 清理（非真相源）
+        key = (bot_id, symbol)
+        pos = BOT_POSITIONS.get(key)
+        if pos:
+            pos_qty = Decimal(str(pos.get("qty") or "0"))
+            new_qty = pos_qty - qty
+            if new_qty < 0:
+                new_qty = Decimal("0")
+            pos["qty"] = new_qty
+            if new_qty == 0:
+                pos["entry_price"] = None
+
+    except Exception as e:
+        print(f"[RISK] create_market_order error bot={bot_id} symbol={symbol}:", e)
+
+
+def _risk_loop():
+    print("[RISK] ladder/baseSL thread started (using The Polling Loop)")
     while True:
         try:
-            with _STATE_LOCK:
-                items = list(BOT_POSITIONS.items())
+            bots = sorted(list(LONG_LADDER_BOTS | SHORT_LADDER_BOTS))
 
-            for (bot_id, symbol), pos in items:
-                if bot_id not in ALL_HARD_SL_BOTS: continue
+            for bot_id in bots:
+                opens = get_bot_open_positions(bot_id)
 
-                side = str(pos.get("side") or "").upper()
-                qty = pos.get("qty") or Decimal("0")
-                entry_price = pos.get("entry_price")
-                ladder_n = int(pos.get("ladder_n", -1))
-                lock_price_state = pos.get("lock_price")
+                for (symbol, direction), v in opens.items():
+                    direction_u = direction.upper()
 
-                if not _bot_allows_hard_sl(bot_id, side): continue
+                    if not _bot_allows_direction(bot_id, direction_u):
+                        continue
 
-                # Remote fallback check
-                remote = get_open_position_for_symbol(symbol)
-                remote_qty = remote["size"] if remote else Decimal("0")
-                remote_side = str(remote["side"]).upper() if remote else None
-                remote_entry = remote.get("entryPrice") if remote else None
+                    qty = v["qty"]
+                    entry_price = v["weighted_entry"]
 
-                # Patch missing local state from remote
-                if entry_price is None and remote_entry and remote_qty > 0:
-                    def _patch(p):
-                        if not p.get("side"): p["side"] = "BUY" if remote_side == "LONG" else "SELL"
-                        if _bot_allows_hard_sl(bot_id, p["side"]):
-                            p["entry_price"] = remote_entry
-                            if (p.get("qty") or Decimal("0")) <= 0: p["qty"] = remote_qty
-                            if "ladder_n" not in p: p["ladder_n"] = -1
-                            p["last_update"] = int(time.time())
-                    _state_update((bot_id, symbol), _patch)
-                    
-                    pos = BOT_POSITIONS.get((bot_id, symbol), {})
-                    side = str(pos.get("side") or "").upper()
-                    qty = pos.get("qty") or Decimal("0")
-                    entry_price = pos.get("entry_price")
-                    ladder_n = int(pos.get("ladder_n", -1))
-                    lock_price_state = pos.get("lock_price")
+                    if qty <= 0 or entry_price <= 0:
+                        continue
 
-                if side not in ("BUY", "SELL") or qty <= 0 or entry_price is None:
-                    continue
+                    current_price = _get_current_price(symbol, direction_u)
+                    if current_price is None:
+                        continue
 
-                # Get Current Price
-                try:
-                    rules = _get_symbol_rules(symbol)
-                    min_qty = rules["min_qty"]
-                    exit_side_for_quote = "SELL" if side == "BUY" else "BUY"
-                    px_str = get_market_price(symbol, exit_side_for_quote, str(min_qty))
-                    current_price = Decimal(px_str)
-                except Exception as e:
-                    print(f"[HARD_SL] get_market_price error bot={bot_id} symbol={symbol}:", e)
-                    continue
+                    pnl_pct = _calc_pnl_pct(direction_u, entry_price, current_price)
 
-                # Compute PnL %
-                if side == "BUY":
-                    pnl_pct = (current_price - entry_price) * Decimal("100") / entry_price
-                else:
-                    pnl_pct = (entry_price - current_price) * Decimal("100") / entry_price
+                    # 1) 基础止损优先（默认 0.5%）
+                    if _base_sl_hit(direction_u, entry_price, current_price):
+                        _execute_virtual_exit(
+                            bot_id=bot_id,
+                            symbol=symbol,
+                            direction=direction_u,
+                            qty=qty,
+                            reason="base_sl_exit",
+                        )
+                        continue
 
-                # Determine target ladder level
-                target_n = _calc_ladder_n(pnl_pct)
+                    # 2) 计算目标锁盈档位 (Local Ladder Logic)
+                    desired_lock = _desired_lock_level_pct(pnl_pct)
+                    current_lock = get_lock_level_pct(bot_id, symbol, direction_u)
 
-                # Upgrade Level
-                if target_n > ladder_n:
-                    lock_pct = _lock_pct_for_n(target_n)
-                    if side == "BUY":
-                        new_lock_price = entry_price * (Decimal("1") + lock_pct / Decimal("100"))
-                    else:
-                        new_lock_price = entry_price * (Decimal("1") - lock_pct / Decimal("100"))
+                    if desired_lock > current_lock:
+                        set_lock_level_pct(bot_id, symbol, direction_u, desired_lock)
+                        current_lock = desired_lock
+                        print(
+                            f"[RISK] LOCK UP bot={bot_id} symbol={symbol} direction={direction_u} "
+                            f"pnl={pnl_pct:.4f}% lock_level={current_lock}%"
+                        )
 
-                    def _upgrade(p):
-                        p["ladder_n"] = target_n
-                        p["lock_price"] = new_lock_price
-                        p["last_update"] = int(time.time())
-                    _state_update((bot_id, symbol), _upgrade)
-
-                    print(f"[HARD_SL] LADDER UP bot={bot_id} symbol={symbol} side={side} pnl={pnl_pct:.4f}% -> n={target_n} lock_price={new_lock_price}")
-                    lock_price_state = new_lock_price
-                    ladder_n = target_n
-
-                if ladder_n < 0 or lock_price_state is None:
-                    continue
-
-                # Check lock hit
-                lock_hit = (current_price <= lock_price_state) if side == "BUY" else (current_price >= lock_price_state)
-
-                if lock_hit:
-                    # Decide close qty
-                    close_qty = qty
-                    if remote_qty > 0:
-                        close_qty = remote_qty if HARD_SL_SCOPE == "symbol" else min(qty, remote_qty)
-
-                    if close_qty > 0:
-                        exit_side = "SELL" if side == "BUY" else "BUY"
-                        print(f"[HARD_SL] TRIGGER EXIT bot={bot_id} symbol={symbol} qty={close_qty} lock_price={lock_price_state} curr={current_price}")
-                        
-                        try:
-                            order = create_market_order(symbol=symbol, side=exit_side, size=str(close_qty), reduce_only=True)
-                            status, cancel_reason = _order_status_and_reason(order)
-                            if status not in ("CANCELED", "REJECTED", "ERROR", "EXPIRED"):
-                                # Clear state
-                                def _clear(p):
-                                    p["qty"] = Decimal("0")
-                                    p["entry_price"] = None
-                                    p["ladder_n"] = -1
-                                    p["lock_price"] = None
-                                    p["last_update"] = int(time.time())
-                                _state_update((bot_id, symbol), _clear)
-                                
-                                # Record Exit PnL
-                                try:
-                                    record_exit_fifo(bot_id, symbol, side, close_qty, current_price, reason="ladder_lock_exit")
-                                except Exception as e:
-                                    print("[PNL] record_exit_fifo error:", e)
-                                    
-                        except Exception as e:
-                            print(f"[HARD_SL] execution error:", e)
+                    # 3) 锁盈触发
+                    if _lock_hit(direction_u, entry_price, current_price, current_lock):
+                        _execute_virtual_exit(
+                            bot_id=bot_id,
+                            symbol=symbol,
+                            direction=direction_u,
+                            qty=qty,
+                            reason="ladder_lock_exit",
+                        )
 
         except Exception as e:
-            print("[HARD_SL] monitor top-level error:", e)
-        
-        time.sleep(HARD_SL_POLL_INTERVAL)
+            print("[RISK] loop top-level error:", e)
+
+        time.sleep(RISK_POLL_INTERVAL)
+
 
 def _ensure_monitor_thread():
     global _MONITOR_THREAD_STARTED
     with _MONITOR_LOCK:
         if not _MONITOR_THREAD_STARTED:
             init_db()
-            _load_state()
-            t = threading.Thread(target=_monitor_positions_loop, daemon=True)
+            t = threading.Thread(target=_risk_loop, daemon=True)
             t.start()
             _MONITOR_THREAD_STARTED = True
-            print("[HARD_SL] ladder virtual monitor thread created")
+            print("[RISK] thread created")
 
-# ------------------------------------------------------------
-# 5. Web Routes & Dashboard
-# ------------------------------------------------------------
+
 @app.route("/", methods=["GET"])
 def index():
     _ensure_monitor_thread()
     return "OK", 200
 
+
+# ----------------------------
+# PnL API（给手机/电脑看）
+# ----------------------------
 @app.route("/api/pnl", methods=["GET"])
 def api_pnl():
-    if not _require_token(): return jsonify({"error": "forbidden"}), 403
+    if not _require_token():
+        return jsonify({"error": "forbidden"}), 403
+
     _ensure_monitor_thread()
+
     bots = list_bots_with_activity()
-    if request.args.get("bot_id"):
-        bots = [b for b in bots if b == request.args.get("bot_id")]
-    
+    only_bot = request.args.get("bot_id")
+    if only_bot:
+        bots = [b for b in bots if b == only_bot]
+
     out = []
     for bot_id in bots:
         base = get_bot_summary(bot_id)
-        # Use DB opens for PnL report
         opens = get_bot_open_positions(bot_id)
+
         unrealized = Decimal("0")
         open_rows = []
+
         for (symbol, direction), v in opens.items():
             qty = v["qty"]
             wentry = v["weighted_entry"]
-            if qty <= 0: continue
-            px_str = get_market_price(symbol, "SELL" if direction == "LONG" else "BUY", "0.01") # approx check
-            px = Decimal(px_str)
-            if direction == "LONG":
+            if qty <= 0:
+                continue
+
+            px = _get_current_price(symbol, direction)
+            if px is None:
+                continue
+
+            if direction.upper() == "LONG":
                 unrealized += (px - wentry) * qty
             else:
                 unrealized += (wentry - px) * qty
-            open_rows.append({"symbol": symbol, "direction": direction, "qty": str(qty), "weighted_entry": str(wentry), "mark_price": str(px)})
-        base.update({"unrealized": str(unrealized), "open_positions": open_rows})
+
+            open_rows.append({
+                "symbol": symbol,
+                "direction": direction.upper(),
+                "qty": str(qty),
+                "weighted_entry": str(wentry),
+                "mark_price": str(px),
+            })
+
+        base.update({
+            "unrealized": str(unrealized),
+            "open_positions": open_rows,
+        })
         out.append(base)
-    
+
+    # 默认按总已实现排序
+    def _rt(x):
+        try:
+            return Decimal(str(x.get("realized_total", "0")))
+        except Exception:
+            return Decimal("0")
+
+    out.sort(key=_rt, reverse=True)
+
     return jsonify({"ts": int(time.time()), "bots": out}), 200
 
+
+# ----------------------------
+# 简易 dashboard（可选）
+# ----------------------------
 @app.route("/dashboard", methods=["GET"])
 def dashboard():
-    if not _require_token(): return Response("Forbidden", status=403)
+    if not _require_token():
+        return Response("Forbidden", status=403)
+
     _ensure_monitor_thread()
-    # Preserving Original Dashboard HTML structure
-    html = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8" />
-<title>Bot PnL Dashboard</title>
-<style>:root{--bg:#0b0f14;--card:#111826;--muted:#9aa4b2;--text:#eef2f7;--good:#22c55e;--bad:#ef4444;}
-body{margin:0;font-family:system-ui;background:var(--bg);color:var(--text);}
-.card{background:var(--card);border:1px solid #1c2a44;border-radius:16px;padding:14px;margin:10px;}
-table{width:100%;border-collapse:collapse;} th,td{padding:8px;border-bottom:1px solid #1b2538;}
-.good{color:var(--good);} .bad{color:var(--bad);}
-</style></head><body><div style="padding:20px;"><h1>Dashboard</h1><div id="cards">Loading...</div></div>
+
+    html = """
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Bot PnL Dashboard</title>
+  <style>
+    :root { --bg:#0b0f14; --card:#111826; --muted:#9aa4b2; --text:#eef2f7; --good:#22c55e; --bad:#ef4444; }
+    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "PingFang SC", "Noto Sans CJK SC"; background:var(--bg); color:var(--text); }
+    header { padding:16px 20px; border-bottom:1px solid #1d2636; display:flex; gap:12px; align-items:center; justify-content:space-between; }
+    h1 { font-size:18px; margin:0; }
+    .muted { color:var(--muted); font-size:12px; }
+    .wrap { padding:16px; max-width:1100px; margin:0 auto; }
+    .controls { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px; }
+    input, select, button {
+      background:#0f1624; border:1px solid #22304a; color:var(--text);
+      padding:8px 10px; border-radius:10px; font-size:12px;
+    }
+    button { cursor:pointer; }
+    .grid { display:grid; grid-template-columns: repeat(12, 1fr); gap:12px; }
+    .card { background:var(--card); border:1px solid #1c2a44; border-radius:16px; padding:14px; grid-column: span 6; }
+    .card.full { grid-column: span 12; }
+    @media (max-width: 900px) { .card { grid-column: span 12; } }
+    .row { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+    .bot { font-size:14px; font-weight:600; }
+    .pill { font-size:10px; padding:2px 8px; background:#0b1220; border:1px solid #23324f; border-radius:999px; color:var(--muted); }
+    .num { font-variant-numeric: tabular-nums; }
+    .good { color:var(--good); }
+    .bad { color:var(--bad); }
+    table { width:100%; border-collapse: collapse; margin-top:10px; }
+    th, td { text-align:left; font-size:11px; padding:8px 6px; border-bottom:1px solid #1b2538; color:var(--text); }
+    th { color:var(--muted); font-weight:500; }
+    .small { font-size:10px; color:var(--muted); }
+    .group { display:flex; gap:8px; flex-wrap:wrap; }
+  </style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Bot PnL Dashboard</h1>
+    <div class="muted">独立 lots 记账 · 真实成交价优先 · 基础止损默认 0.5% · 阶梯锁盈</div>
+  </div>
+  <div class="muted" id="lastUpdate">Loading...</div>
+</header>
+
+<div class="wrap">
+  <div class="controls">
+    <button onclick="refresh()">刷新</button>
+    <select id="sortBy" onchange="render()">
+      <option value="realized_total">按总已实现</option>
+      <option value="realized_day">按24h已实现</option>
+      <option value="realized_week">按7d已实现</option>
+      <option value="unrealized">按未实现</option>
+      <option value="trades_count">按交易次数</option>
+    </select>
+    <input id="filter" placeholder="过滤 BOT_1..." oninput="render()" />
+  </div>
+
+  <div class="grid">
+    <div class="card full">
+      <div class="row">
+        <div class="group">
+          <span class="pill">BOT 1-10: LONG 阶梯锁盈 + 基础SL(0.5%)</span>
+          <span class="pill">BOT 11-20: SHORT 阶梯锁盈 + 基础SL(0.5%)</span>
+          <span class="pill">Others: Strategy-only</span>
+        </div>
+        <div class="small">数据来自 /api/pnl</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="grid" id="cards"></div>
+</div>
+
 <script>
-async function refresh(){
-  const res = await fetch("/api/pnl"+window.location.search);
-  const data = await res.json();
-  let h = "";
-  for(let b of data.bots){
-     h += `<div class="card"><h3>${b.bot_id}</h3>
-     <p>Total Realized: <span class="${Number(b.realized_total)>0?'good':'bad'}">${b.realized_total}</span></p>
-     <p>Unrealized: ${b.unrealized}</p>
-     <table><tr><th>Sym</th><th>Dir</th><th>Qty</th><th>Entry</th></tr>
-     ${b.open_positions.map(p=>`<tr><td>${p.symbol}</td><td>${p.direction}</td><td>${p.qty}</td><td>${p.weighted_entry}</td></tr>`).join('')}
-     </table></div>`;
-  }
-  document.getElementById("cards").innerHTML = h;
+let DATA = [];
+
+function numClass(v) {
+  const n = Number(v);
+  if (isNaN(n) || n === 0) return "num";
+  return n > 0 ? "num good" : "num bad";
 }
-refresh(); setInterval(refresh, 15000);
-</script></body></html>"""
+
+function pickSort(a, b, key) {
+  const av = Number(a[key] ?? 0);
+  const bv = Number(b[key] ?? 0);
+  return bv - av;
+}
+
+function render() {
+  const key = document.getElementById("sortBy").value;
+  const f = (document.getElementById("filter").value || "").trim().toUpperCase();
+
+  let arr = [...DATA];
+  if (f) arr = arr.filter(x => String(x.bot_id || "").toUpperCase().includes(f));
+  arr.sort((a, b) => pickSort(a, b, key));
+
+  const root = document.getElementById("cards");
+  root.innerHTML = "";
+
+  for (const b of arr) {
+    const bot = b.bot_id;
+    const realized_total = b.realized_total ?? "0";
+    const realized_day = b.realized_day ?? "0";
+    const realized_week = b.realized_week ?? "0";
+    const unrealized = b.unrealized ?? "0";
+    const trades = b.trades_count ?? 0;
+    const open = b.open_positions || [];
+
+    const div = document.createElement("div");
+    div.className = "card";
+
+    div.innerHTML = `
+      <div class="row">
+        <div class="row" style="gap:8px;">
+          <span class="bot">${bot}</span>
+          <span class="pill">active</span>
+        </div>
+        <span class="small">Trades: <span class="num">${trades}</span></span>
+      </div>
+
+      <table>
+        <thead>
+          <tr>
+            <th>24h 已实现</th>
+            <th>7d 已实现</th>
+            <th>总已实现</th>
+            <th>未实现</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="${numClass(realized_day)}">${realized_day}</td>
+            <td class="${numClass(realized_week)}">${realized_week}</td>
+            <td class="${numClass(realized_total)}">${realized_total}</td>
+            <td class="${numClass(unrealized)}">${unrealized}</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="small" style="margin-top:8px;">Open lots</div>
+      <table>
+        <thead>
+          <tr>
+            <th>Symbol</th>
+            <th>Dir</th>
+            <th>Qty</th>
+            <th>W.Entry</th>
+            <th>Mark</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${
+            open.length === 0
+              ? `<tr><td colspan="5" class="small">No open lots</td></tr>`
+              : open.map(p => `
+                <tr>
+                  <td>${p.symbol}</td>
+                  <td>${p.direction}</td>
+                  <td class="num">${p.qty}</td>
+                  <td class="num">${p.weighted_entry}</td>
+                  <td class="num">${p.mark_price}</td>
+                </tr>
+              `).join("")
+          }
+        </tbody>
+      </table>
+    `;
+
+    root.appendChild(div);
+  }
+}
+
+async function refresh() {
+  try {
+    const url = new URL("/api/pnl", window.location.origin);
+    const t = new URLSearchParams(window.location.search).get("token");
+    if (t) url.searchParams.set("token", t);
+
+    const res = await fetch(url.toString());
+    const js = await res.json();
+    DATA = js.bots || [];
+    document.getElementById("lastUpdate").textContent =
+      "Updated: " + new Date((js.ts || Date.now()/1000) * 1000).toLocaleString();
+    render();
+  } catch (e) {
+    document.getElementById("lastUpdate").textContent = "Load error";
+    console.error(e);
+  }
+}
+
+refresh();
+setInterval(refresh, 15000);
+</script>
+</body>
+</html>
+    """
     return Response(html, mimetype="text/html")
+
 
 @app.route("/webhook", methods=["POST"])
 def tv_webhook():
     _ensure_monitor_thread()
+
+    # 1) parse json
     try:
         body = request.get_json(force=True, silent=False)
     except Exception as e:
+        print("[WEBHOOK] invalid json:", e)
         return "invalid json", 400
-    
-    if WEBHOOK_SECRET and body.get("secret") != WEBHOOK_SECRET:
-        return "forbidden", 403
+
+    print("[WEBHOOK] raw body:", body)
+
+    if not isinstance(body, dict):
+        return "bad payload", 400
+
+    # 2) secret check
+    if WEBHOOK_SECRET:
+        if body.get("secret") != WEBHOOK_SECRET:
+            print("[WEBHOOK] invalid secret")
+            return "forbidden", 403
 
     symbol = body.get("symbol")
-    if not symbol: return "missing symbol", 400
+    if not symbol:
+        return "missing symbol", 400
 
     bot_id = str(body.get("bot_id", "BOT_1"))
     side_raw = str(body.get("side", "")).upper()
@@ -415,107 +642,258 @@ def tv_webhook():
     action_raw = str(body.get("action", "")).lower()
     tv_client_id = body.get("client_id")
 
-    mode = None
-    if signal_type_raw in ("entry", "open") or action_raw in ("open", "entry"): mode = "entry"
-    elif signal_type_raw.startswith("exit") or action_raw in ("close", "exit"): mode = "exit"
+    # 3) mode
+    mode: Optional[str] = None
+    if signal_type_raw in ("entry", "open"):
+        mode = "entry"
+    elif signal_type_raw.startswith("exit"):
+        mode = "exit"
+    else:
+        if action_raw in ("open", "entry"):
+            mode = "entry"
+        elif action_raw in ("close", "exit"):
+            mode = "exit"
 
+    if mode is None:
+        return "missing or invalid signal_type / action", 400
+
+    # -------------------------
+    # ENTRY
+    # -------------------------
     if mode == "entry":
-        if side_raw not in ("BUY", "SELL"): return "invalid side", 400
+        if side_raw not in ("BUY", "SELL"):
+            return "missing or invalid side", 400
+
         try:
             budget = _extract_budget_usdt(body)
-            snapped_qty = _compute_entry_qty(symbol, side_raw, budget)
         except Exception as e:
+            print("[ENTRY] budget error:", e)
             return str(e), 400
 
-        # Execute
         try:
-            order = create_market_order(symbol=symbol, side=side_raw, size=str(snapped_qty), client_id=tv_client_id)
+            snapped_qty = _compute_entry_qty(symbol, side_raw, budget)
         except Exception as e:
-            print("[ENTRY] order error:", e)
-            return "order error", 500
-        
-        status, cancel_reason = _order_status_and_reason(order)
-        if status in ("REJECTED", "ERROR"):
-            return jsonify({"status": "failed", "reason": cancel_reason}), 200
+            print("[ENTRY] qty compute error:", e)
+            return "qty compute error", 500
 
-        # ✅ 关键：获取真实价格 (Real Executable Price) 并写库
+        size_str = str(snapped_qty)
+        print(
+            f"[ENTRY] bot={bot_id} symbol={symbol} side={side_raw} "
+            f"budget={budget} -> qty={size_str}"
+        )
+
+        try:
+            order = create_market_order(
+                symbol=symbol,
+                side=side_raw,
+                size=size_str,
+                reduce_only=False,
+                client_id=tv_client_id,
+            )
+        except Exception as e:
+            print("[ENTRY] create_market_order error:", e)
+            return "order error", 500
+
+        status, cancel_reason = _order_status_and_reason(order)
+        print(f"[ENTRY] order status={status} cancelReason={cancel_reason!r}")
+
+        if status in ("CANCELED", "REJECTED"):
+            return jsonify({
+                "status": "order_rejected",
+                "mode": "entry",
+                "bot_id": bot_id,
+                "symbol": symbol,
+                "side": side_raw,
+                "request_qty": size_str,
+                "order_status": status,
+                "cancel_reason": cancel_reason,
+            }), 200
+
+        # ✅ 4) 仓库核心逻辑植入：真实成交价优先 (Real Executable Price)
+        computed = (order or {}).get("computed") or {}
+        fallback_price_str = computed.get("price")
+
         order_id = order.get("order_id")
-        entry_price_dec = None
+        client_order_id = order.get("client_order_id")
+
+        entry_price_dec: Optional[Decimal] = None
         final_qty = snapped_qty
 
         try:
-            fill = get_fill_summary(symbol=symbol, order_id=order_id)
+            # 强制尝试获取真实成交
+            fill = get_fill_summary(
+                symbol=symbol,
+                order_id=order_id,
+                client_order_id=client_order_id,
+                max_wait_sec=float(os.getenv("FILL_MAX_WAIT_SEC", "2.0")),
+                poll_interval=float(os.getenv("FILL_POLL_INTERVAL", "0.25")),
+            )
             entry_price_dec = Decimal(str(fill["avg_fill_price"]))
             final_qty = Decimal(str(fill["filled_qty"]))
+            print(
+                f"[ENTRY] fill ok bot={bot_id} symbol={symbol} "
+                f"filled_qty={final_qty} avg_fill={entry_price_dec}"
+            )
         except Exception as e:
-            print("[ENTRY] fill fetch failed, using computed:", e)
-            # Fallback
-            comp = (order or {}).get("computed") or {}
-            if comp.get("price"): entry_price_dec = Decimal(str(comp["price"]))
+            # 无法拿到 fills → 回退 worst price 参考价
+            print(f"[ENTRY] fill fallback bot={bot_id} symbol={symbol} err:", e)
+            try:
+                if fallback_price_str is not None:
+                    entry_price_dec = Decimal(str(fallback_price_str))
+            except Exception:
+                entry_price_dec = None
 
-        # DB Record
-        if entry_price_dec:
-            record_entry(bot_id, symbol, side_raw, final_qty, entry_price_dec, reason="strategy_entry")
-
-        # Update Ladder State
-        def _set_entry(p):
-            p["side"] = side_raw
-            p["qty"] = final_qty
-            p["entry_price"] = entry_price_dec
-            p["ladder_n"] = -1
-            p["lock_price"] = None
-            p["last_update"] = int(time.time())
-        _state_update((bot_id, symbol), _set_entry)
-        _clear_other_bots_same_symbol(symbol, bot_id)
-
-        return jsonify({"status": "ok", "mode": "entry", "qty": str(final_qty), "price": str(entry_price_dec)}), 200
-
-    if mode == "exit":
-        # Check local state first, then DB
+        # 本地 cache 辅助
         key = (bot_id, symbol)
-        pos = BOT_POSITIONS.get(key) or {}
-        local_qty = pos.get("qty", Decimal("0"))
-        local_side = str(pos.get("side") or "").upper()
-        
-        # Determine exit side
-        if local_qty > 0:
-            exit_side = "SELL" if local_side == "BUY" else "BUY"
-            close_qty = local_qty
-        else:
-            # Fallback to remote check if local state empty
+        BOT_POSITIONS[key] = {
+            "side": side_raw,
+            "qty": final_qty,
+            "entry_price": entry_price_dec,
+        }
+
+        # ✅ 独立 lots 记账
+        if entry_price_dec is not None and final_qty > 0:
+            try:
+                record_entry(
+                    bot_id=bot_id,
+                    symbol=symbol,
+                    side=side_raw,
+                    qty=final_qty,
+                    price=entry_price_dec,
+                    reason="strategy_entry_fill" if order_id else "strategy_entry",
+                )
+            except Exception as e:
+                print("[PNL] record_entry error:", e)
+
+        return jsonify({
+            "status": "ok",
+            "mode": "entry",
+            "bot_id": bot_id,
+            "symbol": symbol,
+            "side": side_raw,
+            "qty": str(final_qty),
+            "entry_price": str(entry_price_dec) if entry_price_dec else None,
+            "requested_qty": size_str,
+            "order_status": status,
+            "cancel_reason": cancel_reason,
+            "order_id": order_id,
+        }), 200
+
+    # -------------------------
+    # EXIT（策略出场）
+    # 以 lots 为准，裁剪只平本 bot
+    # -------------------------
+    if mode == "exit":
+        opens = get_bot_open_positions(bot_id)
+
+        long_key = (symbol, "LONG")
+        short_key = (symbol, "SHORT")
+
+        long_qty = opens.get(long_key, {}).get("qty", Decimal("0"))
+        short_qty = opens.get(short_key, {}).get("qty", Decimal("0"))
+
+        # 优先按本地 side 推断方向
+        key_local = (bot_id, symbol)
+        local = BOT_POSITIONS.get(key_local)
+        preferred = "LONG"
+        if local and str(local.get("side", "")).upper() == "SELL":
+            preferred = "SHORT"
+
+        direction_to_close = None
+        qty_to_close = Decimal("0")
+
+        if preferred == "LONG" and long_qty > 0:
+            direction_to_close, qty_to_close = "LONG", long_qty
+        elif preferred == "SHORT" and short_qty > 0:
+            direction_to_close, qty_to_close = "SHORT", short_qty
+        elif long_qty > 0:
+            direction_to_close, qty_to_close = "LONG", long_qty
+        elif short_qty > 0:
+            direction_to_close, qty_to_close = "SHORT", short_qty
+
+        # ✅ 仓库核心逻辑植入：若本地无持仓，尝试远程查询兜底
+        if not direction_to_close or qty_to_close <= 0:
+            print(f"[EXIT] local 0 position, trying remote fallback for {symbol}...")
             remote = get_open_position_for_symbol(symbol)
             if remote and remote["size"] > 0:
-                close_qty = remote["size"]
-                exit_side = map_position_side_to_exit_order_side(remote["side"])
+                direction_to_close = remote["side"] # LONG/SHORT
+                qty_to_close = remote["size"]
+                print(f"[EXIT] remote fallback found: {direction_to_close} {qty_to_close}")
             else:
+                print(f"[EXIT] bot={bot_id} symbol={symbol}: no position to close (local+remote)")
                 return jsonify({"status": "no_position"}), 200
 
+        entry_side = "BUY" if direction_to_close == "LONG" else "SELL"
+        exit_side = "SELL" if direction_to_close == "LONG" else "BUY"
+
+        print(
+            f"[EXIT] bot={bot_id} symbol={symbol} direction={direction_to_close} "
+            f"qty={qty_to_close} -> exit_side={exit_side}"
+        )
+
         try:
-            order = create_market_order(symbol=symbol, side=exit_side, size=str(close_qty), reduce_only=True, client_id=tv_client_id)
+            order = create_market_order(
+                symbol=symbol,
+                side=exit_side,
+                size=str(qty_to_close),
+                reduce_only=True,
+                client_id=tv_client_id,
+            )
         except Exception as e:
+            print("[EXIT] create_market_order error:", e)
             return "order error", 500
 
         status, cancel_reason = _order_status_and_reason(order)
-        if status not in ("CANCELED", "REJECTED", "ERROR"):
-            # Clear Ladder State
-            def _clear(p):
-                p["qty"] = Decimal("0")
-                p["entry_price"] = None
-                p["ladder_n"] = -1
-                p["lock_price"] = None
-                p["last_update"] = int(time.time())
-            _state_update(key, _clear)
+        print(f"[EXIT] order status={status} cancelReason={cancel_reason!r}")
 
-            # Record Exit PnL (Use worst price as proxy if lazy, or fetch fills again)
-            try:
-                px = get_market_price(symbol, "SELL" if exit_side=="BUY" else "BUY", "0.01")
-                record_exit_fifo(bot_id, symbol, "BUY" if exit_side=="SELL" else "SELL", close_qty, Decimal(px), reason="strategy_exit")
-            except Exception:
-                pass
+        if status in ("CANCELED", "REJECTED"):
+            return jsonify({
+                "status": "exit_rejected",
+                "mode": "exit",
+                "bot_id": bot_id,
+                "symbol": symbol,
+                "exit_side": exit_side,
+                "requested_qty": str(qty_to_close),
+                "order_status": status,
+                "cancel_reason": cancel_reason,
+            }), 200
 
-        return jsonify({"status": "ok", "mode": "exit", "qty": str(close_qty)}), 200
+        exit_price = _get_current_price(symbol, direction_to_close) or Decimal("0")
+
+        try:
+            record_exit_fifo(
+                bot_id=bot_id,
+                symbol=symbol,
+                entry_side=entry_side,
+                exit_qty=qty_to_close,
+                exit_price=exit_price,
+                reason="strategy_exit",
+            )
+        except Exception as e:
+            print("[PNL] record_exit_fifo error (strategy):", e)
+
+        try:
+            clear_lock_level_pct(bot_id, symbol, direction_to_close)
+        except Exception:
+            pass
+
+        if key_local in BOT_POSITIONS:
+            BOT_POSITIONS[key_local]["qty"] = Decimal("0")
+            BOT_POSITIONS[key_local]["entry_price"] = None
+
+        return jsonify({
+            "status": "ok",
+            "mode": "exit",
+            "bot_id": bot_id,
+            "symbol": symbol,
+            "exit_side": exit_side,
+            "closed_qty": str(qty_to_close),
+            "order_status": status,
+            "cancel_reason": cancel_reason,
+        }), 200
 
     return "unsupported mode", 400
+
 
 if __name__ == "__main__":
     _ensure_monitor_thread()
