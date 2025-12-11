@@ -5,6 +5,8 @@ from decimal import Decimal, ROUND_DOWN
 from typing import Dict, Any, Optional, Union, Tuple
 
 from apexomni.http_private_sign import HttpPrivateSign
+# ✅ 确保引入 HttpPrivate_v3，这是我们确认可用的
+from apexomni.http_private_v3 import HttpPrivate_v3
 from apexomni.constants import (
     APEX_OMNI_HTTP_MAIN,
     APEX_OMNI_HTTP_TEST,
@@ -132,8 +134,7 @@ def get_market_price(symbol: str, side: str, size: str) -> str:
     base_url, network_id = _get_base_and_network()
     api_creds = _get_api_credentials()
 
-    from apexomni.http_private_v3 import HttpPrivate_v3
-
+    # 这里复用已知的 HttpPrivate_v3
     http_v3_client = HttpPrivate_v3(
         base_url,
         network_id=network_id,
@@ -166,18 +167,22 @@ def get_market_price(symbol: str, side: str, size: str) -> str:
 
 def get_ticker_price(symbol: str) -> str:
     """
-    【新增函数】获取市场标记价格 (Oracle Price) 或 最新成交价 (Last Price)。
-    用于风控监控，避免因为滑点导致提前止损。
+    【修复版】获取市场标记价格 (Oracle Price) 或 最新成交价 (Last Price)。
+    这里改为使用 HttpPrivate_v3，因为它肯定存在（get_market_price 在用它）。
     """
     base_url, network_id = _get_base_and_network()
+    api_creds = _get_api_credentials()
     
-    # 这里使用 Public Client 即可
-    from apexomni.http_public_v3 import HttpPublic_v3
-    
-    http_public = HttpPublic_v3(base_url, network_id=network_id)
+    # ✅ 改动点：直接实例化 Private 客户端，避免 import 错误的 public 模块
+    http_client = HttpPrivate_v3(
+        base_url, 
+        network_id=network_id,
+        api_key_credentials=api_creds
+    )
     
     # 获取 Ticker
-    res = http_public.get_tickers_v3(symbol=symbol)
+    # get_tickers_v3 通常是通用的，即使是 private client 也能调
+    res = http_client.get_tickers_v3(symbol=symbol)
     
     price = None
     
