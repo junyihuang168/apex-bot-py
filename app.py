@@ -9,8 +9,8 @@ from flask import Flask, request, jsonify, Response
 from apex_client import (
     create_market_order,
     get_market_price,
-    get_fill_summary,              # ✅ 新增：仓库逻辑-真实成交回写
-    get_open_position_for_symbol,  # ✅ 新增：仓库逻辑-远程查仓
+    get_fill_summary,              # ✅ 仓库逻辑：真实成交回写
+    get_open_position_for_symbol,  # ✅ 仓库逻辑：远程查仓
     map_position_side_to_exit_order_side,
     _get_symbol_rules,
     _snap_quantity,
@@ -116,7 +116,7 @@ def _order_status_and_reason(order: dict):
 
 
 # ----------------------------
-# 你的阶梯锁盈规则 (Local Ladder Logic - Original)
+# 你的阶梯锁盈规则
 # ----------------------------
 TRIGGER_1 = Decimal("0.18")
 LOCK_1 = Decimal("0.10")
@@ -147,6 +147,7 @@ def _get_current_price(symbol: str, direction: str) -> Optional[Decimal]:
         rules = _get_symbol_rules(symbol)
         min_qty = rules["min_qty"]
         exit_side = "SELL" if direction.upper() == "LONG" else "BUY"
+        # ✅ 这里调用的是 apex_client 的 get_market_price，即“真实可执行价格”
         px_str = get_market_price(symbol, exit_side, str(min_qty))
         return Decimal(str(px_str))
     except Exception as e:
@@ -253,7 +254,7 @@ def _execute_virtual_exit(bot_id: str, symbol: str, direction: str, qty: Decimal
 
 
 def _risk_loop():
-    print("[RISK] ladder/baseSL thread started (using The Polling Loop)")
+    print("[RISK] ladder/baseSL thread started (The Polling Loop)")
     while True:
         try:
             bots = sorted(list(LONG_LADDER_BOTS | SHORT_LADDER_BOTS))
@@ -290,7 +291,8 @@ def _risk_loop():
                         )
                         continue
 
-                    # 2) 计算目标锁盈档位 (Local Ladder Logic)
+                    # 2) 计算目标锁盈档位
+                    # ✅ 这里会自动用到您定义的阶梯逻辑：0.18->0.1, 0.38->0.2, 0.58->0.4...
                     desired_lock = _desired_lock_level_pct(pnl_pct)
                     current_lock = get_lock_level_pct(bot_id, symbol, direction_u)
 
@@ -709,7 +711,7 @@ def tv_webhook():
                 "cancel_reason": cancel_reason,
             }), 200
 
-        # ✅ 4) 仓库核心逻辑植入：真实成交价优先 (Real Executable Price)
+        # ✅ 4) 真实成交价优先记账 (仓库逻辑植入)
         computed = (order or {}).get("computed") or {}
         fallback_price_str = computed.get("price")
 
@@ -720,7 +722,6 @@ def tv_webhook():
         final_qty = snapped_qty
 
         try:
-            # 强制尝试获取真实成交
             fill = get_fill_summary(
                 symbol=symbol,
                 order_id=order_id,
@@ -811,7 +812,7 @@ def tv_webhook():
         elif short_qty > 0:
             direction_to_close, qty_to_close = "SHORT", short_qty
 
-        # ✅ 仓库核心逻辑植入：若本地无持仓，尝试远程查询兜底
+        # ✅ 仓库逻辑植入：远程查仓兜底
         if not direction_to_close or qty_to_close <= 0:
             print(f"[EXIT] local 0 position, trying remote fallback for {symbol}...")
             remote = get_open_position_for_symbol(symbol)
