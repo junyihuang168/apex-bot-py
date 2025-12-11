@@ -4,8 +4,12 @@ import random
 from decimal import Decimal, ROUND_DOWN
 from typing import Dict, Any, Optional, Union, Tuple
 
-# ✅ 引入 Public 客户端，专门用于获取行情
-from apexomni.http_public import HttpPublic
+# ✅ 尝试引入 Public 客户端，如果不存在也不报错，后面有处理
+try:
+    from apexomni.http_public import HttpPublic
+except ImportError:
+    HttpPublic = None
+
 from apexomni.http_private_sign import HttpPrivateSign
 from apexomni.http_private_v3 import HttpPrivate_v3
 from apexomni.constants import (
@@ -95,7 +99,9 @@ def get_client() -> HttpPrivateSign:
         api_key_credentials=api_creds,
     )
     try:
-        client.configs_v3()
+        # 尝试调用一下 configs_v3 测试连接，如果这个也没有就忽略
+        if hasattr(client, 'configs_v3'):
+            client.configs_v3()
     except Exception as e:
         print("[apex_client] WARNING configs_v3 error:", e)
     _CLIENT = client
@@ -138,58 +144,82 @@ def get_market_price(symbol: str, side: str, size: str) -> str:
 
 def get_ticker_price(symbol: str) -> str:
     """
-    【修复版 v3】获取风控监控价格。
-    使用 HttpPublic 客户端，依次尝试 ticker_v3 -> depth_v3 -> worst_price
+    【修复版 v3】获取风控监控价格 (三级容错机制)。
     """
-    base_url, _ = _get_base_and_network()
+    base_url, network_id = _get_base_and_network()
+    api_creds = _get_api_credentials()
     
-    # ✅ 使用 Public Client，不需要签名
-    public_client = HttpPublic(base_url)
+    # 准备好 Private 客户端 (用来做 Plan B 和 C)
+    private_client = HttpPrivate_v3(base_url, network_id=network_id, api_key_credentials=api_creds)
     
-    # --- 方案 A: 尝试获取 Ticker (Oracle Price / Last Price) ---
-    try:
-        # SDK 方法名通常是 ticker_v3 (单数)
-        if hasattr(public_client, 'ticker_v3'):
-            res = public_client.ticker_v3(symbol=symbol)
-            data = res.get("data", res) if isinstance(res, dict) else res
-            
-            # 数据结构可能是 list 或 dict
-            item = data[0] if isinstance(data, list) and data else data
-            if isinstance(item, dict):
-                price = item.get("oraclePrice") or item.get("lastPrice")
-                if price: return str(price)
-    except Exception as e:
-        # print(f"[DEBUG] Ticker fetch failed: {e}")
-        pass
+    # 准备 Public 客户端 (用来做 Plan A)，如果 SDK 支持的话
+    public_client = None
+    if HttpPublic:
+        try:
+            public_client = HttpPublic(base_url)
+        except Exception:
+            pass
 
-    # --- 方案 B: 尝试获取深度数据 (买一卖一算中间价) ---
-    try:
-        # 方法名通常是 depth_v3
-        if hasattr(public_client, 'depth_v3'):
-            res = public_client.depth_v3(symbol=symbol, limit=5)
-            data = res.get("data", res) if isinstance(res, dict) else res
-            
-            bids = data.get("bids", [])
-            asks = data.get("asks", [])
-            
-            if bids and asks:
-                bid1 = float(bids[0][0])
-                ask1 = float(asks[0][0])
-                mid_price = (bid1 + ask1) / 2
-                return str(mid_price)
-    except Exception as e:
-        # print(f"[DEBUG] Depth fetch failed: {e}")
-        pass
+    # --- 方案 A: 尝试通过 Ticker 接口获取 ---
+    # 尝试 public 和 private 两个客户端，尝试 ticker_v3 和 get_tickers_v3 两个名字
+    clients_to_try = [c for c in [public_client, private_client] if c]
+    method_names = ['ticker_v3', 'get_tickers_v3', 'get_ticker_v3']
+    
+    for client in clients_to_try:
+        for method_name in method_names:
+            if hasattr(client, method_name):
+                try:
+                    fn = getattr(client, method_name)
+                    res = fn(symbol=symbol)
+                    
+                    # 解析返回值
+                    data = res.get("data", res) if isinstance(res, dict) else res
+                    item = data[0] if isinstance(data, list) and data else data
+                    
+                    if isinstance(item, dict):
+                        price = item.get("oraclePrice") or item.get("lastPrice") or item.get("price")
+                        if price:
+                            return str(price)
+                except Exception:
+                    pass # 失败就继续试下一个
 
-    # --- 方案 C: 最后的倔强 (Worst Price 平均值) ---
-    print(f"[apex_client] WARNING: Falling back to worst_price for {symbol}")
+    # --- 方案 B: 尝试通过 Depth (深度图) 获取 ---
+    # 大部分 SDK 只要能交易，就一定有 depth/orderbook 接口
+    depth_method_names = ['depth_v3', 'get_depth_v3', 'get_orderbook_v3']
+    for client in clients_to_try:
+        for method_name in depth_method_names:
+            if hasattr(client, method_name):
+                try:
+                    fn = getattr(client, method_name)
+                    res = fn(symbol=symbol, limit=5)
+                    
+                    data = res.get("data", res) if isinstance(res, dict) else res
+                    bids = data.get("bids", [])
+                    asks = data.get("asks", [])
+                    
+                    if bids and asks:
+                        # bids[0][0] 买一价, asks[0][0] 卖一价
+                        bid1 = float(bids[0][0])
+                        ask1 = float(asks[0][0])
+                        mid_price = (bid1 + ask1) / 2
+                        return str(mid_price)
+                except Exception:
+                    pass
+
+    # --- 方案 C: 最后的保底 (Worst Price 平均值) ---
+    # 如果上面全部失败，绝不能让程序报错崩溃，否则锁盈就彻底失效了。
+    # 我们知道 get_market_price 是好的 (因为你能下单)。
+    # 虽然 Worst Price 含滑点，但用来做止损监控总比不监控好。
+    print(f"[apex_client] WARNING: Ticker/Depth failed, using worst_price fallback for {symbol}")
     try:
+        # 获取买卖两个方向的最差价，取平均，抵消部分滑点影响
         p_buy = Decimal(get_market_price(symbol, "BUY", "0.01"))
         p_sell = Decimal(get_market_price(symbol, "SELL", "0.01"))
         avg = (p_buy + p_sell) / 2
         return str(avg)
     except Exception as e:
-        raise RuntimeError(f"All price fetch methods failed for {symbol}: {e}")
+        # 如果连这个都挂了，那我也没办法了
+        raise RuntimeError(f"CRITICAL: All price fetch methods failed for {symbol}: {e}")
 
 
 NumberLike = Union[str, float, int]
