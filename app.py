@@ -9,7 +9,7 @@ from flask import Flask, request, jsonify, Response
 from apex_client import (
     create_market_order,
     get_market_price,
-    get_ticker_price,      # ✅ 引入新函数
+    get_ticker_price,      # ✅ 引入修复后的价格获取函数
     get_fill_summary,
     _get_symbol_rules,
     _snap_quantity,
@@ -92,7 +92,6 @@ def _compute_entry_qty(symbol: str, side: str, budget: Decimal) -> Decimal:
     rules = _get_symbol_rules(symbol)
     min_qty = rules["min_qty"]
 
-    # 下单计算预算时，继续用 get_market_price (Worst Price) 是安全的
     ref_price_dec = Decimal(get_market_price(symbol, side, str(min_qty)))
     theoretical_qty = budget / ref_price_dec
     snapped_qty = _snap_quantity(symbol, theoretical_qty)
@@ -145,7 +144,6 @@ def _bot_allows_direction(bot_id: str, direction: str) -> bool:
 def _get_current_price(symbol: str, direction: str) -> Optional[Decimal]:
     """
     【修改】这里使用 get_ticker_price 获取不含滑点的公允市场价格。
-    direction 参数现在主要用于日志（如果有的话），因为 Ticker 不分方向。
     """
     try:
         # 使用 Oracle/Last Price 避免提前止损
@@ -263,11 +261,17 @@ def _risk_loop():
 
             for bot_id in bots:
                 opens = get_bot_open_positions(bot_id)
+                
+                # ✅ 增加调试日志：如果持有仓位，打印正在监控
+                if opens:
+                    # print(f"[RISK] Monitoring {bot_id} with {len(opens)} positions...") 
+                    pass 
 
                 for (symbol, direction), v in opens.items():
                     direction_u = direction.upper()
 
                     if not _bot_allows_direction(bot_id, direction_u):
+                        # print(f"[RISK] SKIP {bot_id} {direction_u} - Not allowed by config")
                         continue
 
                     qty = v["qty"]
@@ -281,6 +285,9 @@ def _risk_loop():
                         continue
 
                     pnl_pct = _calc_pnl_pct(direction_u, entry_price, current_price)
+                    
+                    # ✅ 偶尔打印一下状态，证明在工作
+                    # print(f"[RISK] {bot_id} {symbol} {direction_u} PnL: {pnl_pct:.2f}%")
 
                     # 1) 基础止损优先（默认 0.5%）
                     if _base_sl_hit(direction_u, entry_price, current_price):
@@ -325,6 +332,7 @@ def _ensure_monitor_thread():
     global _MONITOR_THREAD_STARTED
     with _MONITOR_LOCK:
         if not _MONITOR_THREAD_STARTED:
+            print("[INIT] Initializing Database...")
             init_db()
             t = threading.Thread(target=_risk_loop, daemon=True)
             t.start()
@@ -764,6 +772,17 @@ def tv_webhook():
                     price=entry_price_dec,
                     reason="strategy_entry_fill" if order_id else "strategy_entry",
                 )
+                
+                # ✅✅✅ 写入后的即刻读取检查 ✅✅✅
+                print("--- [DEBUG] DB Integrity Check Start ---")
+                check = get_bot_open_positions(bot_id)
+                print(f"[DEBUG] Post-entry DB check for {bot_id}: {check}")
+                if not check:
+                    print(f"[DEBUG] ⚠️ 警告：写入了但读不到！请检查 pnl.sqlite3 权限或路径")
+                else:
+                    print(f"[DEBUG] ✅ DB Write Confirmed. Risk loop should see this.")
+                print("--- [DEBUG] DB Integrity Check End ---")
+                
             except Exception as e:
                 print("[PNL] record_entry error:", e)
 
@@ -852,7 +871,6 @@ def tv_webhook():
                 "cancel_reason": cancel_reason,
             }), 200
 
-        # 平仓记账也尽量用 Ticker Price 或 Fill，这里简单起见用当前 Ticker
         exit_price = _get_current_price(symbol, direction_to_close) or Decimal("0")
 
         try:
