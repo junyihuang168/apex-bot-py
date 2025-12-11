@@ -1,7 +1,7 @@
 import os
 import sqlite3
 import time
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from typing import Dict, Tuple, Any, List
 
 DB_PATH = os.getenv("PNL_DB_PATH", "pnl.sqlite3")
@@ -63,7 +63,7 @@ def init_db():
     )
     """)
 
-    # lock levels (保留用于兼容旧逻辑，新逻辑主要使用 JSON)
+    # lock levels：阶梯锁盈状态表
     cur.execute("""
     CREATE TABLE IF NOT EXISTS lock_levels (
         bot_id TEXT NOT NULL,
@@ -298,7 +298,7 @@ def get_bot_summary(bot_id: str) -> Dict[str, Any]:
 
 
 # ---------------------------
-# Lock level persistence (Legacy DB support)
+# Lock level persistence
 # ---------------------------
 def get_lock_level_pct(bot_id: str, symbol: str, direction: str) -> Decimal:
     conn = _connect()
