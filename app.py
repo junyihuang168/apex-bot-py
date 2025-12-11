@@ -2,328 +2,260 @@ import os
 import time
 import threading
 from decimal import Decimal
-from typing import Dict, Tuple, Optional, Set
-from flask import Flask, request, jsonify, Response
+from typing import Dict, Tuple, Optional
 
-# 引入优化后的模块
-from apex_client import create_market_order, get_market_price, get_fill_summary, get_symbol_rules, snap_quantity
+from flask import Flask, request, jsonify
+
+# 导入融合后的 helper
+from apex_client import (
+    create_market_order, get_market_price, get_fill_summary,
+    _get_symbol_rules, _snap_quantity, get_open_position_for_symbol,
+    map_position_side_to_exit_order_side
+)
 from pnl_store import (
-    init_db, record_entry, record_exit_fifo, list_bots_with_activity, 
-    get_bot_summary, get_bot_open_positions, get_lock_level_pct, 
-    set_lock_level_pct, clear_lock_level_pct
+    init_db, record_entry, record_exit_fifo,
+    load_json_state, save_json_state
 )
 
 app = Flask(__name__)
-
-# ================= 配置区 =================
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
-DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "")
 
-# 基础止损 (0.5%)
-BASE_SL_PCT = Decimal(os.getenv("BASE_SL_PCT", "0.5"))
-# 监控轮询间隔 (秒)
-RISK_POLL_INTERVAL = float(os.getenv("RISK_POLL_INTERVAL", "1.5"))
+# --- 配置区：BOT 分组 & 阶梯参数 ---
+_LONG_BOTS = os.getenv("LONG_HARD_SL_BOTS", "BOT_1,BOT_2,BOT_3,BOT_4,BOT_5,BOT_6,BOT_7,BOT_8,BOT_9,BOT_10")
+_SHORT_BOTS = os.getenv("SHORT_HARD_SL_BOTS", "BOT_11,BOT_12,BOT_13,BOT_14,BOT_15,BOT_16,BOT_17,BOT_18,BOT_19,BOT_20")
+LONG_HARD_SL_BOTS = {b.strip() for b in _LONG_BOTS.split(",") if b.strip()}
+SHORT_HARD_SL_BOTS = {b.strip() for b in _SHORT_BOTS.split(",") if b.strip()}
+ALL_HARD_SL_BOTS = LONG_HARD_SL_BOTS | SHORT_HARD_SL_BOTS
 
-# 解析 Bot 列表
-def _parse_bots(env_key, default_range):
-    raw = os.getenv(env_key, ",".join([f"BOT_{i}" for i in default_range]))
-    return {b.strip() for b in raw.split(",") if b.strip()}
+LADDER_START_TRIGGER_PCT = Decimal(os.getenv("HARD_SL_LADDER_START_TRIGGER_PCT", "0.18"))
+LADDER_START_LOCK_PCT = Decimal(os.getenv("HARD_SL_LADDER_START_LOCK_PCT", "0.00"))
+LADDER_STEP_PCT = Decimal(os.getenv("HARD_SL_LADDER_STEP_PCT", "0.20"))
+HARD_SL_POLL_INTERVAL = float(os.getenv("HARD_SL_POLL_INTERVAL", "1.5"))
+HARD_SL_SCOPE = os.getenv("HARD_SL_SCOPE", "bot_symbol").lower()
 
-LONG_LADDER_BOTS = _parse_bots("LONG_LADDER_BOTS", range(1, 11))
-SHORT_LADDER_BOTS = _parse_bots("SHORT_LADDER_BOTS", range(11, 21))
-
-# ================= 内存镜像 (Memory Mirror) =================
-# 优化：监控线程只读内存，避免 DB IO 瓶颈
-# Key: (bot_id, symbol, direction)
-LOCAL_POSITIONS: Dict[Tuple[str, str, str], dict] = {}
+# 全局内存状态
+BOT_POSITIONS = {} 
 _STATE_LOCK = threading.Lock()
-_MONITOR_STARTED = False
+_MONITOR_THREAD_STARTED = False
 _MONITOR_LOCK = threading.Lock()
 
-# ================= 阶梯锁盈逻辑 (Local Ladder Logic) =================
-TRIGGER_1, LOCK_1 = Decimal("0.18"), Decimal("0.10")
-TRIGGER_2, LOCK_2 = Decimal("0.38"), Decimal("0.20")
-STEP = Decimal("0.20")
+def _update_state_safe(key, updater):
+    with _STATE_LOCK:
+        pos = BOT_POSITIONS.get(key) or {}
+        updater(pos)
+        BOT_POSITIONS[key] = pos
+        save_json_state(BOT_POSITIONS)
 
-def _calc_desired_lock(pnl_pct: Decimal) -> Decimal:
-    if pnl_pct < TRIGGER_1: return Decimal("0")
-    if pnl_pct < TRIGGER_2: return LOCK_1
-    return LOCK_2 + STEP * ((pnl_pct - TRIGGER_2) // STEP)
+def _bot_allows_hard_sl(bot_id: str, side: str) -> bool:
+    side_u = side.upper()
+    if bot_id in LONG_HARD_SL_BOTS: return side_u == "BUY"
+    if bot_id in SHORT_HARD_SL_BOTS: return side_u == "SELL"
+    return False
 
-# ================= 虚拟监控线程 (The Polling Loop) =================
-def _monitor_loop():
-    print("[RISK] Virtual Monitor Loop Started (Memory-Based)")
+def _calc_ladder_n(pnl_pct: Decimal) -> int:
+    if pnl_pct < LADDER_START_TRIGGER_PCT: return -1
+    try:
+        n = int((pnl_pct - LADDER_START_TRIGGER_PCT) // LADDER_STEP_PCT)
+        return max(0, n)
+    except: return 0
+
+def _lock_pct_for_n(n: int) -> Decimal:
+    if n < 0: return Decimal("0")
+    return LADDER_START_LOCK_PCT + LADDER_STEP_PCT * Decimal(n)
+
+# --- 核心：Hard SL 监控循环 (移植自第二个仓库) ---
+def _monitor_positions_loop():
+    print("[HARD_SL] monitor thread started")
     while True:
         try:
-            # 1. 快速复制内存快照
             with _STATE_LOCK:
-                snapshot = list(LOCAL_POSITIONS.items())
-
-            for (key, pos) in snapshot:
-                bot_id, symbol, direction = key
-                qty, entry_price = pos["qty"], pos["entry_price"]
-                current_lock = pos["lock_level_pct"]
-
-                if qty <= 0 or entry_price <= 0: continue
+                items = list(BOT_POSITIONS.items())
+            
+            for (bot_id, symbol), pos in items:
+                if bot_id not in ALL_HARD_SL_BOTS: continue
                 
-                # 检查该Bot是否启用风控
-                if direction == "LONG" and bot_id not in LONG_LADDER_BOTS: continue
-                if direction == "SHORT" and bot_id not in SHORT_LADDER_BOTS: continue
+                side = str(pos.get("side") or "").upper()
+                qty = pos.get("qty") or Decimal("0")
+                entry_price = pos.get("entry_price")
+                ladder_n = int(pos.get("ladder_n", -1))
+                lock_price = pos.get("lock_price")
+                
+                if not _bot_allows_hard_sl(bot_id, side): continue
+                
+                # 远程兜底检查 (Remote Check)
+                remote = get_open_position_for_symbol(symbol)
+                remote_qty = remote["size"] if remote else Decimal("0")
+                
+                # 如果本地没状态但远程有，进行 Patch (状态恢复)
+                if entry_price is None and remote and remote_qty > 0:
+                    def _patch(p):
+                        remote_side = str(remote["side"]).upper()
+                        # 只有方向匹配才认领
+                        if (bot_id in LONG_HARD_SL_BOTS and remote_side=="LONG") or \
+                           (bot_id in SHORT_HARD_SL_BOTS and remote_side=="SHORT"):
+                            p["side"] = "BUY" if remote_side=="LONG" else "SELL"
+                            p["entry_price"] = remote["entryPrice"]
+                            p["qty"] = remote_qty
+                            p["ladder_n"] = -1
+                    _update_state_safe((bot_id, symbol), _patch)
+                    # 重新读取
+                    pos = BOT_POSITIONS.get((bot_id, symbol), {})
+                    side = pos.get("side", "").upper()
+                    entry_price = pos.get("entry_price")
+                    qty = pos.get("qty", Decimal("0"))
 
-                # 2. 获取真实可成交价格 (Real Executable Price)
-                exit_side = "SELL" if direction == "LONG" else "BUY"
-                rules = get_symbol_rules(symbol)
+                if qty <= 0 or entry_price is None: continue
+
+                # 获取当前价格 (用于计算 PnL)
                 try:
-                    # 使用 min_qty 询价，获取最差成交价
-                    px_str = get_market_price(symbol, exit_side, str(rules["min_qty"]))
-                    curr_price = Decimal(px_str)
-                except Exception:
-                    continue # 网络波动跳过
+                    exit_side = "SELL" if side == "BUY" else "BUY"
+                    current_price = Decimal(get_market_price(symbol, exit_side, "0.01")) # 用最小数量询价
+                except: continue
 
-                # 3. 计算 PnL
-                if direction == "LONG":
-                    pnl_pct = (curr_price - entry_price) * 100 / entry_price
-                else:
-                    pnl_pct = (entry_price - curr_price) * 100 / entry_price
-
-                # 4. 更新锁盈线
-                new_lock = _calc_desired_lock(pnl_pct)
-                if new_lock > current_lock:
-                    print(f"[RISK] 🚀 UPGRADE {bot_id} {symbol}: {pnl_pct:.2f}% -> Lock {new_lock}%")
-                    with _STATE_LOCK:
-                        # 再次确认仓位未变
-                        if LOCAL_POSITIONS.get(key, {}).get("qty") == qty:
-                            LOCAL_POSITIONS[key]["lock_level_pct"] = new_lock
-                    set_lock_level_pct(bot_id, symbol, direction, new_lock)
-                    current_lock = new_lock
-
-                # 5. 检查退出 (止损 或 锁盈触发)
-                reason = None
+                # 计算 PnL %
+                pnl_pct = (current_price - entry_price)/entry_price * 100 if side == "BUY" else (entry_price - current_price)/entry_price * 100
                 
-                # A. 基础止损
-                sl_ratio = BASE_SL_PCT / 100
-                if direction == "LONG" and curr_price <= entry_price * (1 - sl_ratio):
-                    reason = "base_sl"
-                elif direction == "SHORT" and curr_price >= entry_price * (1 + sl_ratio):
-                    reason = "base_sl"
-                
-                # B. 阶梯锁盈
-                if not reason and current_lock > 0:
-                    lock_ratio = current_lock / 100
-                    if direction == "LONG" and curr_price <= entry_price * (1 + lock_ratio):
-                        reason = f"ladder_lock_{current_lock}%"
-                    elif direction == "SHORT" and curr_price >= entry_price * (1 - lock_ratio):
-                        reason = f"ladder_lock_{current_lock}%"
+                # 1. 阶梯升级逻辑 (Ladder Up)
+                target_n = _calc_ladder_n(pnl_pct)
+                if target_n > ladder_n:
+                    lock_pct = _lock_pct_for_n(target_n)
+                    if side == "BUY": new_lock = entry_price * (1 + lock_pct/100)
+                    else: new_lock = entry_price * (1 - lock_pct/100)
+                    
+                    def _upgrade(p):
+                        p["ladder_n"] = target_n
+                        p["lock_price"] = new_lock
+                    _update_state_safe((bot_id, symbol), _upgrade)
+                    print(f"[HARD_SL] UP bot={bot_id} n={target_n} lock={new_lock}")
+                    lock_price = new_lock # 更新本地变量用于下面判断
 
-                # 6. 执行退出
-                if reason:
-                    print(f"[RISK] 💥 TRIGGER EXIT {bot_id} {symbol} ({reason}) PnL:{pnl_pct:.2f}%")
-                    _execute_exit(bot_id, symbol, direction, qty, reason)
+                # 2. 触发离场逻辑 (Trigger Exit)
+                if lock_price is not None:
+                    hit = (current_price <= lock_price) if side == "BUY" else (current_price >= lock_price)
+                    if hit:
+                        print(f"[HARD_SL] TRIGGER EXIT {bot_id} {symbol} pnl={pnl_pct}%")
+                        close_qty = min(qty, remote_qty) if remote else qty # 安全起见不超过远程
+                        
+                        try:
+                            create_market_order(symbol, exit_side, size=str(close_qty), reduce_only=True)
+                            # 记录到 SQLite PnL
+                            record_exit_fifo(bot_id, symbol, side, close_qty, current_price, "ladder_lock")
+                            # 清理状态
+                            def _clear(p):
+                                p["qty"] = Decimal("0")
+                                p["entry_price"] = None
+                                p["ladder_n"] = -1
+                                p["lock_price"] = None
+                            _update_state_safe((bot_id, symbol), _clear)
+                        except Exception as e:
+                            print("[HARD_SL] Exit failed:", e)
 
         except Exception as e:
-            print(f"[RISK] Loop Error: {e}")
-        
-        time.sleep(RISK_POLL_INTERVAL)
+            print("[HARD_SL] loop error:", e)
+        time.sleep(HARD_SL_POLL_INTERVAL)
 
-def _execute_exit(bot_id, symbol, direction, qty, reason):
-    """统一退出逻辑：下单 -> DB记账 -> 清理内存"""
-    exit_side = "SELL" if direction == "LONG" else "BUY"
-    entry_side = "BUY" if direction == "LONG" else "SELL"
+def _ensure_monitor_thread():
+    global _MONITOR_THREAD_STARTED
+    global BOT_POSITIONS
+    with _MONITOR_LOCK:
+        if not _MONITOR_THREAD_STARTED:
+            init_db()
+            BOT_POSITIONS = load_json_state() # 加载历史状态
+            t = threading.Thread(target=_monitor_positions_loop, daemon=True)
+            t.start()
+            _MONITOR_THREAD_STARTED = True
 
-    # 1. 下单
-    try:
-        res = create_market_order(symbol, exit_side, size=str(qty), reduce_only=True)
-        if res["raw_order"].get("retCode") != 0 and res["raw_order"].get("ret_code") != 0:
-             # 简单检查，具体视API返回结构
-             pass
-    except Exception as e:
-        print(f"[RISK] Order Fail: {e}")
-        return
-
-    # 2. 记账 (DB)
-    try:
-        # 获取一次价格用于记账
-        px = Decimal(get_market_price(symbol, exit_side, "0.01"))
-        record_exit_fifo(bot_id, symbol, entry_side, qty, px, reason)
-    except Exception:
-        pass
-
-    # 3. 清理状态
-    clear_lock_level_pct(bot_id, symbol, direction)
-    with _STATE_LOCK:
-        key = (bot_id, symbol, direction)
-        if key in LOCAL_POSITIONS:
-            # 简单处理：全平
-            del LOCAL_POSITIONS[key]
-
-# ================= Web / Dashboard =================
-@app.route("/dashboard")
-def dashboard():
-    _ensure_thread()
-    # 完整的 Dashboard HTML
-    return """
-<!doctype html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Apex Bot Dashboard</title>
-<style>
-:root{--bg:#0b0f14;--card:#111826;--text:#eef2f7;--good:#22c55e;--bad:#ef4444;}
-body{margin:0;font-family:sans-serif;background:var(--bg);color:var(--text);padding:20px;}
-.card{background:var(--card);padding:15px;margin-bottom:10px;border-radius:10px;border:1px solid #1c2a44;}
-.row{display:flex;justify-content:space-between;align-items:center;}
-.num{font-family:monospace;font-weight:bold;}
-.good{color:var(--good);} .bad{color:var(--bad);}
-h1{font-size:18px;margin:0 0 20px 0;}
-table{width:100%;border-collapse:collapse;margin-top:10px;font-size:12px;}
-th,td{text-align:left;padding:5px;border-bottom:1px solid #333;}
-th{color:#888;}
-</style>
-</head>
-<body>
-<h1>Apex Bot Dashboard (Memory Monitor)</h1>
-<div id="app">Loading...</div>
-<script>
-async function load(){
-  try{
-    let res = await fetch('/api/pnl');
-    let data = await res.json();
-    let html = '';
-    data.bots.forEach(b => {
-      html += `<div class="card">
-        <div class="row">
-          <strong>${b.bot_id}</strong>
-          <span>Day: <span class="${b.realized_day>0?'good':'bad'}">${b.realized_day}</span></span>
-        </div>
-        <table><thead><tr><th>Symbol</th><th>Dir</th><th>Qty</th><th>Entry</th></tr></thead><tbody>`;
-      b.open_positions.forEach(p => {
-        html += `<tr><td>${p.symbol}</td><td>${p.direction}</td><td>${p.qty}</td><td>${p.weighted_entry}</td></tr>`;
-      });
-      html += `</tbody></table></div>`;
-    });
-    document.getElementById('app').innerHTML = html;
-  }catch(e){console.error(e);}
-}
-setInterval(load, 2000);
-load();
-</script>
-</body>
-</html>
-"""
-
-@app.route("/api/pnl")
-def api_pnl():
-    _ensure_thread()
-    bots = list_bots_with_activity()
-    out = []
-    for bid in bots:
-        summ = get_bot_summary(bid)
-        opens = get_bot_open_positions(bid)
-        rows = []
-        for (sym, direct), v in opens.items():
-            rows.append({
-                "symbol": sym, "direction": direct, 
-                "qty": str(v["qty"]), "weighted_entry": str(v["weighted_entry"])
-            })
-        summ["open_positions"] = rows
-        out.append(summ)
-    return jsonify({"bots": out})
-
+# --- Webhook 接口 (逻辑合并) ---
 @app.route("/webhook", methods=["POST"])
-def webhook():
-    _ensure_thread()
+def tv_webhook():
+    _ensure_monitor_thread()
     try:
-        data = request.get_json(force=True)
+        body = request.get_json(force=True)
     except: return "invalid json", 400
-    
-    if WEBHOOK_SECRET and data.get("secret") != WEBHOOK_SECRET: return "forbidden", 403
 
-    bot_id = str(data.get("bot_id", "BOT_1"))
-    symbol = data.get("symbol")
-    side = str(data.get("side", "")).upper()
-    action = str(data.get("action", "")).lower()
+    if WEBHOOK_SECRET and body.get("secret") != WEBHOOK_SECRET: return "forbidden", 403
     
-    # 简单的 signal 解析
-    mode = "entry" if action in ["entry", "open"] else "exit"
+    symbol = body.get("symbol")
+    bot_id = str(body.get("bot_id", "BOT_1"))
+    side = str(body.get("side", "")).upper()
+    action = str(body.get("action", "")).lower() # entry / exit
 
-    if mode == "entry":
-        budget = Decimal(str(data.get("size_usdt") or data.get("position_size_usdt") or 0))
-        if budget <= 0: return "invalid size", 400
+    if action == "entry":
+        budget = Decimal(str(body.get("size_usdt", "0")))
+        if budget <= 0: return "bad size", 400
         
+        # 1. 计算数量 & 下单
         try:
-            qty = create_market_order(symbol, side, size_usdt=budget)["computed"]["size"]
-            qty = Decimal(qty)
-        except Exception as e: return f"order error: {e}", 500
-
-        # 获取成交详情 (回填)
-        try:
-            fill = get_fill_summary(symbol, "") # 需要优化：传入 order_id
-            price = fill["avg_fill_price"]
-        except:
-            price = Decimal(get_market_price(symbol, side, "0.01"))
-
-        # ✅ 关键：同时更新内存 + DB
-        direction = "LONG" if side == "BUY" else "SHORT"
-        with _STATE_LOCK:
-            key = (bot_id, symbol, direction)
-            old = LOCAL_POSITIONS.get(key, {})
-            new_q = old.get("qty", Decimal(0)) + qty
-            # 简单加权平均逻辑 (可优化)
-            if new_q > 0:
-                new_p = (old.get("qty", Decimal(0)) * old.get("entry_price", Decimal(0)) + qty * price) / new_q
-            else: new_p = price
+            # 这里简化了 _compute_entry_qty 的调用，实际会调用 apex_client 里的逻辑
+            # 为了代码简洁，直接调用 create_market_order，它内部会处理 budget -> qty
+            res = create_market_order(symbol, side, size_usdt=budget)
             
-            LOCAL_POSITIONS[key] = {
-                "qty": new_q, "entry_price": new_p, 
-                "lock_level_pct": old.get("lock_level_pct", Decimal(0))
-            }
-        
-        record_entry(bot_id, symbol, side, qty, price, "tv_entry")
-        return jsonify({"status": "ok", "qty": str(qty)})
+            # 2. 尝试获取真实成交价 (Fill Summary)
+            order_id = res["order_id"]
+            cid = res["client_order_id"]
+            computed_price = Decimal(res["computed"]["price"])
+            
+            fill_price = computed_price # 默认回退
+            fill_qty = Decimal(res["computed"]["size"])
+            
+            try:
+                # 尝试获取真实成交详情
+                fill = get_fill_summary(symbol, order_id, cid)
+                fill_price = fill["avg_fill_price"]
+                fill_qty = fill["filled_qty"]
+            except: pass
 
-    elif mode == "exit":
-        # 优先读内存平仓
-        key_long = (bot_id, symbol, "LONG")
-        key_short = (bot_id, symbol, "SHORT")
+            # 3. 记录状态 (SQLite + JSON)
+            record_entry(bot_id, symbol, side, fill_qty, fill_price)
+            
+            def _set_state(p):
+                p["side"] = side
+                p["qty"] = fill_qty
+                p["entry_price"] = fill_price
+                p["ladder_n"] = -1
+                p["lock_price"] = None
+            _update_state_safe((bot_id, symbol), _set_state)
+            
+            return jsonify({"status": "ok", "qty": str(fill_qty), "price": str(fill_price)})
+        except Exception as e:
+            print("[ENTRY] Error:", e)
+            return "error", 500
+
+    elif action == "exit":
+        # 查找当前持仓
+        key = (bot_id, symbol)
+        pos = BOT_POSITIONS.get(key, {})
+        qty = pos.get("qty", Decimal("0"))
+        local_side = pos.get("side", "BUY")
         
-        target = None
-        with _STATE_LOCK:
-            if key_long in LOCAL_POSITIONS: target = (key_long, LOCAL_POSITIONS[key_long])
-            elif key_short in LOCAL_POSITIONS: target = (key_short, LOCAL_POSITIONS[key_short])
+        # 远程检查
+        remote = get_open_position_for_symbol(symbol)
+        remote_qty = remote["size"] if remote else Decimal("0")
         
-        if target:
-            (key, pos) = target
-            _execute_exit(bot_id, symbol, key[2], pos["qty"], "tv_exit")
-            return jsonify({"status": "closed"})
-        else:
-            return "no position found", 200
+        close_qty = max(qty, remote_qty) # 尽可能平干净
+        if close_qty <= 0: return jsonify({"status": "no_position"})
+        
+        exit_side = "SELL" if local_side == "BUY" else "BUY"
+        
+        try:
+            create_market_order(symbol, exit_side, size=str(close_qty), reduce_only=True)
+            # 清理状态
+            def _clear(p):
+                p["qty"] = Decimal("0")
+                p["entry_price"] = None
+                p["ladder_n"] = -1
+            _update_state_safe((bot_id, symbol), _clear)
+            
+            # 记录 SQLite (价格用当前市价估算)
+            current_price = Decimal(get_market_price(symbol, exit_side, "0.01"))
+            record_exit_fifo(bot_id, symbol, local_side, close_qty, current_price, "strategy_exit")
+            
+            return jsonify({"status": "ok", "closed": str(close_qty)})
+        except Exception as e:
+            return str(e), 500
 
     return "ok", 200
 
-def _init_cache():
-    """启动时从DB加载到内存"""
-    print("[RISK] Hydrating Cache...")
-    with _STATE_LOCK:
-        bots = list_bots_with_activity()
-        for bid in bots:
-            opens = get_bot_open_positions(bid)
-            for (sym, direct), v in opens.items():
-                lock = get_lock_level_pct(bid, sym, direct)
-                LOCAL_POSITIONS[(bid, sym, direct)] = {
-                    "qty": v["qty"], "entry_price": v["weighted_entry"], 
-                    "lock_level_pct": lock
-                }
-    print(f"[RISK] Cache Ready. {len(LOCAL_POSITIONS)} positions.")
-
-def _ensure_thread():
-    global _MONITOR_STARTED
-    with _MONITOR_LOCK:
-        if not _MONITOR_STARTED:
-            init_db()
-            _init_cache()
-            threading.Thread(target=_monitor_loop, daemon=True).start()
-            _MONITOR_STARTED = True
-
 if __name__ == "__main__":
-    _ensure_thread()
+    _ensure_monitor_thread()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
