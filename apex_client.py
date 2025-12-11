@@ -13,7 +13,7 @@ from apexomni.constants import (
 )
 
 # -------------------------------------------------------------------
-# 交易规则
+# 交易规则（默认：最小数量 0.01，步长 0.01，小数点后 2 位）
 # -------------------------------------------------------------------
 DEFAULT_SYMBOL_RULES = {
     "min_qty": Decimal("0.01"),
@@ -21,11 +21,12 @@ DEFAULT_SYMBOL_RULES = {
     "qty_decimals": 2,
 }
 
-SYMBOL_RULES: Dict[str, Dict[str, Any]] = {}
+SYMBOL_RULES: Dict[str, Dict[str, Any]] = {
+    # "BTC-USDT": {"min_qty": Decimal("0.001"), "step_size": Decimal("0.001"), "qty_decimals": 3},
+}
 
 _CLIENT: Optional[HttpPrivateSign] = None
 
-NumberLike = Union[str, float, int]
 
 def _get_symbol_rules(symbol: str) -> Dict[str, Any]:
     s = symbol.upper()
@@ -61,9 +62,11 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 def _get_base_and_network():
     use_mainnet = _env_bool("APEX_USE_MAINNET", False)
+
     env_name = os.getenv("APEX_ENV", "").lower()
     if env_name in ("main", "mainnet", "prod", "production"):
         use_mainnet = True
+
     base_url = APEX_OMNI_HTTP_MAIN if use_mainnet else APEX_OMNI_HTTP_TEST
     network_id = NETWORKID_OMNI_MAIN_ARB if use_mainnet else NETWORKID_TEST
     return base_url, network_id
@@ -88,6 +91,7 @@ def get_client() -> HttpPrivateSign:
 
     base_url, network_id = _get_base_and_network()
     api_creds = _get_api_credentials()
+
     zk_seeds = os.environ["APEX_ZK_SEEDS"]
     zk_l2 = os.getenv("APEX_L2KEY_SEEDS") or ""
 
@@ -98,13 +102,19 @@ def get_client() -> HttpPrivateSign:
         zk_l2Key=zk_l2,
         api_key_credentials=api_creds,
     )
-    # Debug prints preserved
+
     try:
-        client.configs_v3()
-        print("[apex_client] configs_v3 ok")
+        cfg = client.configs_v3()
+        print("[apex_client] configs_v3 ok:", cfg)
     except Exception as e:
         print("[apex_client] WARNING configs_v3 error:", e)
-    
+
+    try:
+        acc = client.get_account_v3()
+        print("[apex_client] get_account_v3 ok:", acc)
+    except Exception as e:
+        print("[apex_client] WARNING get_account_v3 error:", e)
+
     _CLIENT = client
     return client
 
@@ -117,13 +127,24 @@ def get_account():
 def get_market_price(symbol: str, side: str, size: str) -> str:
     base_url, network_id = _get_base_and_network()
     api_creds = _get_api_credentials()
+
     from apexomni.http_private_v3 import HttpPrivate_v3
 
-    http_v3_client = HttpPrivate_v3(base_url, network_id=network_id, api_key_credentials=api_creds)
+    http_v3_client = HttpPrivate_v3(
+        base_url,
+        network_id=network_id,
+        api_key_credentials=api_creds,
+    )
+
     side = side.upper()
     size_str = str(size)
 
-    res = http_v3_client.get_worst_price_v3(symbol=symbol, size=size_str, side=side)
+    res = http_v3_client.get_worst_price_v3(
+        symbol=symbol,
+        size=size_str,
+        side=side,
+    )
+
     price = None
     if isinstance(res, dict):
         if "worstPrice" in res:
@@ -132,14 +153,20 @@ def get_market_price(symbol: str, side: str, size: str) -> str:
             price = res["data"]["worstPrice"]
 
     if price is None:
-        raise RuntimeError(f"[apex_client] get_worst_price_v3 returned abnormal: {res}")
+        raise RuntimeError(f"[apex_client] get_worst_price_v3 返回异常: {res}")
 
     price_str = str(price)
-    # print(f"[apex_client] worst price for {symbol} {side} size={size_str}: {price_str}")
+    print(f"[apex_client] worst price for {symbol} {side} size={size_str}: {price_str}")
     return price_str
 
 
+NumberLike = Union[str, float, int]
+
+
 def _extract_order_ids(raw_order: Any) -> Tuple[Optional[str], Optional[str]]:
+    """
+    尽量从 Apex 返回中拿 orderId / clientOrderId
+    """
     order_id = None
     client_order_id = None
 
@@ -153,6 +180,7 @@ def _extract_order_ids(raw_order: Any) -> Tuple[Optional[str], Optional[str]]:
     if isinstance(raw_order, dict):
         order_id = _pick(raw_order, "orderId", "id")
         client_order_id = _pick(raw_order, "clientOrderId", "clientId")
+
         data = raw_order.get("data")
         if isinstance(data, dict):
             order_id = order_id or _pick(data, "orderId", "id")
@@ -161,10 +189,9 @@ def _extract_order_ids(raw_order: Any) -> Tuple[Optional[str], Optional[str]]:
     return (str(order_id) if order_id else None, str(client_order_id) if client_order_id else None)
 
 
-# =========================================================================
-# ✅ 核心功能：获取真实成交价格 (Real Executable Price)
-# 这一部分必须保留，用于从 order ID 反查 fills
-# =========================================================================
+# ------------------------------------------------------------
+# ✅ 仓库逻辑植入：真实成交价格获取 (Real Executable Price)
+# ------------------------------------------------------------
 def get_fill_summary(
     symbol: str,
     order_id: Optional[str] = None,
@@ -172,12 +199,25 @@ def get_fill_summary(
     max_wait_sec: float = 2.0,
     poll_interval: float = 0.25,
 ) -> Dict[str, Any]:
+    """
+    尝试用“你本地 apexomni 版本可能存在的任意方法”
+    拉真实成交信息。
+    如果拉不到，抛异常让上层回退到 worst price 参考价。
+    """
     client = get_client()
     start = time.time()
 
     while True:
         last_err = None
-        candidates = ["get_order_v3", "get_order_detail_v3", "get_order_by_id_v3", "get_order_v3_by_id"]
+
+        # 可能的候选方法名（不同版本 SDK 可能不一样）
+        candidates = [
+            "get_order_v3",
+            "get_order_detail_v3",
+            "get_order_by_id_v3",
+            "get_order_v3_by_id",
+        ]
+
         order_obj = None
         for name in candidates:
             if hasattr(client, name) and order_id:
@@ -188,12 +228,18 @@ def get_fill_summary(
                 except Exception as e:
                     last_err = e
 
+        # 某些 SDK 可能有 fills 接口
         fills_obj = None
-        fill_candidates = ["get_fills_v3", "get_order_fills_v3", "get_trade_fills_v3"]
+        fill_candidates = [
+            "get_fills_v3",
+            "get_order_fills_v3",
+            "get_trade_fills_v3",
+        ]
         for name in fill_candidates:
             if hasattr(client, name):
                 try:
                     fn = getattr(client, name)
+                    # 尽量适配参数
                     if order_id and "orderId" in fn.__code__.co_varnames:
                         fills_obj = fn(orderId=order_id)
                     elif client_order_id and "clientId" in fn.__code__.co_varnames:
@@ -206,27 +252,36 @@ def get_fill_summary(
                 except Exception as e:
                     last_err = e
 
+        # 解析 fills 优先
         def _as_list(x):
-            if x is None: return []
-            if isinstance(x, list): return x
+            if x is None:
+                return []
+            if isinstance(x, list):
+                return x
             if isinstance(x, dict):
                 data = x.get("data")
-                if isinstance(data, list): return data
-                if isinstance(data, dict) and "fills" in data: return data["fills"]
+                if isinstance(data, list):
+                    return data
+                if isinstance(data, dict) and "fills" in data and isinstance(data["fills"], list):
+                    return data["fills"]
             return []
 
         fills_list = _as_list(fills_obj)
+
         total_qty = Decimal("0")
         total_notional = Decimal("0")
 
         for f in fills_list:
-            if not isinstance(f, dict): continue
+            if not isinstance(f, dict):
+                continue
             q = f.get("size") or f.get("qty") or f.get("filledSize") or f.get("fillSize")
             p = f.get("price") or f.get("fillPrice")
-            if q is None or p is None: continue
+            if q is None or p is None:
+                continue
             dq = Decimal(str(q))
             dp = Decimal(str(p))
-            if dq <= 0 or dp <= 0: continue
+            if dq <= 0 or dp <= 0:
+                continue
             total_qty += dq
             total_notional += dq * dp
 
@@ -242,8 +297,32 @@ def get_fill_summary(
                 "raw_fills": fills_obj,
             }
 
+        # 退而求其次：从 order_obj 里找 filledSize/avgPrice
+        if isinstance(order_obj, dict):
+            data = order_obj.get("data") if isinstance(order_obj.get("data"), dict) else order_obj
+            if isinstance(data, dict):
+                fq = data.get("filledSize") or data.get("cumFilledSize") or data.get("sizeFilled")
+                ap = data.get("avgPrice") or data.get("averagePrice") or data.get("fillAvgPrice")
+                try:
+                    if fq and ap:
+                        dq = Decimal(str(fq))
+                        dp = Decimal(str(ap))
+                        if dq > 0 and dp > 0:
+                            return {
+                                "symbol": symbol,
+                                "order_id": order_id,
+                                "client_order_id": client_order_id,
+                                "filled_qty": dq,
+                                "avg_fill_price": dp,
+                                "raw_order": order_obj,
+                                "raw_fills": fills_obj,
+                            }
+                except Exception as e:
+                    last_err = e
+
         if time.time() - start >= max_wait_sec:
             raise RuntimeError(f"fill summary unavailable, last_err={last_err!r}")
+
         time.sleep(poll_interval)
 
 
@@ -255,36 +334,60 @@ def create_market_order(
     reduce_only: bool = False,
     client_id: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """
+    MARKET 市价单。
+    返回 wrapper，包含：
+    - data
+    - raw_order
+    - computed(price/size/used_budget...)
+    - order_id / client_order_id（尽量提取）
+    """
     client = get_client()
     side = side.upper()
+
     rules = _get_symbol_rules(symbol)
     decimals = rules["qty_decimals"]
 
     if size_usdt is not None:
         budget = Decimal(str(size_usdt))
-        if budget <= 0: raise ValueError("size_usdt must be > 0")
+        if budget <= 0:
+            raise ValueError("size_usdt must be > 0")
+
         min_qty = rules["min_qty"]
         ref_price_decimal = Decimal(get_market_price(symbol, side, str(min_qty)))
         theoretical_qty = budget / ref_price_decimal
         snapped_qty = _snap_quantity(symbol, theoretical_qty)
+
         price_str = get_market_price(symbol, side, str(snapped_qty))
         price_decimal = Decimal(price_str)
+
         size_str = format(snapped_qty, f".{decimals}f")
-        used_budget = (snapped_qty * price_decimal).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-        print(f"[apex_client] budget={budget} USDT -> qty={size_str}, used≈{used_budget}")
+
+        used_budget = (snapped_qty * price_decimal).quantize(
+            Decimal("0.01"), rounding=ROUND_DOWN
+        )
+
+        print(
+            f"[apex_client] budget={budget} USDT -> qty={size_str}, "
+            f"used≈{used_budget} USDT (price {price_str})"
+        )
     else:
-        if size is None: raise ValueError("size or size_usdt must be provided")
+        if size is None:
+            raise ValueError("size or size_usdt must be provided")
         size_str = str(size)
         price_str = get_market_price(symbol, side, size_str)
         price_decimal = Decimal(price_str)
-        used_budget = (price_decimal * Decimal(size_str)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        used_budget = (price_decimal * Decimal(size_str)).quantize(
+            Decimal("0.01"), rounding=ROUND_DOWN
+        )
 
     ts = int(time.time())
     apex_client_id = _random_client_id()
+
     if client_id:
         print(f"[apex_client] tv_client_id={client_id} -> apex_clientId={apex_client_id}")
     else:
-        print(f"[apex_client] apex_clientId={apex_client_id}")
+        print(f"[apex_client] apex_clientId={apex_client_id} (no tv_client_id)")
 
     params = {
         "symbol": symbol,
@@ -298,10 +401,13 @@ def create_market_order(
     }
 
     print("[apex_client] create_market_order params:", params)
+
     raw_order = client.create_order_v3(**params)
+
     print("[apex_client] order response:", raw_order)
 
     data = raw_order["data"] if isinstance(raw_order, dict) and "data" in raw_order else raw_order
+
     order_id, client_order_id = _extract_order_ids(raw_order)
 
     return {
@@ -319,10 +425,9 @@ def create_market_order(
         },
     }
 
-# ============================================================
-# ✅ Remote Position Helpers (from Repository files)
-# 用于阶梯逻辑的兜底查询
-# ============================================================
+# ------------------------------------------------------------
+# ✅ 仓库逻辑植入：远程查仓兜底
+# ------------------------------------------------------------
 def _norm_symbol(s: str) -> str:
     return str(s or "").upper().replace("-", "").replace("_", "").strip()
 
