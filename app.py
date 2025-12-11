@@ -9,8 +9,8 @@ from flask import Flask, request, jsonify, Response
 from apex_client import (
     create_market_order,
     get_market_price,
-    get_fill_summary,              # ✅ 仓库逻辑：真实成交回写
-    get_open_position_for_symbol,  # ✅ 仓库逻辑：远程查仓
+    get_fill_summary,              # ✅ 新增：仓库逻辑-真实成交回写
+    get_open_position_for_symbol,  # ✅ 新增：仓库逻辑-远程查仓
     map_position_side_to_exit_order_side,
     _get_symbol_rules,
     _snap_quantity,
@@ -147,7 +147,6 @@ def _get_current_price(symbol: str, direction: str) -> Optional[Decimal]:
         rules = _get_symbol_rules(symbol)
         min_qty = rules["min_qty"]
         exit_side = "SELL" if direction.upper() == "LONG" else "BUY"
-        # ✅ 这里调用的是 apex_client 的 get_market_price，即“真实可执行价格”
         px_str = get_market_price(symbol, exit_side, str(min_qty))
         return Decimal(str(px_str))
     except Exception as e:
@@ -254,7 +253,7 @@ def _execute_virtual_exit(bot_id: str, symbol: str, direction: str, qty: Decimal
 
 
 def _risk_loop():
-    print("[RISK] ladder/baseSL thread started (The Polling Loop)")
+    print("[RISK] ladder/baseSL thread started")
     while True:
         try:
             bots = sorted(list(LONG_LADDER_BOTS | SHORT_LADDER_BOTS))
@@ -270,6 +269,15 @@ def _risk_loop():
 
                     qty = v["qty"]
                     entry_price = v["weighted_entry"]
+
+                    # ✅ 新增：仓库功能-远程兜底
+                    # 如果本地没仓位，尝试去查一下交易所，以防万一
+                    if qty <= 0:
+                        remote = get_open_position_for_symbol(symbol)
+                        if remote and remote["size"] > 0 and remote["side"] == direction_u:
+                            qty = remote["size"]
+                            entry_price = remote["entryPrice"]
+                            print(f"[RISK] Found remote position for {bot_id} {symbol}: {qty} @ {entry_price}")
 
                     if qty <= 0 or entry_price <= 0:
                         continue
@@ -292,7 +300,6 @@ def _risk_loop():
                         continue
 
                     # 2) 计算目标锁盈档位
-                    # ✅ 这里会自动用到您定义的阶梯逻辑：0.18->0.1, 0.38->0.2, 0.58->0.4...
                     desired_lock = _desired_lock_level_pct(pnl_pct)
                     current_lock = get_lock_level_pct(bot_id, symbol, direction_u)
 
@@ -711,7 +718,7 @@ def tv_webhook():
                 "cancel_reason": cancel_reason,
             }), 200
 
-        # ✅ 4) 真实成交价优先记账 (仓库逻辑植入)
+        # ✅ 4) 真实成交价优先记账 (Real Executable Price)
         computed = (order or {}).get("computed") or {}
         fallback_price_str = computed.get("price")
 
@@ -812,7 +819,7 @@ def tv_webhook():
         elif short_qty > 0:
             direction_to_close, qty_to_close = "SHORT", short_qty
 
-        # ✅ 仓库逻辑植入：远程查仓兜底
+        # ✅ 新增：如果本地没仓位，尝试远程查询兜底
         if not direction_to_close or qty_to_close <= 0:
             print(f"[EXIT] local 0 position, trying remote fallback for {symbol}...")
             remote = get_open_position_for_symbol(symbol)
