@@ -63,7 +63,7 @@ def init_db():
     )
     """)
 
-    # lock levels: 阶梯锁盈档位
+    # lock levels
     cur.execute("""
     CREATE TABLE IF NOT EXISTS lock_levels (
         bot_id TEXT NOT NULL,
@@ -123,9 +123,9 @@ def record_exit_fifo(
     reason: str = "strategy_exit",
 ):
     """
-    FIFO 出场：
-    - 只从该 bot 的该方向 lots 里扣 remaining_qty
-    - 只记该 bot 自己卖出的数量
+    核心独立性：
+    - 只从该 bot 的该方向 lots 里 FIFO 扣 remaining_qty
+    - 只记自己卖出的数量
     """
     direction = _side_to_direction(entry_side)
     exit_side = "SELL" if direction == "LONG" else "BUY"
@@ -151,7 +151,6 @@ def record_exit_fifo(
         return
 
     ts = _now()
-
     for r in rows:
         if need <= 0:
             break
@@ -230,11 +229,27 @@ def get_bot_open_positions(bot_id: str) -> Dict[Tuple[str, str], Dict[str, Any]]
 
         out[(symbol, direction)] = {
             "qty": qty_sum,
-            "weighted_entry": weighted,
+            "weighted_entry": weighted
         }
 
     conn.close()
     return out
+
+
+def get_open_qty(bot_id: str, symbol: str, direction: str) -> Decimal:
+    """
+    用于 exit 后判断是否仍有剩余仓位，决定是否清 lock_level
+    """
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT SUM(CAST(remaining_qty AS REAL)) AS qty_sum
+        FROM lots
+        WHERE bot_id=? AND symbol=? AND direction=? AND CAST(remaining_qty AS REAL) > 0
+    """, (bot_id, symbol, direction.upper()))
+    row = cur.fetchone()
+    conn.close()
+    return _d(row["qty_sum"] if row and row["qty_sum"] is not None else "0")
 
 
 def list_bots_with_activity() -> List[str]:
@@ -280,7 +295,6 @@ def get_bot_summary(bot_id: str) -> Dict[str, Any]:
         FROM exits WHERE bot_id=?
     """, (bot_id,))
     row = cur.fetchone()
-
     total = _d(row["s"] or "0")
     count = int(row["c"] or 0)
 
@@ -297,7 +311,7 @@ def get_bot_summary(bot_id: str) -> Dict[str, Any]:
 
 
 # ---------------------------
-# ✅ Lock level persistence
+# Lock level persistence
 # ---------------------------
 def get_lock_level_pct(bot_id: str, symbol: str, direction: str) -> Decimal:
     conn = _connect()
@@ -308,7 +322,6 @@ def get_lock_level_pct(bot_id: str, symbol: str, direction: str) -> Decimal:
     """, (bot_id, symbol, direction.upper()))
     row = cur.fetchone()
     conn.close()
-
     if not row:
         return Decimal("0")
     try:
