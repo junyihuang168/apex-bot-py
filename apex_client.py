@@ -1,9 +1,8 @@
 import os
 import time
 import random
-import inspect
 from decimal import Decimal, ROUND_DOWN
-from typing import Dict, Any, Optional, Union, Tuple, Callable
+from typing import Dict, Any, Optional, Union, Tuple
 
 from apexomni.http_private_sign import HttpPrivateSign
 from apexomni.constants import (
@@ -27,7 +26,6 @@ SYMBOL_RULES: Dict[str, Dict[str, Any]] = {
 }
 
 _CLIENT: Optional[HttpPrivateSign] = None
-_PUBLIC_CLIENT: Optional[Any] = None
 
 
 def _get_symbol_rules(symbol: str) -> Dict[str, Any]:
@@ -86,20 +84,6 @@ def _random_client_id() -> str:
     return str(int(float(str(random.random())[2:])))
 
 
-def _call_compat(fn: Callable, **kwargs):
-    """
-    用 inspect.signature 做参数兼容（比 __code__.co_varnames 稳定）
-    """
-    try:
-        sig = inspect.signature(fn)
-        allowed = set(sig.parameters.keys())
-        filtered = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
-        return fn(**filtered)
-    except Exception:
-        # 兜底：如果签名不可用，直接尽力用 kwargs 调
-        return fn(**{k: v for k, v in kwargs.items() if v is not None})
-
-
 def get_client() -> HttpPrivateSign:
     global _CLIENT
     if _CLIENT is not None:
@@ -140,111 +124,10 @@ def get_account():
     return client.get_account_v3()
 
 
-# ---------------------------
-# Public price (mark/last) – 用于风控/触发判断，更贴近图表
-# ---------------------------
-def get_public_client():
-    """
-    尽量初始化 public client（不同 apexomni 版本类名可能不同）
-    """
-    global _PUBLIC_CLIENT
-    if _PUBLIC_CLIENT is not None:
-        return _PUBLIC_CLIENT
-
-    base_url, network_id = _get_base_and_network()
-
-    candidates = [
-        ("apexomni.http_public_v3", "HttpPublic_v3"),
-        ("apexomni.http_public_v2", "HttpPublic_v2"),
-        ("apexomni.http_public", "HttpPublic"),
-    ]
-
-    last_err = None
-    for mod_name, cls_name in candidates:
-        try:
-            mod = __import__(mod_name, fromlist=[cls_name])
-            cls = getattr(mod, cls_name)
-            _PUBLIC_CLIENT = cls(base_url, network_id=network_id)
-            print(f"[apex_client] public client ok: {mod_name}.{cls_name}")
-            return _PUBLIC_CLIENT
-        except Exception as e:
-            last_err = e
-
-    raise RuntimeError(f"public client unavailable: {last_err!r}")
-
-
-def _pick_price_from_ticker(obj: Any) -> Optional[str]:
-    """
-    解析各种 ticker 返回结构，尽量取 mark/last/index
-    """
-    if obj is None:
-        return None
-
-    if isinstance(obj, dict):
-        d = obj.get("data") if isinstance(obj.get("data"), (dict, list)) else obj
-
-        # data 可能是 list（多 symbol）
-        if isinstance(d, list) and d:
-            # 找第一个有价格的
-            for it in d:
-                if isinstance(it, dict):
-                    for k in ("markPrice", "lastPrice", "indexPrice", "price", "close"):
-                        v = it.get(k)
-                        if v is not None:
-                            return str(v)
-
-        if isinstance(d, dict):
-            for k in ("markPrice", "lastPrice", "indexPrice", "price", "close"):
-                v = d.get(k)
-                if v is not None:
-                    return str(v)
-
-    return None
-
-
-def get_ticker_price(symbol: str, prefer: str = "mark") -> str:
-    """
-    风控/触发用：mark/last/index 价优先（贴近图表）
-    prefer: "mark" / "last" / "index"
-    """
-    pub = get_public_client()
-
-    # 可能的方法名
-    methods = [
-        "get_ticker_v3",
-        "get_ticker",
-        "ticker_v3",
-        "get_mark_price_v3",
-        "get_index_price_v3",
-    ]
-
-    last_err = None
-    for name in methods:
-        if hasattr(pub, name):
-            try:
-                fn = getattr(pub, name)
-
-                # 尽量传 symbol
-                res = None
-                try:
-                    res = _call_compat(fn, symbol=symbol)
-                except Exception:
-                    # 有些方法可能叫 market / instrument
-                    res = _call_compat(fn, market=symbol)
-
-                px = _pick_price_from_ticker(res)
-                if px:
-                    return px
-            except Exception as e:
-                last_err = e
-
-    raise RuntimeError(f"ticker price unavailable for {symbol}, last_err={last_err!r}")
-
-
-# ---------------------------
-# Worst executable price – 用于下单保护（不用于记账默认，不用于风控触发）
-# ---------------------------
-def get_worst_price(symbol: str, side: str, size: str) -> str:
+# -----------------------
+# worstPrice (existing)
+# -----------------------
+def get_market_price(symbol: str, side: str, size: str) -> str:
     base_url, network_id = _get_base_and_network()
     api_creds = _get_api_credentials()
 
@@ -280,13 +163,15 @@ def get_worst_price(symbol: str, side: str, size: str) -> str:
     return price_str
 
 
+# ✅ clearer alias (app sizing uses this)
+def get_worst_price(symbol: str, side: str, size: str) -> str:
+    return get_market_price(symbol, side, size)
+
+
 NumberLike = Union[str, float, int]
 
 
 def _extract_order_ids(raw_order: Any) -> Tuple[Optional[str], Optional[str]]:
-    """
-    尽量从 Apex 返回中拿 orderId / clientOrderId
-    """
     order_id = None
     client_order_id = None
 
@@ -309,100 +194,205 @@ def _extract_order_ids(raw_order: Any) -> Tuple[Optional[str], Optional[str]]:
     return (str(order_id) if order_id else None, str(client_order_id) if client_order_id else None)
 
 
-def _as_fills_list(x: Any):
-    if x is None:
-        return []
-    if isinstance(x, list):
-        return x
-    if isinstance(x, dict):
-        data = x.get("data")
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict):
-            # 常见：data.fills
-            fills = data.get("fills")
-            if isinstance(fills, list):
-                return fills
-    return []
+# -----------------------
+# ✅ Public ticker helpers
+# -----------------------
+def _pick_price_from_ticker(obj: Any) -> Optional[str]:
+    if obj is None:
+        return None
+
+    keys = (
+        "markPrice", "lastPrice", "indexPrice",
+        "price", "close", "last", "mark", "index",
+        "oraclePrice", "midPrice"
+    )
+
+    if isinstance(obj, dict):
+        d = obj.get("data") if isinstance(obj.get("data"), (dict, list)) else obj
+
+        if isinstance(d, list) and d:
+            for it in d:
+                if isinstance(it, dict):
+                    for k in keys:
+                        v = it.get(k)
+                        if v is not None:
+                            return str(v)
+
+        if isinstance(d, dict):
+            for k in keys:
+                v = d.get(k)
+                if v is not None:
+                    return str(v)
+
+            for subk in ("ticker", "result"):
+                sub = d.get(subk)
+                if isinstance(sub, dict):
+                    for k in keys:
+                        v = sub.get(k)
+                        if v is not None:
+                            return str(v)
+
+    return None
 
 
+def get_ticker_price(symbol: str, prefer: str = "last") -> str:
+    """
+    Best-effort public ticker.
+    If your SDK has HttpPublic_v3, we use it; else fallback to requests with a few common paths.
+    """
+    sym = str(symbol)
+
+    # 1) Try SDK public client (different versions may differ)
+    try:
+        from apexomni.http_public_v3 import HttpPublic_v3  # type: ignore
+
+        base_url, network_id = _get_base_and_network()
+        pub = HttpPublic_v3(base_url, network_id=network_id)
+
+        candidates = [
+            "get_ticker_v3",
+            "get_tickers_v3",
+            "get_ticker",
+            "get_tickers",
+            "get_mark_price_v3",
+        ]
+
+        res = None
+        last_err = None
+        for name in candidates:
+            if hasattr(pub, name):
+                try:
+                    fn = getattr(pub, name)
+                    # try common call styles
+                    if "symbol" in getattr(fn, "__code__", type("x", (), {"co_varnames": ()})) .co_varnames:
+                        res = fn(symbol=sym)
+                    else:
+                        res = fn(sym)
+                    break
+                except Exception as e:
+                    last_err = e
+
+        if os.getenv("APEX_DEBUG_TICKER", "0") == "1":
+            print("[apex_client] ticker raw response (sdk):", res)
+
+        px = _pick_price_from_ticker(res)
+        if px is not None:
+            return str(Decimal(px))
+
+        if last_err:
+            raise RuntimeError(last_err)
+
+    except Exception as e:
+        # continue to requests fallback
+        if os.getenv("APEX_DEBUG_TICKER", "0") == "1":
+            print("[apex_client] sdk ticker failed, fallback to requests:", e)
+
+    # 2) requests fallback
+    try:
+        import requests
+
+        base_url, _ = _get_base_and_network()
+        # allow override if needed
+        public_base = os.getenv("APEX_PUBLIC_BASE_URL", base_url).rstrip("/")
+
+        paths = [
+            f"/api/v3/ticker?symbol={sym}",
+            f"/api/v3/tickers?symbol={sym}",
+            f"/v3/ticker?symbol={sym}",
+            f"/v3/tickers?symbol={sym}",
+        ]
+
+        last_err = None
+        for p in paths:
+            try:
+                url = public_base + p
+                r = requests.get(url, timeout=2.5)
+                js = r.json() if r.content else None
+
+                if os.getenv("APEX_DEBUG_TICKER", "0") == "1":
+                    print("[apex_client] ticker raw response (requests):", url, js)
+
+                px = _pick_price_from_ticker(js)
+                if px is not None:
+                    return str(Decimal(px))
+            except Exception as e:
+                last_err = e
+
+        raise RuntimeError(last_err or "no ticker response")
+
+    except Exception as e:
+        raise RuntimeError(f"ticker price unavailable for {sym}, err={e}")
+
+
+# -------------------------------------------------------------------------
+# ✅ 真实成交信息（fills）总结
+# -------------------------------------------------------------------------
 def get_fill_summary(
     symbol: str,
     order_id: Optional[str] = None,
     client_order_id: Optional[str] = None,
-    max_wait_sec: float = 3.0,
-    poll_interval_fast: float = 0.15,
-    poll_interval_slow: float = 0.35,
-    fast_window_sec: float = 2.2,
+    max_wait_sec: float = 2.0,
+    poll_interval: float = 0.25,
 ) -> Dict[str, Any]:
-    """
-    下单后：前 2–3 秒高频拉 fills。
-    - 优先解析 fills 的逐笔，计算 avg_fill_price
-    - 再退而求其次从 order_detail 里找 avgPrice/filledSize
-    """
     client = get_client()
     start = time.time()
-    last_err = None
-
-    # 可能的候选方法名（不同版本 SDK 可能不一样）
-    order_candidates = [
-        "get_order_v3",
-        "get_order_detail_v3",
-        "get_order_by_id_v3",
-        "get_order_v3_by_id",
-        "get_order",
-    ]
-
-    fill_candidates = [
-        "get_fills_v3",
-        "get_order_fills_v3",
-        "get_trade_fills_v3",
-        "get_fills",
-    ]
 
     while True:
+        last_err = None
+
+        candidates = [
+            "get_order_v3",
+            "get_order_detail_v3",
+            "get_order_by_id_v3",
+            "get_order_v3_by_id",
+        ]
+
         order_obj = None
+        for name in candidates:
+            if hasattr(client, name) and order_id:
+                try:
+                    fn = getattr(client, name)
+                    order_obj = fn(orderId=order_id) if "orderId" in fn.__code__.co_varnames else fn(order_id)
+                    break
+                except Exception as e:
+                    last_err = e
+
         fills_obj = None
-
-        # 1) order detail
-        if order_id:
-            for name in order_candidates:
-                if hasattr(client, name):
-                    try:
-                        fn = getattr(client, name)
-                        # 兼容参数
-                        order_obj = None
-                        try:
-                            order_obj = _call_compat(fn, orderId=order_id, order_id=order_id, id=order_id, symbol=symbol)
-                        except Exception:
-                            # 有些 SDK 可能只接受位置参数
-                            order_obj = fn(order_id)
-                        break
-                    except Exception as e:
-                        last_err = e
-
-        # 2) fills
+        fill_candidates = [
+            "get_fills_v3",
+            "get_order_fills_v3",
+            "get_trade_fills_v3",
+        ]
         for name in fill_candidates:
             if hasattr(client, name):
                 try:
                     fn = getattr(client, name)
-                    fills_obj = None
-                    # 优先 orderId
-                    if order_id:
-                        try:
-                            fills_obj = _call_compat(fn, orderId=order_id, order_id=order_id, id=order_id, symbol=symbol)
-                        except Exception:
-                            fills_obj = fn(order_id)
-                    # 再试 clientId
-                    if fills_obj is None and client_order_id:
-                        fills_obj = _call_compat(fn, clientId=client_order_id, client_id=client_order_id, symbol=symbol)
-
-                    if fills_obj is not None:
-                        break
+                    if order_id and "orderId" in fn.__code__.co_varnames:
+                        fills_obj = fn(orderId=order_id)
+                    elif client_order_id and "clientId" in fn.__code__.co_varnames:
+                        fills_obj = fn(clientId=client_order_id)
+                    elif order_id:
+                        fills_obj = fn(order_id)
+                    else:
+                        continue
+                    break
                 except Exception as e:
                     last_err = e
 
-        fills_list = _as_fills_list(fills_obj)
+        def _as_list(x):
+            if x is None:
+                return []
+            if isinstance(x, list):
+                return x
+            if isinstance(x, dict):
+                data = x.get("data")
+                if isinstance(data, list):
+                    return data
+                if isinstance(data, dict) and "fills" in data and isinstance(data["fills"], list):
+                    return data["fills"]
+            return []
+
+        fills_list = _as_list(fills_obj)
 
         total_qty = Decimal("0")
         total_notional = Decimal("0")
@@ -433,7 +423,6 @@ def get_fill_summary(
                 "raw_fills": fills_obj,
             }
 
-        # 3) fallback: 从 order detail 找 filledSize/avgPrice
         if isinstance(order_obj, dict):
             data = order_obj.get("data") if isinstance(order_obj.get("data"), dict) else order_obj
             if isinstance(data, dict):
@@ -456,13 +445,10 @@ def get_fill_summary(
                 except Exception as e:
                     last_err = e
 
-        elapsed = time.time() - start
-        if elapsed >= max_wait_sec:
+        if time.time() - start >= max_wait_sec:
             raise RuntimeError(f"fill summary unavailable, last_err={last_err!r}")
 
-        # 前 2.x 秒高频，之后降频
-        interval = poll_interval_fast if elapsed <= fast_window_sec else poll_interval_slow
-        time.sleep(interval)
+        time.sleep(poll_interval)
 
 
 def create_market_order(
@@ -473,73 +459,44 @@ def create_market_order(
     reduce_only: bool = False,
     client_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    MARKET 市价单。
-    注意：
-    - 下单 price 默认仍使用 worstPrice 作为“保护性 price”（防滑点/风控）
-    - 真实成交价/触发判断由上层用 get_fill_summary / get_ticker_price 来做
-    """
     client = get_client()
     side = side.upper()
 
     rules = _get_symbol_rules(symbol)
     decimals = rules["qty_decimals"]
 
-    # 订单保护价模式：默认 worst（更稳，不容易被交易所拒单）
-    order_price_mode = os.getenv("APEX_ORDER_PRICE_MODE", "worst").lower().strip()  # worst / last
-
     if size_usdt is not None:
         budget = Decimal(str(size_usdt))
         if budget <= 0:
             raise ValueError("size_usdt must be > 0")
 
-        # 用 ticker 估算 qty（不走 worstPrice 做估值），如果 public 不可用才兜底 worst
-        ref_px = None
-        try:
-            ref_px = Decimal(get_ticker_price(symbol, prefer="last"))
-        except Exception as e:
-            print("[apex_client] ticker price unavailable for sizing, fallback worst:", e)
-
         min_qty = rules["min_qty"]
-        if ref_px is None or ref_px <= 0:
-            ref_px = Decimal(get_worst_price(symbol, side, str(min_qty)))
-
-        theoretical_qty = budget / ref_px
+        ref_price_decimal = Decimal(get_market_price(symbol, side, str(min_qty)))
+        theoretical_qty = budget / ref_price_decimal
         snapped_qty = _snap_quantity(symbol, theoretical_qty)
 
-        # 下单 price
-        if order_price_mode == "last":
-            try:
-                price_str = get_ticker_price(symbol, prefer="last")
-            except Exception:
-                price_str = get_worst_price(symbol, side, str(snapped_qty))
-        else:
-            price_str = get_worst_price(symbol, side, str(snapped_qty))
+        price_str = get_market_price(symbol, side, str(snapped_qty))
+        price_decimal = Decimal(price_str)
 
-        price_decimal = Decimal(str(price_str))
         size_str = format(snapped_qty, f".{decimals}f")
 
-        used_budget = (snapped_qty * price_decimal).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        used_budget = (snapped_qty * price_decimal).quantize(
+            Decimal("0.01"), rounding=ROUND_DOWN
+        )
 
         print(
             f"[apex_client] budget={budget} USDT -> qty={size_str}, "
-            f"used≈{used_budget} USDT (order_price={price_str}, mode={order_price_mode})"
+            f"used≈{used_budget} USDT (price {price_str})"
         )
     else:
         if size is None:
             raise ValueError("size or size_usdt must be provided")
         size_str = str(size)
-
-        if order_price_mode == "last":
-            try:
-                price_str = get_ticker_price(symbol, prefer="last")
-            except Exception:
-                price_str = get_worst_price(symbol, side, size_str)
-        else:
-            price_str = get_worst_price(symbol, side, size_str)
-
-        price_decimal = Decimal(str(price_str))
-        used_budget = (price_decimal * Decimal(size_str)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        price_str = get_market_price(symbol, side, size_str)
+        price_decimal = Decimal(price_str)
+        used_budget = (price_decimal * Decimal(size_str)).quantize(
+            Decimal("0.01"), rounding=ROUND_DOWN
+        )
 
     ts = int(time.time())
     apex_client_id = _random_client_id()
@@ -567,6 +524,7 @@ def create_market_order(
     print("[apex_client] order response:", raw_order)
 
     data = raw_order["data"] if isinstance(raw_order, dict) and "data" in raw_order else raw_order
+
     order_id, client_order_id = _extract_order_ids(raw_order)
 
     return {
@@ -578,15 +536,13 @@ def create_market_order(
             "symbol": symbol,
             "side": side,
             "size": size_str,
-            "order_price": str(price_str),        # 下单保护价
+            "price": price_str,
             "used_budget": str(used_budget),
             "reduce_only": reduce_only,
-            "order_price_mode": order_price_mode,
         },
     }
 
 
-# ✅ 远程查仓函数（追加在后面）
 def _norm_symbol(s: str) -> str:
     return str(s or "").upper().replace("-", "").replace("_", "").strip()
 
