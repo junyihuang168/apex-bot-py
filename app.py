@@ -9,9 +9,8 @@ from flask import Flask, request, jsonify, Response
 from apex_client import (
     create_market_order,
     get_market_price,
-    get_fill_summary,              # ✅ 新增：仓库逻辑-真实成交回写
-    get_open_position_for_symbol,  # ✅ 新增：仓库逻辑-远程查仓
-    map_position_side_to_exit_order_side,
+    get_fill_summary,              # 真实成交抓取（Fill-First）
+    get_open_position_for_symbol,  # 远程查仓兜底
     _get_symbol_rules,
     _snap_quantity,
 )
@@ -45,23 +44,34 @@ def _require_token() -> bool:
 def _parse_bot_list(env_val: str) -> Set[str]:
     return {b.strip() for b in env_val.split(",") if b.strip()}
 
-# BOT 1-10：做多风控
+
+# ---------------------------------------------------------
+# ✅ Bot 分组：按你新需求
+# - BOT_1 ~ BOT_5：做多风控（SL + 阶梯锁盈）
+# - BOT_6 ~ BOT_10：做空风控（SL + 阶梯锁盈）
+# - 其他 bot：策略-only（不进风控线程，但仍 Fill-First 记账）
+# ---------------------------------------------------------
 LONG_LADDER_BOTS = _parse_bot_list(
-    os.getenv("LONG_LADDER_BOTS", ",".join([f"BOT_{i}" for i in range(1, 11)]))
+    os.getenv("LONG_LADDER_BOTS", ",".join([f"BOT_{i}" for i in range(1, 6)]))
 )
 
-# BOT 11-20：做空风控
 SHORT_LADDER_BOTS = _parse_bot_list(
-    os.getenv("SHORT_LADDER_BOTS", ",".join([f"BOT_{i}" for i in range(11, 21)]))
+    os.getenv("SHORT_LADDER_BOTS", ",".join([f"BOT_{i}" for i in range(6, 11)]))
 )
 
-# ✅ 基础止损默认 0.5%
+# ✅ 基础止损默认 0.5%（你说的 -0.5 本金）
 BASE_SL_PCT = Decimal(os.getenv("BASE_SL_PCT", "0.5"))
 
-# 风控轮询间隔
-RISK_POLL_INTERVAL = float(os.getenv("RISK_POLL_INTERVAL", "2.0"))
+# 风控轮询间隔：建议更快一些（默认 0.6s）
+RISK_POLL_INTERVAL = float(os.getenv("RISK_POLL_INTERVAL", "0.6"))
 
-# 本地 cache（仅辅助）
+# Fill-First：前 2-3 秒高频 + 慢速兜底（不回退 worstPrice）
+FILL_FAST_WAIT_SEC = float(os.getenv("FILL_FAST_WAIT_SEC", "3.0"))
+FILL_FAST_POLL_SEC = float(os.getenv("FILL_FAST_POLL_SEC", "0.20"))
+FILL_SLOW_WAIT_SEC = float(os.getenv("FILL_SLOW_WAIT_SEC", "12.0"))
+FILL_SLOW_POLL_SEC = float(os.getenv("FILL_SLOW_POLL_SEC", "0.50"))
+
+# 本地 cache（仅辅助，不作为真相源）
 BOT_POSITIONS: Dict[Tuple[str, str], dict] = {}
 
 _MONITOR_THREAD_STARTED = False
@@ -116,21 +126,39 @@ def _order_status_and_reason(order: dict):
 
 
 # ----------------------------
-# 你的阶梯锁盈规则
+# ✅ 你的最新阶梯锁盈规则（百分比单位）
+# - 费用：0.05 单边，一买一卖 0.10
+# - 0.15 -> lock 0.10（确保不亏）
+# - 0.45 -> lock 0.20
+# - 0.55 -> lock 0.30
+# - 0.65 -> lock 0.40
+# - >=0.65 后，每多 +0.10 利润，lock +0.10（0.75->0.50，0.85->0.60 ...）
 # ----------------------------
-TRIGGER_1 = Decimal("0.18")
+TRIGGER_1 = Decimal("0.15")
 LOCK_1 = Decimal("0.10")
-TRIGGER_2 = Decimal("0.38")
+TRIGGER_2 = Decimal("0.45")
 LOCK_2 = Decimal("0.20")
-STEP = Decimal("0.20")
+TRIGGER_3 = Decimal("0.55")
+LOCK_3 = Decimal("0.30")
+TRIGGER_4 = Decimal("0.65")
+LOCK_4 = Decimal("0.40")
+STEP = Decimal("0.10")
 
 def _desired_lock_level_pct(pnl_pct: Decimal) -> Decimal:
-    if pnl_pct < TRIGGER_1:
+    p = pnl_pct
+    if p < TRIGGER_1:
         return Decimal("0")
-    if pnl_pct < TRIGGER_2:
+    if p < TRIGGER_2:
         return LOCK_1
-    n = (pnl_pct - TRIGGER_2) // STEP
-    return LOCK_2 + STEP * n
+    if p < TRIGGER_3:
+        return LOCK_2
+    if p < TRIGGER_4:
+        return LOCK_3
+
+    # p >= 0.65
+    extra = p - TRIGGER_4
+    n = int(extra // STEP)  # 0.65->0, 0.75->1, 0.85->2 ...
+    return LOCK_4 + STEP * Decimal(n)
 
 
 def _bot_allows_direction(bot_id: str, direction: str) -> bool:
@@ -143,6 +171,11 @@ def _bot_allows_direction(bot_id: str, direction: str) -> bool:
 
 
 def _get_current_price(symbol: str, direction: str) -> Optional[Decimal]:
+    """
+    当前可执行价格的保守估计（用 worst price）。
+    注意：它只用于风控触发判断的“当前价”，不是 entry/exit 基准价。
+    entry/exit 基准价一律来自真实 fill。
+    """
     try:
         rules = _get_symbol_rules(symbol)
         min_qty = rules["min_qty"]
@@ -185,7 +218,78 @@ def _lock_hit(direction: str, entry_price: Decimal, current_price: Decimal, lock
         return current_price >= lock_price
 
 
+def _fill_first_wait(symbol: str, order_id: Optional[str], client_order_id: Optional[str]) -> Tuple[Decimal, Decimal]:
+    """
+    ✅ Fill-First：先 2-3 秒高频尝试，然后慢速兜底。
+    返回 (filled_qty, avg_fill_price)，失败直接抛异常（上层不得用 worstPrice 回退记账）。
+    """
+    last_err = None
+
+    # fast window
+    try:
+        fill = get_fill_summary(
+            symbol=symbol,
+            order_id=order_id,
+            client_order_id=client_order_id,
+            max_wait_sec=FILL_FAST_WAIT_SEC,
+            poll_interval=FILL_FAST_POLL_SEC,
+        )
+        fq = Decimal(str(fill["filled_qty"]))
+        ap = Decimal(str(fill["avg_fill_price"]))
+        if fq > 0 and ap > 0:
+            return fq, ap
+    except Exception as e:
+        last_err = e
+
+    # slow window
+    try:
+        fill = get_fill_summary(
+            symbol=symbol,
+            order_id=order_id,
+            client_order_id=client_order_id,
+            max_wait_sec=FILL_SLOW_WAIT_SEC,
+            poll_interval=FILL_SLOW_POLL_SEC,
+        )
+        fq = Decimal(str(fill["filled_qty"]))
+        ap = Decimal(str(fill["avg_fill_price"]))
+        if fq > 0 and ap > 0:
+            return fq, ap
+    except Exception as e:
+        last_err = e
+
+    raise RuntimeError(f"Fill-First failed: cannot obtain fills. last_err={last_err!r}")
+
+
+def _smc_guard_block_duplicate_entry(bot_id: str, symbol: str, side_raw: str) -> Optional[str]:
+    """
+    ✅ BOT_1 / BOT_6（SMC 专用）尽量不出错：
+    - 本地 lots 已经有同方向仓位 -> 拒绝重复开仓
+    - 交易所远程查到同方向仓位 -> 拒绝重复开仓
+    """
+    direction = "LONG" if side_raw.upper() == "BUY" else "SHORT"
+
+    opens = get_bot_open_positions(bot_id)
+    key = (symbol, direction)
+    if key in opens:
+        try:
+            q = opens[key].get("qty", Decimal("0"))
+            if q and Decimal(str(q)) > 0:
+                return f"SMC_GUARD: bot already has local open lots for {symbol} {direction}"
+        except Exception:
+            pass
+
+    remote = get_open_position_for_symbol(symbol)
+    if remote and remote.get("size") and Decimal(str(remote["size"])) > 0:
+        if str(remote.get("side", "")).upper() == direction:
+            return f"SMC_GUARD: exchange already has open position for {symbol} {direction}"
+
+    return None
+
+
 def _execute_virtual_exit(bot_id: str, symbol: str, direction: str, qty: Decimal, reason: str):
+    """
+    ✅ 风控出场：必须拿到真实成交价（Fill-First），否则不记账/不假算。
+    """
     if qty <= 0:
         return
 
@@ -193,15 +297,7 @@ def _execute_virtual_exit(bot_id: str, symbol: str, direction: str, qty: Decimal
     entry_side = "BUY" if direction_u == "LONG" else "SELL"
     exit_side = "SELL" if direction_u == "LONG" else "BUY"
 
-    exit_price = _get_current_price(symbol, direction_u)
-    if exit_price is None:
-        print(f"[RISK] skip exit due to no price bot={bot_id} symbol={symbol}")
-        return
-
-    print(
-        f"[RISK] EXIT bot={bot_id} symbol={symbol} direction={direction_u} "
-        f"qty={qty} reason={reason}"
-    )
+    print(f"[RISK] EXIT bot={bot_id} symbol={symbol} direction={direction_u} qty={qty} reason={reason}")
 
     try:
         order = create_market_order(
@@ -217,14 +313,20 @@ def _execute_virtual_exit(bot_id: str, symbol: str, direction: str, qty: Decimal
         if status in ("CANCELED", "REJECTED"):
             return
 
+        order_id = order.get("order_id")
+        client_order_id = order.get("client_order_id")
+
+        # ✅ Fill-First：真实 exit fill
+        filled_qty, avg_exit = _fill_first_wait(symbol, order_id, client_order_id)
+
         # ✅ FIFO 记账，仅扣该 bot 自己的 lots
         try:
             record_exit_fifo(
                 bot_id=bot_id,
                 symbol=symbol,
                 entry_side=entry_side,
-                exit_qty=qty,
-                exit_price=exit_price,
+                exit_qty=filled_qty,
+                exit_price=avg_exit,
                 reason=reason,
             )
         except Exception as e:
@@ -241,7 +343,7 @@ def _execute_virtual_exit(bot_id: str, symbol: str, direction: str, qty: Decimal
         pos = BOT_POSITIONS.get(key)
         if pos:
             pos_qty = Decimal(str(pos.get("qty") or "0"))
-            new_qty = pos_qty - qty
+            new_qty = pos_qty - filled_qty
             if new_qty < 0:
                 new_qty = Decimal("0")
             pos["qty"] = new_qty
@@ -249,7 +351,7 @@ def _execute_virtual_exit(bot_id: str, symbol: str, direction: str, qty: Decimal
                 pos["entry_price"] = None
 
     except Exception as e:
-        print(f"[RISK] create_market_order error bot={bot_id} symbol={symbol}:", e)
+        print(f"[RISK] exit error bot={bot_id} symbol={symbol}:", e)
 
 
 def _risk_loop():
@@ -270,8 +372,7 @@ def _risk_loop():
                     qty = v["qty"]
                     entry_price = v["weighted_entry"]
 
-                    # ✅ 新增：仓库功能-远程兜底
-                    # 如果本地没仓位，尝试去查一下交易所，以防万一
+                    # ✅ 远程兜底：本地没仓位时，尝试查交易所
                     if qty <= 0:
                         remote = get_open_position_for_symbol(symbol)
                         if remote and remote["size"] > 0 and remote["side"] == direction_u:
@@ -279,8 +380,10 @@ def _risk_loop():
                             entry_price = remote["entryPrice"]
                             print(f"[RISK] Found remote position for {bot_id} {symbol}: {qty} @ {entry_price}")
 
-                    if qty <= 0 or entry_price <= 0:
+                    if qty <= 0 or entry_price is None or Decimal(str(entry_price)) <= 0:
                         continue
+
+                    entry_price = Decimal(str(entry_price))
 
                     current_price = _get_current_price(symbol, direction_u)
                     if current_price is None:
@@ -294,7 +397,7 @@ def _risk_loop():
                             bot_id=bot_id,
                             symbol=symbol,
                             direction=direction_u,
-                            qty=qty,
+                            qty=Decimal(str(qty)),
                             reason="base_sl_exit",
                         )
                         continue
@@ -311,13 +414,13 @@ def _risk_loop():
                             f"pnl={pnl_pct:.4f}% lock_level={current_lock}%"
                         )
 
-                    # 3) 锁盈触发
+                    # 3) 锁盈触发（回撤到 lock 位置）
                     if _lock_hit(direction_u, entry_price, current_price, current_lock):
                         _execute_virtual_exit(
                             bot_id=bot_id,
                             symbol=symbol,
                             direction=direction_u,
-                            qty=qty,
+                            qty=Decimal(str(qty)),
                             reason="ladder_lock_exit",
                         )
 
@@ -396,7 +499,6 @@ def api_pnl():
         })
         out.append(base)
 
-    # 默认按总已实现排序
     def _rt(x):
         try:
             return Decimal(str(x.get("realized_total", "0")))
@@ -459,7 +561,7 @@ def dashboard():
 <header>
   <div>
     <h1>Bot PnL Dashboard</h1>
-    <div class="muted">独立 lots 记账 · 真实成交价优先 · 基础止损默认 0.5% · 阶梯锁盈</div>
+    <div class="muted">独立 lots 记账 · Fill-First 默认 · 基础止损默认 0.5% · 阶梯锁盈</div>
   </div>
   <div class="muted" id="lastUpdate">Loading...</div>
 </header>
@@ -481,8 +583,8 @@ def dashboard():
     <div class="card full">
       <div class="row">
         <div class="group">
-          <span class="pill">BOT 1-10: LONG 阶梯锁盈 + 基础SL(0.5%)</span>
-          <span class="pill">BOT 11-20: SHORT 阶梯锁盈 + 基础SL(0.5%)</span>
+          <span class="pill">BOT 1-5: LONG 风控（SL + 阶梯锁盈）</span>
+          <span class="pill">BOT 6-10: SHORT 风控（SL + 阶梯锁盈）</span>
           <span class="pill">Others: Strategy-only</span>
         </div>
         <div class="small">数据来自 /api/pnl</div>
@@ -673,6 +775,13 @@ def tv_webhook():
         if side_raw not in ("BUY", "SELL"):
             return "missing or invalid side", 400
 
+        # ✅ BOT_1 / BOT_6 防错（SMC 专用）
+        if bot_id in ("BOT_1", "BOT_6"):
+            guard_msg = _smc_guard_block_duplicate_entry(bot_id, symbol, side_raw)
+            if guard_msg:
+                print("[ENTRY] blocked by guard:", guard_msg)
+                return jsonify({"status": "blocked", "reason": guard_msg}), 200
+
         try:
             budget = _extract_budget_usdt(body)
         except Exception as e:
@@ -686,10 +795,7 @@ def tv_webhook():
             return "qty compute error", 500
 
         size_str = str(snapped_qty)
-        print(
-            f"[ENTRY] bot={bot_id} symbol={symbol} side={side_raw} "
-            f"budget={budget} -> qty={size_str}"
-        )
+        print(f"[ENTRY] bot={bot_id} symbol={symbol} side={side_raw} budget={budget} -> qty={size_str}")
 
         try:
             order = create_market_order(
@@ -718,60 +824,54 @@ def tv_webhook():
                 "cancel_reason": cancel_reason,
             }), 200
 
-        # ✅ 4) 真实成交价优先记账 (Real Executable Price)
-        computed = (order or {}).get("computed") or {}
-        fallback_price_str = computed.get("price")
-
+        # ✅ Fill-First：必须拿到真实成交价才记账/开风控（不回退 worstPrice）
         order_id = order.get("order_id")
         client_order_id = order.get("client_order_id")
 
-        entry_price_dec: Optional[Decimal] = None
-        final_qty = snapped_qty
-
         try:
-            fill = get_fill_summary(
-                symbol=symbol,
-                order_id=order_id,
-                client_order_id=client_order_id,
-                max_wait_sec=float(os.getenv("FILL_MAX_WAIT_SEC", "2.0")),
-                poll_interval=float(os.getenv("FILL_POLL_INTERVAL", "0.25")),
-            )
-            entry_price_dec = Decimal(str(fill["avg_fill_price"]))
-            final_qty = Decimal(str(fill["filled_qty"]))
-            print(
-                f"[ENTRY] fill ok bot={bot_id} symbol={symbol} "
-                f"filled_qty={final_qty} avg_fill={entry_price_dec}"
-            )
+            filled_qty, entry_price_dec = _fill_first_wait(symbol, order_id, client_order_id)
         except Exception as e:
-            # 无法拿到 fills → 回退 worst price 参考价
-            print(f"[ENTRY] fill fallback bot={bot_id} symbol={symbol} err:", e)
-            try:
-                if fallback_price_str is not None:
-                    entry_price_dec = Decimal(str(fallback_price_str))
-            except Exception:
-                entry_price_dec = None
+            print(f"[ENTRY] Fill-First failed bot={bot_id} symbol={symbol} err:", e)
+
+            # 远程信息仅用于诊断，不用于记账
+            remote = get_open_position_for_symbol(symbol)
+            diag = None
+            if remote and remote.get("size") and Decimal(str(remote["size"])) > 0:
+                diag = {
+                    "remote_side": remote.get("side"),
+                    "remote_size": str(remote.get("size")),
+                    "remote_entryPrice": str(remote.get("entryPrice")),
+                }
+
+            return jsonify({
+                "status": "fill_unavailable",
+                "mode": "entry",
+                "bot_id": bot_id,
+                "symbol": symbol,
+                "side": side_raw,
+                "requested_qty": size_str,
+                "order_status": status,
+                "cancel_reason": cancel_reason,
+                "order_id": order_id,
+                "diagnostic": diag,
+            }), 200
 
         # 本地 cache 辅助
         key = (bot_id, symbol)
-        BOT_POSITIONS[key] = {
-            "side": side_raw,
-            "qty": final_qty,
-            "entry_price": entry_price_dec,
-        }
+        BOT_POSITIONS[key] = {"side": side_raw, "qty": filled_qty, "entry_price": entry_price_dec}
 
-        # ✅ 独立 lots 记账
-        if entry_price_dec is not None and final_qty > 0:
-            try:
-                record_entry(
-                    bot_id=bot_id,
-                    symbol=symbol,
-                    side=side_raw,
-                    qty=final_qty,
-                    price=entry_price_dec,
-                    reason="strategy_entry_fill" if order_id else "strategy_entry",
-                )
-            except Exception as e:
-                print("[PNL] record_entry error:", e)
+        # ✅ 独立 lots 记账（只用 fill）
+        try:
+            record_entry(
+                bot_id=bot_id,
+                symbol=symbol,
+                side=side_raw,
+                qty=filled_qty,
+                price=entry_price_dec,
+                reason="strategy_entry_fill",
+            )
+        except Exception as e:
+            print("[PNL] record_entry error:", e)
 
         return jsonify({
             "status": "ok",
@@ -779,8 +879,8 @@ def tv_webhook():
             "bot_id": bot_id,
             "symbol": symbol,
             "side": side_raw,
-            "qty": str(final_qty),
-            "entry_price": str(entry_price_dec) if entry_price_dec else None,
+            "qty": str(filled_qty),
+            "entry_price": str(entry_price_dec),
             "requested_qty": size_str,
             "order_status": status,
             "cancel_reason": cancel_reason,
@@ -789,7 +889,7 @@ def tv_webhook():
 
     # -------------------------
     # EXIT（策略出场）
-    # 以 lots 为准，裁剪只平本 bot
+    # ✅ 也改为 Fill-First：用真实成交价记账
     # -------------------------
     if mode == "exit":
         opens = get_bot_open_positions(bot_id)
@@ -819,12 +919,12 @@ def tv_webhook():
         elif short_qty > 0:
             direction_to_close, qty_to_close = "SHORT", short_qty
 
-        # ✅ 新增：如果本地没仓位，尝试远程查询兜底
+        # ✅ 如果本地没仓位，尝试远程查询兜底
         if not direction_to_close or qty_to_close <= 0:
             print(f"[EXIT] local 0 position, trying remote fallback for {symbol}...")
             remote = get_open_position_for_symbol(symbol)
             if remote and remote["size"] > 0:
-                direction_to_close = remote["side"] # LONG/SHORT
+                direction_to_close = remote["side"]  # LONG/SHORT
                 qty_to_close = remote["size"]
                 print(f"[EXIT] remote fallback found: {direction_to_close} {qty_to_close}")
             else:
@@ -834,10 +934,7 @@ def tv_webhook():
         entry_side = "BUY" if direction_to_close == "LONG" else "SELL"
         exit_side = "SELL" if direction_to_close == "LONG" else "BUY"
 
-        print(
-            f"[EXIT] bot={bot_id} symbol={symbol} direction={direction_to_close} "
-            f"qty={qty_to_close} -> exit_side={exit_side}"
-        )
+        print(f"[EXIT] bot={bot_id} symbol={symbol} direction={direction_to_close} qty={qty_to_close} -> exit_side={exit_side}")
 
         try:
             order = create_market_order(
@@ -866,16 +963,34 @@ def tv_webhook():
                 "cancel_reason": cancel_reason,
             }), 200
 
-        exit_price = _get_current_price(symbol, direction_to_close) or Decimal("0")
+        order_id = order.get("order_id")
+        client_order_id = order.get("client_order_id")
+
+        # ✅ Fill-First：真实 exit fill
+        try:
+            filled_qty, avg_exit = _fill_first_wait(symbol, order_id, client_order_id)
+        except Exception as e:
+            print(f"[EXIT] Fill-First failed bot={bot_id} symbol={symbol} err:", e)
+            return jsonify({
+                "status": "fill_unavailable",
+                "mode": "exit",
+                "bot_id": bot_id,
+                "symbol": symbol,
+                "exit_side": exit_side,
+                "requested_qty": str(qty_to_close),
+                "order_status": status,
+                "cancel_reason": cancel_reason,
+                "order_id": order_id,
+            }), 200
 
         try:
             record_exit_fifo(
                 bot_id=bot_id,
                 symbol=symbol,
                 entry_side=entry_side,
-                exit_qty=qty_to_close,
-                exit_price=exit_price,
-                reason="strategy_exit",
+                exit_qty=filled_qty,
+                exit_price=avg_exit,
+                reason="strategy_exit_fill",
             )
         except Exception as e:
             print("[PNL] record_exit_fifo error (strategy):", e)
@@ -895,7 +1010,8 @@ def tv_webhook():
             "bot_id": bot_id,
             "symbol": symbol,
             "exit_side": exit_side,
-            "closed_qty": str(qty_to_close),
+            "closed_qty": str(filled_qty),
+            "avg_exit_price": str(avg_exit),
             "order_status": status,
             "cancel_reason": cancel_reason,
         }), 200
