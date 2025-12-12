@@ -1,286 +1,482 @@
-# apex_client.py
 import os
 import time
 import random
+import inspect
 from decimal import Decimal, ROUND_DOWN
+from typing import Dict, Any, Optional, Union, Tuple
 
+from apexomni.http_private_sign import HttpPrivateSign
 from apexomni.constants import (
     APEX_OMNI_HTTP_MAIN,
     APEX_OMNI_HTTP_TEST,
-    NETWORKID_MAIN,
-    NETWORKID_TEST,
     NETWORKID_OMNI_MAIN_ARB,
-    NETWORKID_TEST,  # keep
+    NETWORKID_TEST,
 )
 
-# NOTE:
-# - 官网说明私有接口签名依赖 api_key_credentials['secret']，而不是 api_key=... 这种参数。
-# - 你的报错：Http__init__() got unexpected keyword argument 'api_key'
-#   说明你当前 SDK 版本不接受 api_key 这个命名；应传 api_key_credentials dict。:contentReference[oaicite:2]{index=2}
-
-try:
-    from apexomni.http_private_sign import HttpPrivateSign
-except Exception:
-    HttpPrivateSign = None
-
-try:
-    from apexomni.http_public_v3 import HttpPublic_v3
-except Exception:
-    HttpPublic_v3 = None
-
-# -----------------------------
-# Symbol rules (fallback)
-# -----------------------------
 DEFAULT_SYMBOL_RULES = {
     "min_qty": Decimal("0.01"),
     "step_size": Decimal("0.01"),
-    "qty_dp": 2,
+    "qty_decimals": 2,
 }
 
-SYMBOL_RULES = {
-    # "ZEC-USDT": {"min_qty": Decimal("0.01"), "step_size": Decimal("0.01"), "qty_dp": 2},
+SYMBOL_RULES: Dict[str, Dict[str, Any]] = {
+    # "BTC-USDT": {"min_qty": Decimal("0.001"), "step_size": Decimal("0.001"), "qty_decimals": 3},
 }
+
+_CLIENT: Optional[HttpPrivateSign] = None
+
+
+def _get_symbol_rules(symbol: str) -> Dict[str, Any]:
+    s = symbol.upper()
+    rules = SYMBOL_RULES.get(s, {})
+    return {**DEFAULT_SYMBOL_RULES, **rules}
+
+
+def _snap_quantity(symbol: str, theoretical_qty: Decimal) -> Decimal:
+    rules = _get_symbol_rules(symbol)
+    step = rules["step_size"]
+    min_qty = rules["min_qty"]
+    decimals = rules["qty_decimals"]
+
+    if theoretical_qty <= 0:
+        raise ValueError("calculated quantity must be > 0")
+
+    steps = (theoretical_qty // step)
+    snapped = steps * step
+
+    quantum = Decimal("1").scaleb(-decimals)
+    snapped = snapped.quantize(quantum, rounding=ROUND_DOWN)
+
+    if snapped < min_qty:
+        raise ValueError(f"budget too small: snapped quantity {snapped} < minQty {min_qty}")
+
+    return snapped
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
-    v = (os.getenv(name) or "").strip().lower()
-    if v in ("1", "true", "yes", "y", "on"):
-        return True
-    if v in ("0", "false", "no", "n", "off"):
-        return False
-    return default
+    value = os.getenv(name, str(default))
+    return value.lower() in ("1", "true", "yes", "y", "on")
 
 
-def _host() -> str:
-    use_main = _env_bool("APEX_USE_MAINNET", True)
-    return APEX_OMNI_HTTP_MAIN if use_main else APEX_OMNI_HTTP_TEST
+def _get_base_and_network():
+    use_mainnet = _env_bool("APEX_USE_MAINNET", False)
+
+    env_name = os.getenv("APEX_ENV", "").lower()
+    if env_name in ("main", "mainnet", "prod", "production"):
+        use_mainnet = True
+
+    base_url = APEX_OMNI_HTTP_MAIN if use_mainnet else APEX_OMNI_HTTP_TEST
+    network_id = NETWORKID_OMNI_MAIN_ARB if use_mainnet else NETWORKID_TEST
+    return base_url, network_id
 
 
-def _network_id() -> int:
-    use_main = _env_bool("APEX_USE_MAINNET", True)
-    return NETWORKID_MAIN if use_main else NETWORKID_TEST
-
-
-def _chain_id() -> int:
-    # ApeX Omni mainnet chainId in docs examples: NETWORKID_OMNI_MAIN_ARB :contentReference[oaicite:3]{index=3}
-    use_main = _env_bool("APEX_USE_MAINNET", True)
-    return NETWORKID_OMNI_MAIN_ARB if use_main else NETWORKID_TEST
-
-
-_PRIVATE = None
-_PUBLIC = None
-
-
-def _mk_private_client():
-    global _PRIVATE
-    if _PRIVATE is not None:
-        return _PRIVATE
-
-    if HttpPrivateSign is None:
-        raise RuntimeError("apexomni.http_private_sign.HttpPrivateSign import failed. Check requirements / SDK version.")
-
-    api_key_credentials = {
-        "key": os.getenv("APEX_API_KEY", "").strip(),
-        "secret": os.getenv("APEX_API_SECRET", "").strip(),
-        "passphrase": os.getenv("APEX_API_PASSPHRASE", "").strip(),
+def _get_api_credentials():
+    return {
+        "key": os.environ["APEX_API_KEY"],
+        "secret": os.environ["APEX_API_SECRET"],
+        "passphrase": os.environ["APEX_API_PASSPHRASE"],
     }
-    if not api_key_credentials["key"] or not api_key_credentials["secret"] or not api_key_credentials["passphrase"]:
-        raise RuntimeError("Missing APEX_API_KEY / APEX_API_SECRET / APEX_API_PASSPHRASE env vars.")
-
-    seeds = (os.getenv("APEX_ZK_SEEDS") or "").strip()
-    l2key = (os.getenv("APEX_L2KEY_SEEDS") or "").strip()
-
-    # 关键修复：不要用 api_key=... 这种写法；用 api_key_credentials=dict（官网签名示例就是这么用的）:contentReference[oaicite:4]{index=4}
-    _PRIVATE = HttpPrivateSign(
-        _host(),
-        network_id=_network_id(),
-        api_key_credentials=api_key_credentials,
-        seeds=seeds if seeds else None,
-        l2Key=l2key if l2key else None,
-        chainId=_chain_id(),
-    )
-    return _PRIVATE
 
 
-def _mk_public_client():
-    global _PUBLIC
-    if _PUBLIC is not None:
-        return _PUBLIC
-    if HttpPublic_v3 is None:
-        # public client optional; if missing you can still run by relying on order response prices
-        _PUBLIC = None
-        return _PUBLIC
-    _PUBLIC = HttpPublic_v3(_host(), network_id=_network_id())
-    return _PUBLIC
-
-
-def random_client_id() -> str:
-    # docs show random client id approach :contentReference[oaicite:5]{index=5}
+def _random_client_id() -> str:
     return str(int(float(str(random.random())[2:])))
 
 
-def _get_symbol_rules(symbol: str):
-    r = SYMBOL_RULES.get(symbol)
-    if r:
-        return r
-    return DEFAULT_SYMBOL_RULES
+def get_client() -> HttpPrivateSign:
+    global _CLIENT
+    if _CLIENT is not None:
+        return _CLIENT
+
+    base_url, network_id = _get_base_and_network()
+    api_creds = _get_api_credentials()
+
+    zk_seeds = os.environ["APEX_ZK_SEEDS"]
+    zk_l2 = os.getenv("APEX_L2KEY_SEEDS") or ""
+
+    client = HttpPrivateSign(
+        base_url,
+        network_id=network_id,
+        zk_seeds=zk_seeds,
+        zk_l2Key=zk_l2,
+        api_key_credentials=api_creds,
+    )
+
+    _CLIENT = client
+    return client
 
 
-def _snap_quantity(qty: Decimal, symbol: str) -> Decimal:
-    rules = _get_symbol_rules(symbol)
-    step = rules["step_size"]
-    minq = rules["min_qty"]
-    if qty < minq:
-        qty = minq
-    # floor to step
-    steps = (qty / step).quantize(Decimal("1"), rounding=ROUND_DOWN)
-    return (steps * step).quantize(step)
+def get_account():
+    client = get_client()
+    return client.get_account_v3()
 
 
-def get_ticker_price(symbol: str, max_retry: int = 5, sleep_s: float = 0.25) -> Decimal | None:
-    pub = _mk_public_client()
-    if pub is None:
+def _mk_http_v3():
+    base_url, network_id = _get_base_and_network()
+    api_creds = _get_api_credentials()
+    from apexomni.http_private_v3 import HttpPrivate_v3
+    return HttpPrivate_v3(
+        base_url,
+        network_id=network_id,
+        api_key_credentials=api_creds,
+    )
+
+
+def get_market_price(symbol: str, side: str, size: str) -> str:
+    http_v3_client = _mk_http_v3()
+    side = side.upper()
+    size_str = str(size)
+
+    res = http_v3_client.get_worst_price_v3(
+        symbol=symbol,
+        size=size_str,
+        side=side,
+    )
+
+    price = None
+    if isinstance(res, dict):
+        if "worstPrice" in res:
+            price = res["worstPrice"]
+        elif "data" in res and isinstance(res["data"], dict) and "worstPrice" in res["data"]:
+            price = res["data"]["worstPrice"]
+
+    if price is None:
+        raise RuntimeError(f"[apex_client] get_worst_price_v3 abnormal: {res}")
+
+    price_str = str(price)
+    print(f"[apex_client] worst price for {symbol} {side} size={size_str}: {price_str}")
+    return price_str
+
+
+NumberLike = Union[str, float, int]
+
+
+def _extract_order_ids(raw_order: Any) -> Tuple[Optional[str], Optional[str]]:
+    order_id = None
+    client_order_id = None
+
+    def _pick(d: dict, *keys):
+        for k in keys:
+            v = d.get(k)
+            if v is not None:
+                return v
         return None
+
+    if isinstance(raw_order, dict):
+        order_id = _pick(raw_order, "orderId", "id")
+        client_order_id = _pick(raw_order, "clientOrderId", "clientId")
+
+        data = raw_order.get("data")
+        if isinstance(data, dict):
+            order_id = order_id or _pick(data, "orderId", "id")
+            client_order_id = client_order_id or _pick(data, "clientOrderId", "clientId")
+
+    return (str(order_id) if order_id else None, str(client_order_id) if client_order_id else None)
+
+
+def _call_flexible(fn, *, args_list=None, kwargs_list=None):
+    args_list = args_list or []
+    kwargs_list = kwargs_list or []
     last_err = None
-    for _ in range(max_retry):
+
+    for a in args_list:
         try:
-            # SDK naming can vary; try common ones
-            for fn_name in ("ticker_v3", "get_ticker_v3", "ticker", "get_ticker"):
-                fn = getattr(pub, fn_name, None)
-                if fn:
-                    res = fn(symbol=symbol)
-                    data = res.get("data") if isinstance(res, dict) else None
-                    if isinstance(data, dict):
-                        px = data.get("price") or data.get("lastPrice") or data.get("indexPrice")
-                        if px:
-                            return Decimal(str(px))
-            time.sleep(sleep_s)
+            return fn(*a)
         except Exception as e:
             last_err = e
-            time.sleep(sleep_s)
-    return None
+
+    for kw in kwargs_list:
+        try:
+            return fn(**kw)
+        except Exception as e:
+            last_err = e
+
+    raise last_err if last_err else RuntimeError("call failed")
 
 
-def create_market_order(symbol: str, side: str, size: Decimal, reduce_only: bool, client_id: str | None = None):
+def get_fill_summary(
+    symbol: str,
+    order_id: Optional[str] = None,
+    client_order_id: Optional[str] = None,
+    max_wait_sec: float = 3.0,
+    poll_interval: float = 0.10,
+) -> Dict[str, Any]:
     """
-    size: base qty (NOT USDT budget), already snapped.
-    side: BUY or SELL
+    ✅ 重点修复：不同 apexomni 版本 SDK 的方法签名不一样
+    这里用 HttpPrivate_v3 优先（更稳定），并用 flexible-call 兼容参数名。
     """
-    c = _mk_private_client()
-    cid = client_id or random_client_id()
+    http_v3 = _mk_http_v3()
+    start = time.time()
+    last_err = None
 
-    # Try v3 create order
-    for fn_name in ("create_order_v3", "create_order", "create_market_order"):
-        fn = getattr(c, fn_name, None)
-        if not fn:
-            continue
-        res = fn(
-            symbol=symbol,
-            side=side,
-            type="MARKET",
-            size=str(size),
-            clientId=cid,
-            reduceOnly=bool(reduce_only),
+    while True:
+        try:
+            order_obj = None
+            fills_obj = None
+
+            # ---- order detail candidates ----
+            for name in ("get_order_v3", "get_order_detail_v3", "get_order_by_id_v3"):
+                if hasattr(http_v3, name) and order_id:
+                    fn = getattr(http_v3, name)
+
+                    # 尝试多种签名
+                    try:
+                        order_obj = _call_flexible(
+                            fn,
+                            args_list=[(order_id,)],
+                            kwargs_list=[
+                                {"orderId": order_id},
+                                {"order_id": order_id},
+                                {"id": order_id},
+                            ],
+                        )
+                        break
+                    except Exception as e:
+                        last_err = e
+
+            # ---- fills candidates ----
+            for name in ("get_fills_v3", "get_order_fills_v3", "get_trade_fills_v3"):
+                if hasattr(http_v3, name):
+                    fn = getattr(http_v3, name)
+                    try:
+                        fills_obj = _call_flexible(
+                            fn,
+                            args_list=[(order_id,)] if order_id else [],
+                            kwargs_list=[
+                                {"orderId": order_id} if order_id else {},
+                                {"order_id": order_id} if order_id else {},
+                                {"clientId": client_order_id} if client_order_id else {},
+                                {"clientOrderId": client_order_id} if client_order_id else {},
+                            ],
+                        )
+                        break
+                    except Exception as e:
+                        last_err = e
+
+            def _as_list(x):
+                if x is None:
+                    return []
+                if isinstance(x, list):
+                    return x
+                if isinstance(x, dict):
+                    data = x.get("data")
+                    if isinstance(data, list):
+                        return data
+                    if isinstance(data, dict):
+                        if "fills" in data and isinstance(data["fills"], list):
+                            return data["fills"]
+                        if "list" in data and isinstance(data["list"], list):
+                            return data["list"]
+                return []
+
+            fills_list = _as_list(fills_obj)
+
+            total_qty = Decimal("0")
+            total_notional = Decimal("0")
+
+            for f in fills_list:
+                if not isinstance(f, dict):
+                    continue
+                q = f.get("size") or f.get("qty") or f.get("filledSize") or f.get("fillSize")
+                p = f.get("price") or f.get("fillPrice") or f.get("avgPrice")
+                if q is None or p is None:
+                    continue
+                dq = Decimal(str(q))
+                dp = Decimal(str(p))
+                if dq <= 0 or dp <= 0:
+                    continue
+                total_qty += dq
+                total_notional += dq * dp
+
+            if total_qty > 0:
+                avg = (total_notional / total_qty)
+                return {
+                    "symbol": symbol,
+                    "order_id": order_id,
+                    "client_order_id": client_order_id,
+                    "filled_qty": total_qty,
+                    "avg_fill_price": avg,
+                    "raw_order": order_obj,
+                    "raw_fills": fills_obj,
+                }
+
+            # 退而求其次：从 order_obj 里找 filledSize/avgPrice
+            if isinstance(order_obj, dict):
+                data = order_obj.get("data") if isinstance(order_obj.get("data"), dict) else order_obj
+                if isinstance(data, dict):
+                    fq = data.get("filledSize") or data.get("cumFilledSize") or data.get("sizeFilled")
+                    ap = data.get("avgPrice") or data.get("averagePrice") or data.get("fillAvgPrice")
+                    if fq and ap:
+                        dq = Decimal(str(fq))
+                        dp = Decimal(str(ap))
+                        if dq > 0 and dp > 0:
+                            return {
+                                "symbol": symbol,
+                                "order_id": order_id,
+                                "client_order_id": client_order_id,
+                                "filled_qty": dq,
+                                "avg_fill_price": dp,
+                                "raw_order": order_obj,
+                                "raw_fills": fills_obj,
+                            }
+
+        except Exception as e:
+            last_err = e
+
+        if time.time() - start >= max_wait_sec:
+            raise RuntimeError(f"fill summary unavailable, last_err={last_err!r}")
+
+        time.sleep(poll_interval)
+
+
+def create_market_order(
+    symbol: str,
+    side: str,
+    size: NumberLike | None = None,
+    size_usdt: NumberLike | None = None,
+    reduce_only: bool = False,
+    client_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    client = get_client()
+    side = side.upper()
+
+    rules = _get_symbol_rules(symbol)
+    decimals = rules["qty_decimals"]
+
+    if size_usdt is not None:
+        budget = Decimal(str(size_usdt))
+        if budget <= 0:
+            raise ValueError("size_usdt must be > 0")
+
+        min_qty = rules["min_qty"]
+        ref_price_decimal = Decimal(get_market_price(symbol, side, str(min_qty)))
+        theoretical_qty = budget / ref_price_decimal
+        snapped_qty = _snap_quantity(symbol, theoretical_qty)
+
+        price_str = get_market_price(symbol, side, str(snapped_qty))
+        price_decimal = Decimal(price_str)
+
+        size_str = format(snapped_qty, f".{decimals}f")
+
+        used_budget = (snapped_qty * price_decimal).quantize(
+            Decimal("0.01"), rounding=ROUND_DOWN
         )
-        return res, cid
 
-    raise RuntimeError("No create order method found on SDK client (expected create_order_v3/create_order/...)")
+        print(f"[apex_client] budget={budget} -> qty={size_str}, used≈{used_budget} (price {price_str})")
+    else:
+        if size is None:
+            raise ValueError("size or size_usdt must be provided")
+        size_str = str(size)
+        price_str = get_market_price(symbol, side, size_str)
+        price_decimal = Decimal(price_str)
+        used_budget = (price_decimal * Decimal(size_str)).quantize(
+            Decimal("0.01"), rounding=ROUND_DOWN
+        )
 
+    ts = int(time.time())
+    apex_client_id = _random_client_id()
 
-
-def get_order_v3(order_id: str | None = None, client_id: str | None = None):
-    c = _mk_private_client()
-
-    # 关键修复：一律用 keyword args，避免你现在这种 positional 触发 “takes 1 positional but 2 were given”
-    fn = getattr(c, "get_order_v3", None) or getattr(c, "get_order", None)
-    if not fn:
-        raise RuntimeError("No get_order_v3/get_order method found on SDK client.")
-
-    kwargs = {}
-    if order_id:
-        kwargs["orderId"] = order_id
     if client_id:
-        kwargs["clientOrderId"] = client_id
+        print(f"[apex_client] tv_client_id={client_id} -> apex_clientId={apex_client_id}")
+    else:
+        print(f"[apex_client] apex_clientId={apex_client_id} (no tv_client_id)")
 
-    return fn(**kwargs)
+    params = {
+        "symbol": symbol,
+        "side": side,
+        "type": "MARKET",
+        "size": size_str,
+        "price": price_str,
+        "timestampSeconds": ts,
+        "reduceOnly": reduce_only,
+        "clientId": apex_client_id,
+    }
+
+    print("[apex_client] create_market_order params:", params)
+
+    raw_order = client.create_order_v3(**params)
+
+    print("[apex_client] order response:", raw_order)
+
+    data = raw_order["data"] if isinstance(raw_order, dict) and "data" in raw_order else raw_order
+    order_id, client_order_id = _extract_order_ids(raw_order)
+
+    return {
+        "data": data,
+        "raw_order": raw_order,
+        "order_id": order_id,
+        "client_order_id": client_order_id,
+        "computed": {
+            "symbol": symbol,
+            "side": side,
+            "size": size_str,
+            "price": price_str,
+            "used_budget": str(used_budget),
+            "reduce_only": reduce_only,
+        },
+    }
 
 
-def get_fill_summary(order_id: str, client_id: str | None = None) -> dict:
-    """
-    Returns:
-      {
-        "status": "...",
-        "filled_size": Decimal,
-        "avg_price": Decimal,
-      }
-    """
-    res = get_order_v3(order_id=order_id, client_id=client_id)
-    data = res.get("data") if isinstance(res, dict) else None
+def _norm_symbol(s: str) -> str:
+    return str(s or "").upper().replace("-", "").replace("_", "").strip()
+
+
+def get_open_position_for_symbol(symbol: str) -> Optional[Dict[str, Any]]:
+    try:
+        acc = get_account()
+    except Exception as e:
+        print("[apex_client] get_account error:", e)
+        return None
+
+    data = acc.get("data") if isinstance(acc, dict) else None
     if not isinstance(data, dict):
-        return {"status": "UNKNOWN", "filled_size": Decimal("0"), "avg_price": Decimal("0")}
+        data = acc if isinstance(acc, dict) else {}
 
-    status = str(data.get("status") or "UNKNOWN")
-    filled = Decimal(str(data.get("cumMatchFillSize") or "0"))
-    avg = Decimal(str(data.get("averagePrice") or "0"))
+    positions = (
+        data.get("positions")
+        or data.get("openPositions")
+        or data.get("position")
+        or data.get("positionV3")
+        or []
+    )
 
-    # Some responses may expose latestMatchFillPrice as a fallback
-    if avg == 0:
-        lpx = data.get("latestMatchFillPrice") or data.get("lastFillPrice")
-        if lpx:
-            avg = Decimal(str(lpx))
+    if not isinstance(positions, list):
+        return None
 
-    return {"status": status, "filled_size": filled, "avg_price": avg}
+    target = _norm_symbol(symbol)
 
-
-def wait_for_fill(order_id: str, client_id: str | None, fast_wait_s: float = 3.0, slow_wait_s: float = 60.0):
-    """
-    Fast poll for a few seconds, then slow poll up to 60s.
-    """
-    t0 = time.time()
-    # fast
-    while time.time() - t0 < fast_wait_s:
-        fs = get_fill_summary(order_id, client_id)
-        if fs["filled_size"] > 0 and fs["avg_price"] > 0:
-            return fs
-        time.sleep(0.2)
-
-    # slow
-    t1 = time.time()
-    while time.time() - t1 < slow_wait_s:
-        fs = get_fill_summary(order_id, client_id)
-        if fs["filled_size"] > 0 and fs["avg_price"] > 0:
-            return fs
-        time.sleep(1.0)
-
-    return {"status": "TIMEOUT", "filled_size": Decimal("0"), "avg_price": Decimal("0")}
-
-
-def get_account_positions():
-    c = _mk_private_client()
-    fn = getattr(c, "get_account_v3", None) or getattr(c, "get_account", None)
-    if not fn:
-        raise RuntimeError("No get_account_v3/get_account method found on SDK client.")
-    res = fn()
-    data = res.get("data") if isinstance(res, dict) else None
-    if not isinstance(data, dict):
-        return []
-    positions = data.get("positions") or []
-    if isinstance(positions, list):
-        return positions
-    return []
-
-
-def get_open_position_for_symbol(symbol: str):
-    positions = get_account_positions()
     for p in positions:
-        if str(p.get("symbol")) != symbol:
+        if not isinstance(p, dict):
             continue
-        size = Decimal(str(p.get("size") or "0"))
-        side = str(p.get("side") or "")
-        if size > 0 and side in ("LONG", "SHORT"):
-            return {"symbol": symbol, "side": side, "size": size, "raw": p}
+
+        psym = _norm_symbol(p.get("symbol", ""))
+        if psym != target:
+            continue
+
+        size = p.get("size")
+        side = str(p.get("side", "")).upper()  # LONG/SHORT
+        entry = p.get("entryPrice")
+
+        try:
+            size_dec = Decimal(str(size or "0"))
+        except Exception:
+            size_dec = Decimal("0")
+
+        if size_dec <= 0 or side not in ("LONG", "SHORT"):
+            continue
+
+        entry_dec = None
+        try:
+            if entry is not None:
+                entry_dec = Decimal(str(entry))
+        except Exception:
+            entry_dec = None
+
+        return {
+            "symbol": str(p.get("symbol", symbol)),
+            "side": side,
+            "size": size_dec,
+            "entryPrice": entry_dec,
+            "raw": p,
+        }
+
     return None
-
-
-def map_position_side_to_exit_order_side(pos_side: str) -> str:
-    return "SELL" if pos_side == "LONG" else "BUY"
