@@ -1,183 +1,127 @@
+# risk_manager.py
 import os
-import threading
 import time
 from decimal import Decimal
 
-import apex_client
 import pnl_store
+import apex_client
 
 
-# Global registry to avoid starting duplicated watchers
-_WATCHERS = {}
-_WATCHERS_LOCK = threading.Lock()
+def _parse_bot_ids(s: str) -> set[str]:
+    out = set()
+    for x in (s or "").split(","):
+        x = x.strip()
+        if x:
+            out.add(x)
+    return out
 
 
-def _d(x) -> Decimal:
-    if isinstance(x, Decimal):
-        return x
-    return Decimal(str(x))
+LONG_RISK_BOTS = _parse_bot_ids(os.getenv("LONG_RISK_BOTS", "BOT_1,BOT_2,BOT_3,BOT_4,BOT_5"))
+SHORT_RISK_BOTS = _parse_bot_ids(os.getenv("SHORT_RISK_BOTS", "BOT_6,BOT_7,BOT_8,BOT_9,BOT_10"))
+
+BASE_SL_PCT = Decimal(os.getenv("BASE_SL_PCT", "-0.5"))  # -0.5 (%)
+
+# Your ladder:
+# +0.15 => lock 0.10
+# +0.45 => lock 0.20
+# +0.55 => lock 0.30
+# +0.65 => lock 0.40
+# then continue +0.10 each +0.10 pnl beyond 0.65
+T1 = Decimal(os.getenv("LOCK_T1_PNL", "0.15"))
+L1 = Decimal(os.getenv("LOCK_L1", "0.10"))
+T2 = Decimal(os.getenv("LOCK_T2_PNL", "0.45"))
+L2 = Decimal(os.getenv("LOCK_L2", "0.20"))
+T3 = Decimal(os.getenv("LOCK_T3_PNL", "0.55"))
+L3 = Decimal(os.getenv("LOCK_L3", "0.30"))
+T4 = Decimal(os.getenv("LOCK_T4_PNL", "0.65"))
+L4 = Decimal(os.getenv("LOCK_L4", "0.40"))
+STEP = Decimal(os.getenv("LOCK_STEP", "0.10"))
 
 
-def _calc_profit_pct(direction: str, entry_price: Decimal, current_price: Decimal) -> Decimal:
-    """
-    Profit in percent (not decimal), e.g. 0.15 means +0.15%
-    """
-    if entry_price <= 0 or current_price <= 0:
+def _pnl_pct(pos_side: str, entry: Decimal, mark: Decimal) -> Decimal:
+    if entry <= 0:
         return Decimal("0")
-    if direction.upper() == "LONG":
-        return (current_price - entry_price) / entry_price * Decimal("100")
+    if pos_side == "LONG":
+        return (mark - entry) / entry * Decimal("100")
     else:
-        return (entry_price - current_price) / entry_price * Decimal("100")
+        return (entry - mark) / entry * Decimal("100")
 
 
-def _ladder_lock_pct(peak_profit_pct: Decimal) -> Decimal:
-    """
-    Implements EXACTLY your rule style:
-    - fee round trip = 0.10, so first lock is 0.10 at profit 0.15
-    - 0.45 -> lock 0.2
-    - 0.55 -> lock 0.3
-    - 0.65 -> lock 0.4
-    - keep going: each +0.10 profit beyond 0.65 increases lock by +0.10
-    """
-    p = _d(peak_profit_pct)
-
-    if p < Decimal("0.15"):
-        return Decimal("0")
-
-    # base points
-    if p < Decimal("0.45"):
-        return Decimal("0.10")
-    if p < Decimal("0.55"):
-        return Decimal("0.20")
-    if p < Decimal("0.65"):
-        return Decimal("0.30")
-
-    # p >= 0.65
-    # 0.65 -> 0.40, 0.75 -> 0.50, 0.85 -> 0.60 ...
-    extra = p - Decimal("0.65")
-    k = int((extra // Decimal("0.10")))
-    return Decimal("0.40") + Decimal("0.10") * Decimal(k)
+def _next_lock_level(pnl: Decimal, current_lock: Decimal) -> Decimal:
+    lock = current_lock
+    if pnl >= T1:
+        lock = max(lock, L1)
+    if pnl >= T2:
+        lock = max(lock, L2)
+    if pnl >= T3:
+        lock = max(lock, L3)
+    if pnl >= T4:
+        lock = max(lock, L4)
+        # continue upward
+        extra = pnl - T4
+        if extra >= STEP:
+            n = (extra / STEP).to_integral_value(rounding="ROUND_FLOOR")
+            lock = max(lock, L4 + n * STEP)
+    return lock
 
 
-def _get_executable_exit_price(symbol: str, direction: str, qty: Decimal) -> Decimal:
-    """
-    Use executable worst price for the exit side as a conservative proxy for current.
-    This is NOT used as baseline; baseline is fill avg entry.
-    """
-    exit_side = "SELL" if direction.upper() == "LONG" else "BUY"
-    px = apex_client.get_market_price(symbol, exit_side, str(qty))
-    return _d(px)
+def _bot_allowed(bot_id: str, pos_side: str) -> bool:
+    if pos_side == "LONG":
+        return bot_id in LONG_RISK_BOTS
+    if pos_side == "SHORT":
+        return bot_id in SHORT_RISK_BOTS
+    return False
 
 
-def _risk_loop(bot_id: str, symbol: str, direction: str, poll_sec: float):
-    key = (bot_id, symbol, direction)
-    try:
-        while True:
-            st = pnl_store.get_risk_state(bot_id, symbol, direction)
-            if not st:
-                return
+def run_loop(poll_s: float = 1.0):
+    while True:
+        try:
+            for p in pnl_store.list_positions():
+                bot_id = p["bot_id"]
+                symbol = p["symbol"]
+                pos_side = p["side"]  # LONG/SHORT
 
-            if str(st.get("status")) != "ACTIVE":
-                return
+                if not _bot_allowed(bot_id, pos_side):
+                    continue
+                if int(p.get("closing") or 0) == 1:
+                    continue
 
-            entry_price = _d(st["entry_fill_price"])
-            entry_qty = _d(st["entry_qty"])
-            sl_pct = _d(st["sl_pct"])
-            peak_profit = _d(st["peak_profit_pct"])
-            lock_pct = _d(st["lock_level_pct"])
+                qty = Decimal(p["qty"])
+                entry = Decimal(p["entry_price"])
+                current_lock = Decimal(p["lock_level_pct"])
 
-            # reconcile remote position size if possible
-            pos = apex_client.get_open_position_for_symbol(symbol)
-            if pos and pos.get("side") in ("LONG", "SHORT"):
-                # if direction mismatched, freeze
-                if pos["side"] != direction.upper():
-                    pnl_store.set_risk_status(bot_id, symbol, direction, "FROZEN")
-                    return
-                if pos.get("size") and _d(pos["size"]) > 0:
-                    entry_qty = _d(pos["size"])
+                # mark price: prefer public ticker, fallback to order-based later
+                mark = apex_client.get_ticker_price(symbol) or entry
+                pnl = _pnl_pct(pos_side, entry, mark)
 
-            if entry_qty <= 0:
-                pnl_store.set_risk_status(bot_id, symbol, direction, "CLOSED")
-                pnl_store.clear_risk_state(bot_id, symbol, direction)
-                return
+                new_lock = _next_lock_level(pnl, current_lock)
+                if new_lock != current_lock:
+                    pnl_store.set_lock_level(bot_id, symbol, new_lock)
 
-            # Current executable exit price (conservative)
-            current_px = _get_executable_exit_price(symbol, direction, entry_qty)
-            profit_pct = _calc_profit_pct(direction, entry_price, current_px)
+                stop_line = max(BASE_SL_PCT, new_lock)
 
-            # update peak / lock
-            if profit_pct > peak_profit:
-                peak_profit = profit_pct
+                # stop triggers when pnl <= stop_line
+                if pnl <= stop_line:
+                    # trigger close
+                    pnl_store.mark_closing(bot_id, symbol, True)
+                    exit_side = "SELL" if pos_side == "LONG" else "BUY"
 
-            desired_lock = _ladder_lock_pct(peak_profit)
-            if desired_lock > lock_pct:
-                lock_pct = desired_lock
+                    res, client_id = apex_client.create_market_order(
+                        symbol=symbol,
+                        side=exit_side,
+                        size=qty,
+                        reduce_only=True,
+                    )
+                    order_id = (res.get("data") or {}).get("id") if isinstance(res, dict) else None
 
-            pnl_store.update_risk_progress(bot_id, symbol, direction, peak_profit, lock_pct)
+                    fs = apex_client.wait_for_fill(order_id or "", client_id, fast_wait_s=3.0, slow_wait_s=60.0)
+                    exit_price = fs["avg_price"] if fs["avg_price"] > 0 else (mark)
 
-            # Stop loss
-            if profit_pct <= sl_pct:
-                _close_position_fill_first(bot_id, symbol, direction, entry_qty, reason=f"SL_{sl_pct}%")
-                return
+                    pnl_store.add_trade(bot_id, symbol, "CLOSE", exit_side, qty, exit_price, f"RISK_STOP pnl={pnl:.4f}% stop={stop_line:.4f}%", order_id, client_id)
+                    pnl_store.delete_position(bot_id, symbol)
 
-            # Trailing lock take-profit
-            if lock_pct > 0 and profit_pct <= lock_pct:
-                _close_position_fill_first(bot_id, symbol, direction, entry_qty, reason=f"LOCK_{lock_pct}%")
-                return
+        except Exception as e:
+            # keep loop alive
+            print("[RISK] loop error:", repr(e))
 
-            time.sleep(poll_sec)
-
-    finally:
-        with _WATCHERS_LOCK:
-            _WATCHERS.pop(key, None)
-
-
-def _close_position_fill_first(bot_id: str, symbol: str, direction: str, qty: Decimal, reason: str):
-    """
-    Reduce-only close using fill-first (must obtain real exit fills).
-    """
-    exit_side = "SELL" if direction.upper() == "LONG" else "BUY"
-    entry_side = "BUY" if direction.upper() == "LONG" else "SELL"
-
-    try:
-        res = apex_client.create_market_order_fill_first(
-            symbol=symbol,
-            side=exit_side,
-            size=str(qty),
-            reduce_only=True,
-            tv_signal_id=f"{bot_id}:{symbol}:{direction}:RISK_CLOSE",
-        )
-    except apex_client.FillUnavailableError as e:
-        # cannot obtain exit fills -> freeze (do not write fake pnl)
-        pnl_store.set_risk_status(bot_id, symbol, direction, "FROZEN")
-        print("[risk_manager] EXIT fill unavailable, freeze:", e)
-        return
-
-    filled_qty = Decimal(res["fill"]["filled_qty"])
-    avg_exit = Decimal(res["fill"]["avg_fill_price"])
-
-    pnl_store.record_exit_fifo(
-        bot_id=bot_id,
-        symbol=symbol,
-        entry_side=entry_side,
-        exit_qty=filled_qty,
-        exit_price=avg_exit,
-        reason=reason,
-    )
-
-    pnl_store.set_risk_status(bot_id, symbol, direction, "CLOSED")
-    pnl_store.clear_risk_state(bot_id, symbol, direction)
-    print(f"[risk_manager] closed {bot_id} {symbol} {direction} qty={filled_qty} exit={avg_exit} reason={reason}")
-
-
-def start_risk_watcher(bot_id: str, symbol: str, direction: str, poll_sec: float = 0.6):
-    """
-    Starts a per-bot watcher if not running.
-    """
-    key = (bot_id, symbol, direction.upper())
-    with _WATCHERS_LOCK:
-        if key in _WATCHERS:
-            return
-        t = threading.Thread(target=_risk_loop, args=(bot_id, symbol, direction.upper(), poll_sec), daemon=True)
-        _WATCHERS[key] = t
-        t.start()
+        time.sleep(poll_s)
