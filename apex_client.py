@@ -1,29 +1,36 @@
+# apex_client.py
 import os
 import time
 import random
 from decimal import Decimal, ROUND_DOWN
-from typing import Any, Dict, Optional, List, Tuple
 
-from apexomni.http_private_sign import HttpPrivateSign
 from apexomni.constants import (
     APEX_OMNI_HTTP_MAIN,
     APEX_OMNI_HTTP_TEST,
-    NETWORKID_OMNI_MAIN_ARB,
+    NETWORKID_MAIN,
     NETWORKID_TEST,
+    NETWORKID_OMNI_MAIN_ARB,
+    NETWORKID_TEST,  # keep
 )
 
-# 这些类名在不同版本的 apexomni SDK 可能略有差异：
-# 我做了“延迟导入 + 兼容分支”，避免你再遇到签名不匹配/类不存在直接崩。
+# NOTE:
+# - 官网说明私有接口签名依赖 api_key_credentials['secret']，而不是 api_key=... 这种参数。
+# - 你的报错：Http__init__() got unexpected keyword argument 'api_key'
+#   说明你当前 SDK 版本不接受 api_key 这个命名；应传 api_key_credentials dict。:contentReference[oaicite:2]{index=2}
+
 try:
-    from apexomni.http_private_v3 import HttpPrivate_v3
+    from apexomni.http_private_sign import HttpPrivateSign
 except Exception:
-    HttpPrivate_v3 = None  # type: ignore
+    HttpPrivateSign = None
 
+try:
+    from apexomni.http_public_v3 import HttpPublic_v3
+except Exception:
+    HttpPublic_v3 = None
 
-# -------------------------------------------------------------------
-# 交易规则（默认：最小数量 0.01，步长 0.01，小数点后 2 位）
-# 如某些币不同，可在 SYMBOL_RULES 里覆盖
-# -------------------------------------------------------------------
+# -----------------------------
+# Symbol rules (fallback)
+# -----------------------------
 DEFAULT_SYMBOL_RULES = {
     "min_qty": Decimal("0.01"),
     "step_size": Decimal("0.01"),
@@ -36,375 +43,244 @@ SYMBOL_RULES = {
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
-    v = str(os.getenv(name, "")).strip().lower()
-    if not v:
-        return default
-    return v in ("1", "true", "yes", "y", "on")
+    v = (os.getenv(name) or "").strip().lower()
+    if v in ("1", "true", "yes", "y", "on"):
+        return True
+    if v in ("0", "false", "no", "n", "off"):
+        return False
+    return default
 
 
-def _get_symbol_rules(symbol: str) -> Dict[str, Decimal]:
-    r = SYMBOL_RULES.get(symbol, None)
-    if not r:
-        r = DEFAULT_SYMBOL_RULES
-    return {
-        "min_qty": Decimal(str(r["min_qty"])),
-        "step_size": Decimal(str(r["step_size"])),
-        "qty_dp": int(r["qty_dp"]),
-    }
+def _host() -> str:
+    use_main = _env_bool("APEX_USE_MAINNET", True)
+    return APEX_OMNI_HTTP_MAIN if use_main else APEX_OMNI_HTTP_TEST
 
 
-def _snap_quantity(symbol: str, qty: Decimal) -> Decimal:
-    rules = _get_symbol_rules(symbol)
-    step = rules["step_size"]
-    if step <= 0:
-        return qty
-
-    snapped = (qty / step).to_integral_value(rounding=ROUND_DOWN) * step
-
-    # 再按小数位截断（保险）
-    dp = rules["qty_dp"]
-    fmt = Decimal("1") / (Decimal("10") ** dp)
-    snapped = (snapped // fmt) * fmt
-
-    if snapped < rules["min_qty"]:
-        return Decimal("0")
-    return snapped
+def _network_id() -> int:
+    use_main = _env_bool("APEX_USE_MAINNET", True)
+    return NETWORKID_MAIN if use_main else NETWORKID_TEST
 
 
-def _mk_private_client() -> Any:
-    api_key = os.getenv("APEX_API_KEY", "")
-    api_secret = os.getenv("APEX_API_SECRET", "")
-    api_passphrase = os.getenv("APEX_API_PASSPHRASE", "")
-    zk_seeds = os.getenv("APEX_ZK_SEEDS", "") or os.getenv("APEX_ZKSEEDS", "")
-    l2key_seeds = os.getenv("APEX_L2KEY_SEEDS", "")
-
-    use_main = _env_bool("APEX_USE_MAINNET", True) or (str(os.getenv("APEX_ENV", "")).lower() == "main")
-    base_url = APEX_OMNI_HTTP_MAIN if use_main else APEX_OMNI_HTTP_TEST
-    network_id = NETWORKID_OMNI_MAIN_ARB if use_main else NETWORKID_TEST
-
-    if HttpPrivate_v3 is None:
-        raise RuntimeError("apexomni HttpPrivate_v3 not available in your environment")
-
-    signer = HttpPrivateSign(
-        api_key=api_key,
-        api_secret=api_secret,
-        api_passphrase=api_passphrase,
-        zk_seeds=zk_seeds,
-        l2key_seeds=l2key_seeds,
-    )
-
-    # 不同 SDK 版本的构造器参数可能不同，这里做兼容尝试
-    try:
-        return HttpPrivate_v3(base_url, network_id, signer)
-    except TypeError:
-        try:
-            return HttpPrivate_v3(base_url, network_id=network_id, signer=signer)
-        except TypeError:
-            return HttpPrivate_v3(host=base_url, network_id=network_id, signer=signer)
+def _chain_id() -> int:
+    # ApeX Omni mainnet chainId in docs examples: NETWORKID_OMNI_MAIN_ARB :contentReference[oaicite:3]{index=3}
+    use_main = _env_bool("APEX_USE_MAINNET", True)
+    return NETWORKID_OMNI_MAIN_ARB if use_main else NETWORKID_TEST
 
 
 _PRIVATE = None
+_PUBLIC = None
 
 
-def _client() -> Any:
+def _mk_private_client():
     global _PRIVATE
-    if _PRIVATE is None:
-        _PRIVATE = _mk_private_client()
+    if _PRIVATE is not None:
+        return _PRIVATE
+
+    if HttpPrivateSign is None:
+        raise RuntimeError("apexomni.http_private_sign.HttpPrivateSign import failed. Check requirements / SDK version.")
+
+    api_key_credentials = {
+        "key": os.getenv("APEX_API_KEY", "").strip(),
+        "secret": os.getenv("APEX_API_SECRET", "").strip(),
+        "passphrase": os.getenv("APEX_API_PASSPHRASE", "").strip(),
+    }
+    if not api_key_credentials["key"] or not api_key_credentials["secret"] or not api_key_credentials["passphrase"]:
+        raise RuntimeError("Missing APEX_API_KEY / APEX_API_SECRET / APEX_API_PASSPHRASE env vars.")
+
+    seeds = (os.getenv("APEX_ZK_SEEDS") or "").strip()
+    l2key = (os.getenv("APEX_L2KEY_SEEDS") or "").strip()
+
+    # 关键修复：不要用 api_key=... 这种写法；用 api_key_credentials=dict（官网签名示例就是这么用的）:contentReference[oaicite:4]{index=4}
+    _PRIVATE = HttpPrivateSign(
+        _host(),
+        network_id=_network_id(),
+        api_key_credentials=api_key_credentials,
+        seeds=seeds if seeds else None,
+        l2Key=l2key if l2key else None,
+        chainId=_chain_id(),
+    )
     return _PRIVATE
 
 
-# -------------------------------------------------------------------
-# 下单：仍然需要 worstPrice 作为“限价保护参数”（很多交易所/SDK 的 market 实现会要求 price）
-# 但：成交价（记账、风控）严格用 fills/avgFill，不再用 worstPrice 回填。
-# -------------------------------------------------------------------
-def get_worst_price(symbol: str, side: str, size: str) -> str:
-    c = _client()
-    side_u = side.upper()
-    try:
-        r = c.get_worst_price_v3(symbol=symbol, side=side_u, size=size)
-    except TypeError:
-        r = c.get_worst_price_v3(symbol, side_u, size)
-
-    data = (r or {}).get("data", r) or {}
-    px = data.get("worstPrice") or data.get("price") or data.get("worst_price")
-    if px is None:
-        raise RuntimeError(f"worst price unavailable for {symbol} {side_u} size={size}")
-    return str(px)
+def _mk_public_client():
+    global _PUBLIC
+    if _PUBLIC is not None:
+        return _PUBLIC
+    if HttpPublic_v3 is None:
+        # public client optional; if missing you can still run by relying on order response prices
+        _PUBLIC = None
+        return _PUBLIC
+    _PUBLIC = HttpPublic_v3(_host(), network_id=_network_id())
+    return _PUBLIC
 
 
-def get_mark_price(symbol: str) -> str:
-    """
-    用 (worstBuy + worstSell)/2 做近似 mark/mid，避免你现在的“pnl 被系统性低估”
-    导致 0.15% 明明到了却不抬锁盈。
-    """
+def random_client_id() -> str:
+    # docs show random client id approach :contentReference[oaicite:5]{index=5}
+    return str(int(float(str(random.random())[2:])))
+
+
+def _get_symbol_rules(symbol: str):
+    r = SYMBOL_RULES.get(symbol)
+    if r:
+        return r
+    return DEFAULT_SYMBOL_RULES
+
+
+def _snap_quantity(qty: Decimal, symbol: str) -> Decimal:
     rules = _get_symbol_rules(symbol)
-    s = str(rules["min_qty"])
-    wb = Decimal(get_worst_price(symbol, "BUY", s))
-    ws = Decimal(get_worst_price(symbol, "SELL", s))
-    mid = (wb + ws) / Decimal("2")
-    return str(mid)
+    step = rules["step_size"]
+    minq = rules["min_qty"]
+    if qty < minq:
+        qty = minq
+    # floor to step
+    steps = (qty / step).quantize(Decimal("1"), rounding=ROUND_DOWN)
+    return (steps * step).quantize(step)
 
 
-def create_market_order(
-    symbol: str,
-    side: str,
-    size: str,
-    reduce_only: bool,
-    client_id: Optional[str] = None,
-) -> Dict[str, Any]:
-    c = _client()
-    side_u = side.upper()
-
-    # 市价单这里仍给 price=worstPrice（用于保护/兼容 SDK）
-    px = get_worst_price(symbol, side_u, size)
-
-    params = {
-        "symbol": symbol,
-        "side": side_u,
-        "type": "MARKET",
-        "size": size,
-        "price": px,
-        "reduceOnly": bool(reduce_only),
-    }
-    if client_id:
-        params["clientId"] = client_id
-
-    # 兼容不同 SDK 方法名
-    try:
-        resp = c.create_order_v3(**params)
-    except Exception:
-        resp = c.create_order_v3(params)
-
-    # 统一输出结构，方便 app.py 解析
-    out: Dict[str, Any] = {"raw": resp, "computed": {"worst_price": px}}
-
-    data = (resp or {}).get("data", resp) or {}
-    order_id = data.get("id") or data.get("orderId") or data.get("order_id")
-    client_order_id = data.get("clientOrderId") or data.get("client_order_id") or data.get("clientId")
-
-    out["order_id"] = str(order_id) if order_id is not None else None
-    out["client_order_id"] = str(client_order_id) if client_order_id is not None else None
-    out["data"] = data
-    return out
-
-
-# -------------------------------------------------------------------
-# 订单查询（兼容 get_order_v3 签名差异）
-# -------------------------------------------------------------------
-def _get_order_detail_v3(order_id: Optional[str], client_order_id: Optional[str]) -> Dict[str, Any]:
-    c = _client()
-
-    # 尽量用 order_id
-    if order_id:
-        for call in (
-            lambda: c.get_order_v3(order_id),
-            lambda: c.get_order_v3(id=order_id),
-            lambda: c.get_order_v3(orderId=order_id),
-            lambda: c.get_order_v3(order_id=order_id),
-        ):
-            try:
-                r = call()
-                return (r or {}).get("data", r) or {}
-            except TypeError:
-                continue
-            except Exception:
-                continue
-
-    # 再用 client_order_id
-    if client_order_id:
-        for call in (
-            lambda: c.get_order_v3(client_order_id),
-            lambda: c.get_order_v3(clientOrderId=client_order_id),
-            lambda: c.get_order_v3(client_order_id=client_order_id),
-        ):
-            try:
-                r = call()
-                return (r or {}).get("data", r) or {}
-            except TypeError:
-                continue
-            except Exception:
-                continue
-
-    return {}
-
-
-def _extract_fill_list(resp: Any) -> List[Dict[str, Any]]:
-    data = (resp or {}).get("data", resp) or {}
-    if isinstance(data, dict):
-        items = data.get("fills") or data.get("list") or data.get("data") or data.get("rows")
-        if isinstance(items, list):
-            return items
-    if isinstance(data, list):
-        return data
-    return []
-
-
-def _fetch_fills_v3(symbol: str, order_id: Optional[str], client_order_id: Optional[str], begin_ms: int, end_ms: int) -> List[Dict[str, Any]]:
-    c = _client()
-
-    # 不同 SDK 版本方法名差异很大：这里做“多路尝试”
-    candidates = []
-
-    # 常见：fills_v3 / get_fills_v3
-    if hasattr(c, "fills_v3"):
-        candidates.append(lambda: c.fills_v3(symbol=symbol, begin=begin_ms, end=end_ms, orderId=order_id, clientOrderId=client_order_id))
-        candidates.append(lambda: c.fills_v3(symbol=symbol, begin=begin_ms, end=end_ms))
-    if hasattr(c, "get_fills_v3"):
-        candidates.append(lambda: c.get_fills_v3(symbol=symbol, begin=begin_ms, end=end_ms, orderId=order_id, clientOrderId=client_order_id))
-        candidates.append(lambda: c.get_fills_v3(symbol=symbol, begin=begin_ms, end=end_ms))
-
-    # 有些版本叫 get_my_fills_v3 / my_fills_v3
-    if hasattr(c, "get_my_fills_v3"):
-        candidates.append(lambda: c.get_my_fills_v3(symbol=symbol, begin=begin_ms, end=end_ms, orderId=order_id, clientOrderId=client_order_id))
-    if hasattr(c, "my_fills_v3"):
-        candidates.append(lambda: c.my_fills_v3(symbol=symbol, begin=begin_ms, end=end_ms, orderId=order_id, clientOrderId=client_order_id))
-
-    last_err = None
-    for fn in candidates:
-        try:
-            r = fn()
-            fills = _extract_fill_list(r)
-            if fills:
-                # 如传了 order_id/client_order_id，再做一次过滤（防止返回了别的成交）
-                if order_id or client_order_id:
-                    filtered = []
-                    for f in fills:
-                        oid = str(f.get("orderId") or f.get("order_id") or f.get("id") or "")
-                        coid = str(f.get("clientOrderId") or f.get("client_order_id") or "")
-                        if order_id and oid and oid == str(order_id):
-                            filtered.append(f)
-                        elif client_order_id and coid and coid == str(client_order_id):
-                            filtered.append(f)
-                    if filtered:
-                        return filtered
-                return fills
-        except Exception as e:
-            last_err = e
-            continue
-
-    if last_err:
-        raise last_err
-    return []
-
-
-def get_fill_summary(
-    symbol: str,
-    order_id: Optional[str],
-    client_order_id: Optional[str],
-    max_wait_sec: float = 30.0,
-    poll_interval: float = 0.5,
-    fast_window_sec: float = 3.0,
-    fast_poll_interval: float = 0.2,
-) -> Dict[str, Any]:
-    """
-    - 前 fast_window_sec 秒：高频尝试（你要求的 2–3 秒）
-    - 之后：降频直到 max_wait_sec
-    - 订单 PENDING 时 fills 可能暂不可见：会持续轮询
-    """
-    start = time.time()
-    start_ms = int(time.time() * 1000) - 60_000  # 往前 60s 缓冲，避免时钟偏差
-    last_err = None
-
-    while True:
-        elapsed = time.time() - start
-        if elapsed > max_wait_sec:
-            break
-
-        now_ms = int(time.time() * 1000) + 5_000
-
-        try:
-            fills = _fetch_fills_v3(symbol, order_id, client_order_id, start_ms, now_ms)
-            if fills:
-                total_qty = Decimal("0")
-                total_notional = Decimal("0")
-
-                for f in fills:
-                    px = f.get("price") or f.get("fillPrice") or f.get("avgPrice") or f.get("matchPrice")
-                    sz = f.get("size") or f.get("qty") or f.get("fillSize") or f.get("matchSize")
-                    if px is None or sz is None:
-                        continue
-                    pxd = Decimal(str(px))
-                    szd = Decimal(str(sz))
-                    if szd <= 0:
-                        continue
-                    total_qty += szd
-                    total_notional += pxd * szd
-
-                if total_qty > 0:
-                    avg = (total_notional / total_qty)
-                    return {
-                        "filled_qty": str(total_qty),
-                        "avg_fill_price": str(avg),
-                        "fills_count": len(fills),
-                    }
-        except Exception as e:
-            last_err = e
-
-        # 兜底：有些 SDK 订单详情里会带 averagePrice/cumMatchFillSize
-        try:
-            od = _get_order_detail_v3(order_id, client_order_id)
-            avgp = od.get("averagePrice") or od.get("avgPrice") or od.get("avg_fill_price")
-            cumq = od.get("cumMatchFillSize") or od.get("cumMatchFillSizeValue") or od.get("cumMatchFillSizeQty") or od.get("filledSize") or od.get("cumFilledSize")
-            if avgp not in (None, "", "0", 0) and cumq not in (None, "", "0", 0):
-                avgd = Decimal(str(avgp))
-                cumd = Decimal(str(cumq))
-                if avgd > 0 and cumd > 0:
-                    return {
-                        "filled_qty": str(cumd),
-                        "avg_fill_price": str(avgd),
-                        "fills_count": 0,
-                    }
-        except Exception as e:
-            last_err = e
-
-        # sleep
-        if elapsed <= fast_window_sec:
-            time.sleep(fast_poll_interval)
-        else:
-            time.sleep(poll_interval)
-
-    raise RuntimeError(f"fill summary unavailable, last_err={repr(last_err)}")
-
-
-# -------------------------------------------------------------------
-# 查仓（用于 app.py 的远程兜底）
-# -------------------------------------------------------------------
-def get_open_position_for_symbol(symbol: str) -> Optional[Dict[str, Any]]:
-    c = _client()
-    # 兼容：positions_v3 / get_positions_v3
-    resp = None
-    try:
-        if hasattr(c, "positions_v3"):
-            resp = c.positions_v3()
-        elif hasattr(c, "get_positions_v3"):
-            resp = c.get_positions_v3()
-    except Exception:
-        resp = None
-
-    data = (resp or {}).get("data", resp) or {}
-    positions = data.get("positions") or data.get("list") or data.get("data") or data.get("rows") or data
-    if not isinstance(positions, list):
+def get_ticker_price(symbol: str, max_retry: int = 5, sleep_s: float = 0.25) -> Decimal | None:
+    pub = _mk_public_client()
+    if pub is None:
         return None
-
-    for p in positions:
-        sym = p.get("symbol")
-        if sym != symbol:
-            continue
-        side = (p.get("side") or p.get("positionSide") or "").upper()
-        size = p.get("size") or p.get("positionSize") or p.get("qty") or 0
-        entry = p.get("entryPrice") or p.get("avgEntryPrice") or p.get("entry_price") or 0
+    last_err = None
+    for _ in range(max_retry):
         try:
-            sized = Decimal(str(size))
-            entryd = Decimal(str(entry))
-        except Exception:
-            continue
-
-        if sized > 0 and side in ("LONG", "SHORT"):
-            return {"symbol": symbol, "side": side, "size": sized, "entryPrice": entryd}
-
+            # SDK naming can vary; try common ones
+            for fn_name in ("ticker_v3", "get_ticker_v3", "ticker", "get_ticker"):
+                fn = getattr(pub, fn_name, None)
+                if fn:
+                    res = fn(symbol=symbol)
+                    data = res.get("data") if isinstance(res, dict) else None
+                    if isinstance(data, dict):
+                        px = data.get("price") or data.get("lastPrice") or data.get("indexPrice")
+                        if px:
+                            return Decimal(str(px))
+            time.sleep(sleep_s)
+        except Exception as e:
+            last_err = e
+            time.sleep(sleep_s)
     return None
 
 
-def map_position_side_to_exit_order_side(direction: str) -> str:
-    d = direction.upper()
-    return "SELL" if d == "LONG" else "BUY"
+def create_market_order(symbol: str, side: str, size: Decimal, reduce_only: bool, client_id: str | None = None):
+    """
+    size: base qty (NOT USDT budget), already snapped.
+    side: BUY or SELL
+    """
+    c = _mk_private_client()
+    cid = client_id or random_client_id()
+
+    # Try v3 create order
+    for fn_name in ("create_order_v3", "create_order", "create_market_order"):
+        fn = getattr(c, fn_name, None)
+        if not fn:
+            continue
+        res = fn(
+            symbol=symbol,
+            side=side,
+            type="MARKET",
+            size=str(size),
+            clientId=cid,
+            reduceOnly=bool(reduce_only),
+        )
+        return res, cid
+
+    raise RuntimeError("No create order method found on SDK client (expected create_order_v3/create_order/...)")
+
+
+
+def get_order_v3(order_id: str | None = None, client_id: str | None = None):
+    c = _mk_private_client()
+
+    # 关键修复：一律用 keyword args，避免你现在这种 positional 触发 “takes 1 positional but 2 were given”
+    fn = getattr(c, "get_order_v3", None) or getattr(c, "get_order", None)
+    if not fn:
+        raise RuntimeError("No get_order_v3/get_order method found on SDK client.")
+
+    kwargs = {}
+    if order_id:
+        kwargs["orderId"] = order_id
+    if client_id:
+        kwargs["clientOrderId"] = client_id
+
+    return fn(**kwargs)
+
+
+def get_fill_summary(order_id: str, client_id: str | None = None) -> dict:
+    """
+    Returns:
+      {
+        "status": "...",
+        "filled_size": Decimal,
+        "avg_price": Decimal,
+      }
+    """
+    res = get_order_v3(order_id=order_id, client_id=client_id)
+    data = res.get("data") if isinstance(res, dict) else None
+    if not isinstance(data, dict):
+        return {"status": "UNKNOWN", "filled_size": Decimal("0"), "avg_price": Decimal("0")}
+
+    status = str(data.get("status") or "UNKNOWN")
+    filled = Decimal(str(data.get("cumMatchFillSize") or "0"))
+    avg = Decimal(str(data.get("averagePrice") or "0"))
+
+    # Some responses may expose latestMatchFillPrice as a fallback
+    if avg == 0:
+        lpx = data.get("latestMatchFillPrice") or data.get("lastFillPrice")
+        if lpx:
+            avg = Decimal(str(lpx))
+
+    return {"status": status, "filled_size": filled, "avg_price": avg}
+
+
+def wait_for_fill(order_id: str, client_id: str | None, fast_wait_s: float = 3.0, slow_wait_s: float = 60.0):
+    """
+    Fast poll for a few seconds, then slow poll up to 60s.
+    """
+    t0 = time.time()
+    # fast
+    while time.time() - t0 < fast_wait_s:
+        fs = get_fill_summary(order_id, client_id)
+        if fs["filled_size"] > 0 and fs["avg_price"] > 0:
+            return fs
+        time.sleep(0.2)
+
+    # slow
+    t1 = time.time()
+    while time.time() - t1 < slow_wait_s:
+        fs = get_fill_summary(order_id, client_id)
+        if fs["filled_size"] > 0 and fs["avg_price"] > 0:
+            return fs
+        time.sleep(1.0)
+
+    return {"status": "TIMEOUT", "filled_size": Decimal("0"), "avg_price": Decimal("0")}
+
+
+def get_account_positions():
+    c = _mk_private_client()
+    fn = getattr(c, "get_account_v3", None) or getattr(c, "get_account", None)
+    if not fn:
+        raise RuntimeError("No get_account_v3/get_account method found on SDK client.")
+    res = fn()
+    data = res.get("data") if isinstance(res, dict) else None
+    if not isinstance(data, dict):
+        return []
+    positions = data.get("positions") or []
+    if isinstance(positions, list):
+        return positions
+    return []
+
+
+def get_open_position_for_symbol(symbol: str):
+    positions = get_account_positions()
+    for p in positions:
+        if str(p.get("symbol")) != symbol:
+            continue
+        size = Decimal(str(p.get("size") or "0"))
+        side = str(p.get("side") or "")
+        if size > 0 and side in ("LONG", "SHORT"):
+            return {"symbol": symbol, "side": side, "size": size, "raw": p}
+    return None
+
+
+def map_position_side_to_exit_order_side(pos_side: str) -> str:
+    return "SELL" if pos_side == "LONG" else "BUY"
