@@ -2,7 +2,7 @@ import os
 import sqlite3
 import time
 from decimal import Decimal
-from typing import Dict, Tuple, Any, List, Optional
+from typing import Dict, Tuple, Any, List
 
 DB_PATH = os.getenv("PNL_DB_PATH", "pnl.sqlite3")
 
@@ -22,15 +22,6 @@ def _d(x) -> Decimal:
 def _connect():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-
-    # concurrency hardening
-    try:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
-        conn.execute("PRAGMA busy_timeout=3000;")
-    except Exception:
-        pass
-
     return conn
 
 
@@ -38,7 +29,7 @@ def init_db():
     conn = _connect()
     cur = conn.cursor()
 
-    # lots: each entry
+    # lots: 每次 entry 一条
     cur.execute("""
     CREATE TABLE IF NOT EXISTS lots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -47,14 +38,14 @@ def init_db():
         direction TEXT NOT NULL,        -- LONG / SHORT
         entry_side TEXT NOT NULL,       -- BUY / SELL
         qty TEXT NOT NULL,              -- Decimal as text
-        entry_price TEXT NOT NULL,      -- Decimal as text (FILL AVG)
+        entry_price TEXT NOT NULL,      -- Decimal as text
         remaining_qty TEXT NOT NULL,    -- Decimal as text
         reason TEXT,
         ts INTEGER NOT NULL
     )
     """)
 
-    # exits: each exit record
+    # exits: 每次出场记录（可多笔 lot 贡献）
     cur.execute("""
     CREATE TABLE IF NOT EXISTS exits (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -72,40 +63,13 @@ def init_db():
     )
     """)
 
-    # lock levels (your stepwise lock)
+    # lock levels: 阶梯锁盈档位
     cur.execute("""
     CREATE TABLE IF NOT EXISTS lock_levels (
         bot_id TEXT NOT NULL,
         symbol TEXT NOT NULL,
         direction TEXT NOT NULL,
         lock_level_pct TEXT NOT NULL,
-        updated_ts INTEGER NOT NULL,
-        PRIMARY KEY (bot_id, symbol, direction)
-    )
-    """)
-
-    # processed signals for idempotency
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS processed_signals (
-        bot_id TEXT NOT NULL,
-        signal_id TEXT NOT NULL,
-        ts INTEGER NOT NULL,
-        PRIMARY KEY (bot_id, signal_id)
-    )
-    """)
-
-    # risk state (fill-first baseline)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS risk_states (
-        bot_id TEXT NOT NULL,
-        symbol TEXT NOT NULL,
-        direction TEXT NOT NULL,             -- LONG/SHORT
-        entry_fill_price TEXT NOT NULL,      -- Decimal text
-        entry_qty TEXT NOT NULL,             -- Decimal text
-        peak_profit_pct TEXT NOT NULL,       -- Decimal text
-        lock_level_pct TEXT NOT NULL,        -- Decimal text
-        sl_pct TEXT NOT NULL,                -- Decimal text (e.g. -0.5)
-        status TEXT NOT NULL,                -- ACTIVE / FROZEN / CLOSED
         updated_ts INTEGER NOT NULL,
         PRIMARY KEY (bot_id, symbol, direction)
     )
@@ -135,7 +99,7 @@ def record_entry(
     p = _d(price)
 
     if q <= 0 or p <= 0:
-        raise ValueError("record_entry requires qty>0 and price>0 (fill-first)")
+        raise ValueError("record_entry requires qty>0 and price>0")
 
     conn = _connect()
     cur = conn.cursor()
@@ -158,6 +122,11 @@ def record_exit_fifo(
     exit_price: Decimal,
     reason: str = "strategy_exit",
 ):
+    """
+    FIFO 出场：
+    - 只从该 bot 的该方向 lots 里扣 remaining_qty
+    - 只记该 bot 自己卖出的数量
+    """
     direction = _side_to_direction(entry_side)
     exit_side = "SELL" if direction == "LONG" else "BUY"
 
@@ -165,7 +134,7 @@ def record_exit_fifo(
     px_exit = _d(exit_price)
 
     if need <= 0 or px_exit <= 0:
-        raise ValueError("record_exit_fifo requires exit_qty>0 and exit_price>0 (fill-first)")
+        raise ValueError("record_exit_fifo requires exit_qty>0 and exit_price>0")
 
     conn = _connect()
     cur = conn.cursor()
@@ -182,6 +151,7 @@ def record_exit_fifo(
         return
 
     ts = _now()
+
     for r in rows:
         if need <= 0:
             break
@@ -203,11 +173,13 @@ def record_exit_fifo(
 
         new_rem = rem - take
 
+        # update lot remaining
         cur.execute("""
             UPDATE lots SET remaining_qty=?
             WHERE id=?
         """, (str(new_rem), lot_id))
 
+        # write exit record
         cur.execute("""
             INSERT INTO exits (
                 bot_id, symbol, direction, entry_side, exit_side,
@@ -226,6 +198,15 @@ def record_exit_fifo(
 
 
 def get_bot_open_positions(bot_id: str) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    """
+    返回：
+    {
+      (symbol, direction): {
+          "qty": Decimal,
+          "weighted_entry": Decimal
+      }
+    }
+    """
     conn = _connect()
     cur = conn.cursor()
 
@@ -246,7 +227,11 @@ def get_bot_open_positions(bot_id: str) -> Dict[Tuple[str, str], Dict[str, Any]]
         notional_sum = _d(r["notional_sum"] or "0")
 
         weighted = (notional_sum / qty_sum) if qty_sum > 0 else Decimal("0")
-        out[(symbol, direction)] = {"qty": qty_sum, "weighted_entry": weighted}
+
+        out[(symbol, direction)] = {
+            "qty": qty_sum,
+            "weighted_entry": weighted,
+        }
 
     conn.close()
     return out
@@ -261,12 +246,19 @@ def list_bots_with_activity() -> List[str]:
         UNION
         SELECT DISTINCT bot_id FROM exits
     """)
+
     bots = sorted([r[0] for r in cur.fetchall() if r[0]])
     conn.close()
     return bots
 
 
 def get_bot_summary(bot_id: str) -> Dict[str, Any]:
+    """
+    realized_day: 24h
+    realized_week: 7d
+    realized_total: all
+    trades_count: exits count
+    """
     conn = _connect()
     cur = conn.cursor()
 
@@ -288,6 +280,7 @@ def get_bot_summary(bot_id: str) -> Dict[str, Any]:
         FROM exits WHERE bot_id=?
     """, (bot_id,))
     row = cur.fetchone()
+
     total = _d(row["s"] or "0")
     count = int(row["c"] or 0)
 
@@ -304,127 +297,45 @@ def get_bot_summary(bot_id: str) -> Dict[str, Any]:
 
 
 # ---------------------------
-# Idempotency (signal dedup)
+# ✅ Lock level persistence
 # ---------------------------
-def is_signal_processed(bot_id: str, signal_id: str) -> bool:
+def get_lock_level_pct(bot_id: str, symbol: str, direction: str) -> Decimal:
     conn = _connect()
     cur = conn.cursor()
     cur.execute("""
-        SELECT 1 FROM processed_signals
-        WHERE bot_id=? AND signal_id=?
-    """, (bot_id, signal_id))
-    row = cur.fetchone()
-    conn.close()
-    return row is not None
-
-
-def mark_signal_processed(bot_id: str, signal_id: str):
-    conn = _connect()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT OR IGNORE INTO processed_signals (bot_id, signal_id, ts)
-        VALUES (?, ?, ?)
-    """, (bot_id, signal_id, _now()))
-    conn.commit()
-    conn.close()
-
-
-# ---------------------------
-# Risk state persistence
-# ---------------------------
-def upsert_risk_state(
-    bot_id: str,
-    symbol: str,
-    direction: str,
-    entry_fill_price: Decimal,
-    entry_qty: Decimal,
-    sl_pct: Decimal,
-    peak_profit_pct: Decimal = Decimal("0"),
-    lock_level_pct: Decimal = Decimal("0"),
-    status: str = "ACTIVE",
-):
-    conn = _connect()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO risk_states (
-            bot_id, symbol, direction,
-            entry_fill_price, entry_qty,
-            peak_profit_pct, lock_level_pct,
-            sl_pct, status, updated_ts
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(bot_id, symbol, direction)
-        DO UPDATE SET
-            entry_fill_price=excluded.entry_fill_price,
-            entry_qty=excluded.entry_qty,
-            peak_profit_pct=excluded.peak_profit_pct,
-            lock_level_pct=excluded.lock_level_pct,
-            sl_pct=excluded.sl_pct,
-            status=excluded.status,
-            updated_ts=excluded.updated_ts
-    """, (
-        bot_id, symbol, direction.upper(),
-        str(_d(entry_fill_price)), str(_d(entry_qty)),
-        str(_d(peak_profit_pct)), str(_d(lock_level_pct)),
-        str(_d(sl_pct)), str(status), _now()
-    ))
-    conn.commit()
-    conn.close()
-
-
-def get_risk_state(bot_id: str, symbol: str, direction: str) -> Optional[Dict[str, Any]]:
-    conn = _connect()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT * FROM risk_states
+        SELECT lock_level_pct FROM lock_levels
         WHERE bot_id=? AND symbol=? AND direction=?
     """, (bot_id, symbol, direction.upper()))
     row = cur.fetchone()
     conn.close()
+
     if not row:
-        return None
-    return dict(row)
+        return Decimal("0")
+    try:
+        return _d(row["lock_level_pct"])
+    except Exception:
+        return Decimal("0")
 
 
-def update_risk_progress(bot_id: str, symbol: str, direction: str, peak_profit_pct: Decimal, lock_level_pct: Decimal):
-    st = get_risk_state(bot_id, symbol, direction)
-    if not st:
-        return
-    upsert_risk_state(
-        bot_id=bot_id,
-        symbol=symbol,
-        direction=direction,
-        entry_fill_price=_d(st["entry_fill_price"]),
-        entry_qty=_d(st["entry_qty"]),
-        sl_pct=_d(st["sl_pct"]),
-        peak_profit_pct=_d(peak_profit_pct),
-        lock_level_pct=_d(lock_level_pct),
-        status=str(st["status"]),
-    )
-
-
-def set_risk_status(bot_id: str, symbol: str, direction: str, status: str):
-    st = get_risk_state(bot_id, symbol, direction)
-    if not st:
-        return
-    upsert_risk_state(
-        bot_id=bot_id,
-        symbol=symbol,
-        direction=direction,
-        entry_fill_price=_d(st["entry_fill_price"]),
-        entry_qty=_d(st["entry_qty"]),
-        sl_pct=_d(st["sl_pct"]),
-        peak_profit_pct=_d(st["peak_profit_pct"]),
-        lock_level_pct=_d(st["lock_level_pct"]),
-        status=str(status),
-    )
-
-
-def clear_risk_state(bot_id: str, symbol: str, direction: str):
+def set_lock_level_pct(bot_id: str, symbol: str, direction: str, lock_level_pct: Decimal):
+    lvl = _d(lock_level_pct)
     conn = _connect()
     cur = conn.cursor()
     cur.execute("""
-        DELETE FROM risk_states
+        INSERT INTO lock_levels (bot_id, symbol, direction, lock_level_pct, updated_ts)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(bot_id, symbol, direction)
+        DO UPDATE SET lock_level_pct=excluded.lock_level_pct, updated_ts=excluded.updated_ts
+    """, (bot_id, symbol, direction.upper(), str(lvl), _now()))
+    conn.commit()
+    conn.close()
+
+
+def clear_lock_level_pct(bot_id: str, symbol: str, direction: str):
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute("""
+        DELETE FROM lock_levels
         WHERE bot_id=? AND symbol=? AND direction=?
     """, (bot_id, symbol, direction.upper()))
     conn.commit()
