@@ -1,275 +1,318 @@
 import os
-import json
 import time
 from decimal import Decimal
 from typing import Any, Dict, Optional
 
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify, request
 
 from apex_client import get_client
 import pnl_store
-from risk_manager import start_risk_thread
 
 app = Flask(__name__)
 
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
-ENABLE_LIVE_TRADING = os.getenv("ENABLE_LIVE_TRADING", "true").lower() == "true"
 
-DEFAULT_BUDGET_USDT = Decimal(os.getenv("DEFAULT_BUDGET_USDT", "15"))
+TP_PCT = Decimal(os.getenv("TP_PCT", "0.60"))       # 默认 0.60%
+BASE_SL_PCT = Decimal(os.getenv("BASE_SL_PCT", "0.50"))  # 默认 0.50%
 
-# Bot direction rules:
-# BOT_1~5 => LONG only
-# BOT_6~10 => SHORT only
-BOT_DIR_RULES: Dict[str, str] = {}
-for i in range(1, 6):
-    BOT_DIR_RULES[f"BOT_{i}"] = "LONG"
-for i in range(6, 11):
-    BOT_DIR_RULES[f"BOT_{i}"] = "SHORT"
+# ladder: 触发阈值 -> 锁定收益阈值（百分比）
+# 例：到 +0.15% 就把止损抬到 +0.10%
+# 你可以按你最新规则改这里；也可做成 env 字符串解析（你要我再加也行）
+LADDER = [
+    (Decimal("0.15"), Decimal("0.10")),
+    (Decimal("0.30"), Decimal("0.20")),
+    (Decimal("0.45"), Decimal("0.30")),
+    (Decimal("0.60"), Decimal("0.40")),
+]
 
-
-def _json_error(msg: str, code: int = 400):
-    return jsonify({"ok": False, "error": msg}), code
-
-
-def _parse_json_body() -> Dict[str, Any]:
-    """
-    更强健的 JSON 解析：能把导致 400 的原因打印出来。
-    """
-    raw = request.get_data(cache=False, as_text=True) or ""
-    if not raw.strip():
-        raise ValueError("empty body")
-
-    # try flask json
+def _d(x: Any) -> Decimal:
     try:
-        obj = request.get_json(force=True, silent=False)
-        if isinstance(obj, dict):
-            return obj
-        raise ValueError("json is not an object")
+        return Decimal(str(x))
     except Exception:
-        # fallback manual json
-        try:
-            obj2 = json.loads(raw)
-            if isinstance(obj2, dict):
-                return obj2
-            raise ValueError("json is not an object")
-        except Exception as e:
-            raise ValueError(f"invalid json: {e}")
+        return Decimal("0")
 
 
-def _infer_action(payload: Dict[str, Any]) -> str:
-    a = (payload.get("action") or payload.get("signal_type") or "").strip().lower()
-    if a in ("open", "entry", "enter", "buy", "sell"):
-        return "open"
-    if a in ("close", "exit", "reduce"):
-        return "close"
-    return ""
-
-
-def _infer_direction(payload: Dict[str, Any]) -> str:
-    d = (payload.get("direction") or "").strip().upper()
-    if d in ("LONG", "SHORT"):
-        return d
-
-    side = (payload.get("side") or "").strip().upper()
-    if side == "BUY":
+def bot_forced_direction(bot_id: int) -> Optional[str]:
+    if 1 <= bot_id <= 5:
         return "LONG"
-    if side == "SELL":
+    if 6 <= bot_id <= 10:
         return "SHORT"
-    return ""
+    return None
 
 
-def _infer_open_side(direction: str, payload: Dict[str, Any]) -> str:
-    side = (payload.get("side") or "").strip().upper()
-    if side in ("BUY", "SELL"):
-        return side
-    return "BUY" if direction == "LONG" else "SELL"
+def entry_side_for(direction: str) -> str:
+    return "BUY" if direction.upper() == "LONG" else "SELL"
 
 
-def _infer_close_side(direction: str) -> str:
-    return "SELL" if direction == "LONG" else "BUY"
+def exit_side_for(direction: str) -> str:
+    return "SELL" if direction.upper() == "LONG" else "BUY"
 
 
-def _get_size_from_payload(symbol: str, direction: str, payload: Dict[str, Any]) -> Decimal:
+def compute_sl_tp(entry_price: Decimal, direction: str) -> Dict[str, str]:
     """
-    支持两种：
-    - size: 直接合约数量
-    - position_size_usdt / budget: 用 USDT 预算换算成 qty
+    SL/TP 全部基于“交易所真实成交均价 entry_price”来算。
     """
-    client = get_client()
+    if entry_price <= 0:
+        return {"sl": "0", "tp": "0"}
 
-    if payload.get("size") is not None:
-        try:
-            return Decimal(str(payload["size"]))
-        except Exception:
-            return Decimal("0")
+    if direction.upper() == "LONG":
+        sl = entry_price * (Decimal("1") - BASE_SL_PCT / Decimal("100"))
+        tp = entry_price * (Decimal("1") + TP_PCT / Decimal("100"))
+    else:
+        sl = entry_price * (Decimal("1") + BASE_SL_PCT / Decimal("100"))
+        tp = entry_price * (Decimal("1") - TP_PCT / Decimal("100"))
 
-    budget = payload.get("position_size_usdt") or payload.get("budget") or None
-    if budget is None:
-        budget = DEFAULT_BUDGET_USDT
+    return {"sl": str(sl), "tp": str(tp)}
 
-    try:
-        budget_d = Decimal(str(budget))
-    except Exception:
-        budget_d = DEFAULT_BUDGET_USDT
 
-    # 用盘口估算 qty
-    bid, ask = client.get_best_bid_ask(symbol)
-    px = bid if direction == "LONG" else ask
-    if px is None or px <= 0:
-        last = client.get_last_price(symbol)
-        if last is None or last <= 0:
-            return Decimal("0")
-        px = last
+def apply_ladder(pos: Dict[str, Any], mark: Decimal) -> None:
+    """
+    简化版 ladder：只更新 lock_level_pct 和 sl_price（抬止损）
+    """
+    direction = pos["direction"].upper()
+    entry = _d(pos["entry_price"])
+    if entry <= 0 or mark <= 0:
+        return
 
-    qty = (budget_d / Decimal(str(px)))
-    return qty
+    # profit pct
+    if direction == "LONG":
+        profit_pct = (mark - entry) / entry * Decimal("100")
+    else:
+        profit_pct = (entry - mark) / entry * Decimal("100")
+
+    cur_lock = _d(pos.get("lock_level_pct", "0"))
+    best_lock = cur_lock
+
+    for trig, lock in LADDER:
+        if profit_pct >= trig and lock > best_lock:
+            best_lock = lock
+
+    if best_lock > cur_lock:
+        # 抬 SL 到 “锁定收益价”
+        if direction == "LONG":
+            new_sl = entry * (Decimal("1") + best_lock / Decimal("100"))
+        else:
+            new_sl = entry * (Decimal("1") - best_lock / Decimal("100"))
+
+        pnl_store.update_position(pos["bot_id"], pos["symbol"], {
+            "lock_level_pct": str(best_lock),
+            "sl_price": str(new_sl),
+            "max_profit_pct": str(max(_d(pos.get("max_profit_pct", "0")), profit_pct)),
+        })
+
+
+def should_stop(pos: Dict[str, Any], mark: Decimal) -> bool:
+    direction = pos["direction"].upper()
+    sl = _d(pos.get("sl_price", "0"))
+    tp = _d(pos.get("tp_price", "0"))
+    if mark <= 0:
+        return False
+
+    if direction == "LONG":
+        if sl > 0 and mark <= sl:
+            return True
+        if tp > 0 and mark >= tp:
+            return True
+    else:
+        if sl > 0 and mark >= sl:
+            return True
+        if tp > 0 and mark <= tp:
+            return True
+    return False
 
 
 @app.get("/healthz")
 def healthz():
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "ts": int(time.time())})
+
+
+@app.get("/dashboard")
+def dashboard():
+    return jsonify(pnl_store.list_positions())
+
+
+@app.get("/api/pnl")
+def api_pnl():
+    return jsonify(pnl_store.list_positions())
 
 
 @app.post("/webhook")
-def tv_webhook():
-    # parse
-    try:
-        payload = _parse_json_body()
-    except Exception as e:
-        print(f"[WEBHOOK] invalid json: {e}")
-        return _json_error(f"invalid json: {e}", 400)
-
-    # secret
-    secret = str(payload.get("secret") or "").strip()
+def webhook():
+    body = request.get_json(silent=True) or {}
+    secret = str(body.get("secret", ""))
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
-        print(f"[WEBHOOK] forbidden: secret mismatch, got='{secret}'")
-        return _json_error("forbidden", 401)
+        return jsonify({"ok": False, "error": "bad secret"}), 403
 
-    bot_id = str(payload.get("bot_id") or "").strip()
-    symbol = str(payload.get("symbol") or "").strip()
-    if not bot_id or not symbol:
-        print(f"[WEBHOOK] missing bot_id/symbol payload={payload}")
-        return _json_error("missing bot_id or symbol", 400)
+    bot_id = int(body.get("bot_id", 0))
+    action = str(body.get("action", "")).lower()   # open / close
+    symbol = str(body.get("symbol", "")).strip()
 
-    action = _infer_action(payload)
-    if not action:
-        print(f"[WEBHOOK] missing action/signal_type payload={payload}")
-        return _json_error("missing action/signal_type", 400)
-
-    direction = _infer_direction(payload)
-    if not direction:
-        print(f"[WEBHOOK] missing direction/side payload={payload}")
-        return _json_error("missing direction or side", 400)
-
-    # enforce bot rule (only for listed bots)
-    rule = BOT_DIR_RULES.get(bot_id)
-    if rule and rule != direction:
-        print(f"[WEBHOOK] ignored by bot rule bot={bot_id} rule={rule} got={direction}")
-        return jsonify({"ok": True, "ignored": True, "reason": "bot_direction_rule"}), 200
+    if bot_id <= 0 or not symbol or action not in ("open", "close"):
+        return jsonify({"ok": False, "error": "bad payload"}), 400
 
     client = get_client()
 
+    forced = bot_forced_direction(bot_id)
+
     if action == "open":
-        side = _infer_open_side(direction, payload)
-        qty = _get_size_from_payload(symbol, direction, payload)
+        direction = forced or str(body.get("direction", "")).upper() or "LONG"
+        if direction not in ("LONG", "SHORT"):
+            direction = "LONG"
+
+        side = entry_side_for(direction)
+
+        # 你 TV payload 里经常 size=15（像是 USDT 预算），这里按“预算/现价”换算 qty
+        budget = _d(body.get("size", "0"))
+        if budget <= 0:
+            return jsonify({"ok": False, "error": "size must be >0"}), 400
+
+        mark = client.get_last_price(symbol) or Decimal("0")
+        if mark <= 0:
+            # 再试 depth
+            bid, ask = client.get_best_bid_ask(symbol)
+            mark = (ask if side == "BUY" else bid) or Decimal("0")
+
+        if mark <= 0:
+            return jsonify({"ok": False, "error": "price unavailable"}), 500
+
+        qty = budget / mark
         qty = client.snap_qty(symbol, qty)
-
         if qty <= 0:
-            print(f"[ENTRY] qty compute error bot={bot_id} symbol={symbol} payload={payload}")
-            return _json_error("qty compute error", 400)
+            return jsonify({"ok": False, "error": "qty too small after snap"}), 400
 
-        client_oid = str(payload.get("client_id") or f"tv-{bot_id}-{int(time.time())}")
-        print(f"[ENTRY] bot={bot_id} symbol={symbol} dir={direction} side={side} qty={qty} oid={client_oid}")
+        resp = client.create_market_order(
+            symbol=symbol,
+            side=side,
+            size=qty,
+            reduce_only=False,
+            client_order_id=str(body.get("client_id") or ""),
+        )
 
-        if not ENABLE_LIVE_TRADING:
-            pnl_store.set_position(bot_id, symbol, {
-                "direction": direction,
-                "qty": str(qty),
-                "entry_price": "0",
-                "lock_level_pct": "0",
-                "is_closing": False,
-            })
-            return jsonify({"ok": True, "paper": True}), 200
+        data = resp.get("data") or resp
+        order_id = str(data.get("id") or "")
 
-        try:
-            resp = client.create_market_order(symbol=symbol, side=side, size=qty, reduce_only=False, client_order_id=client_oid)
-            data = resp.get("data") or resp
-            order_id = str(data.get("id") or data.get("orderId") or "")
+        fill = {"ok": False}
+        if order_id:
+            fill = client.get_fill_summary(symbol=symbol, order_id=order_id, max_wait_sec=3.0)
 
-            fill = client.get_fill_summary(symbol=symbol, order_id=order_id, max_wait_sec=3.0, poll_interval=0.2)
-            print(f"[ENTRY] order_id={order_id} fill={fill}")
+        entry_price = _d(fill.get("avg_price", "0"))
+        if entry_price <= 0:
+            # 最后兜底：用下单时 mark（但你要求“尽量用交易所成交价”，这里只是兜底）
+            entry_price = mark
 
-            entry_px = str(fill.get("avg_price") or "0")
-            filled_qty = str(fill.get("filled_qty") or str(qty))
+        sltp = compute_sl_tp(entry_price, direction)
+        pnl_store.set_position(
+            bot_id=str(bot_id),
+            symbol=symbol,
+            direction=direction,
+            qty=str(qty),
+            entry_price=str(entry_price),
+            sl_price=sltp["sl"],
+            tp_price=sltp["tp"],
+        )
 
-            pnl_store.set_position(bot_id, symbol, {
-                "direction": direction,
-                "qty": filled_qty,
-                "entry_price": entry_px,
-                "lock_level_pct": "0",
-                "is_closing": False,
-            })
-
-            return jsonify({"ok": True, "order_id": order_id, "fill": fill}), 200
-
-        except Exception as e:
-            print(f"[ENTRY] create_market_order error: {e}")
-            return _json_error(f"create_market_order error: {e}", 500)
+        return jsonify({
+            "ok": True,
+            "action": "open",
+            "bot_id": bot_id,
+            "symbol": symbol,
+            "direction": direction,
+            "qty": str(qty),
+            "order_id": order_id,
+            "fill": fill,
+        })
 
     # close
-    pos = pnl_store.get_position(bot_id, symbol)
-    close_side = _infer_close_side(direction)
+    pos = pnl_store.get_position(str(bot_id), symbol)
+    if not pos:
+        return jsonify({"ok": False, "error": "no local position"}), 200
 
-    # qty priority: payload.size > local store > remote account
-    qty = Decimal("0")
-    if payload.get("size") is not None:
-        try:
-            qty = Decimal(str(payload["size"]))
-        except Exception:
-            qty = Decimal("0")
-    if qty <= 0 and pos:
-        try:
-            qty = Decimal(str(pos.get("qty") or "0"))
-        except Exception:
-            qty = Decimal("0")
+    direction = pos["direction"].upper()
+    side = exit_side_for(direction)
+    qty = _d(pos.get("qty", "0"))
     if qty <= 0:
-        qty = client.get_open_position_size(symbol, direction)
+        pnl_store.clear_position(str(bot_id), symbol)
+        return jsonify({"ok": True, "action": "close", "note": "qty=0 cleared"}), 200
 
-    qty = client.snap_qty(symbol, qty)
-    if qty <= 0:
-        print(f"[EXIT] bot={bot_id} symbol={symbol}: no position qty to close")
-        return jsonify({"ok": True, "closed": False, "reason": "no_position"}), 200
+    resp = client.create_market_order(
+        symbol=symbol,
+        side=side,
+        size=qty,
+        reduce_only=True,
+        client_order_id=str(body.get("client_id") or ""),
+    )
 
-    client_oid = str(payload.get("client_id") or f"tv-close-{bot_id}-{int(time.time())}")
-    print(f"[EXIT] bot={bot_id} symbol={symbol} dir={direction} side={close_side} qty={qty} oid={client_oid}")
+    pnl_store.clear_position(str(bot_id), symbol)
 
-    if not ENABLE_LIVE_TRADING:
-        pnl_store.clear_position(bot_id, symbol)
-        return jsonify({"ok": True, "paper": True}), 200
+    return jsonify({
+        "ok": True,
+        "action": "close",
+        "bot_id": bot_id,
+        "symbol": symbol,
+        "direction": direction,
+        "order": resp,
+    })
 
-    try:
-        pnl_store.mark_closing(bot_id, symbol, True)
-        resp = client.create_market_order(symbol=symbol, side=close_side, size=qty, reduce_only=True, client_order_id=client_oid)
-        data = resp.get("data") or resp
-        order_id = str(data.get("id") or data.get("orderId") or "")
 
-        fill = client.get_fill_summary(symbol=symbol, order_id=order_id, max_wait_sec=3.0, poll_interval=0.2)
-        print(f"[EXIT] order_id={order_id} fill={fill}")
+def _risk_loop():
+    """
+    简化风控线程：轮询本地仓位 -> 更新 ladder -> 触发 SL/TP 自动平仓
+    """
+    client = None
+    while True:
+        try:
+            if client is None:
+                client = get_client()
 
-        pnl_store.clear_position(bot_id, symbol)
-        return jsonify({"ok": True, "order_id": order_id, "fill": fill}), 200
+            state = pnl_store.list_positions()
+            positions = list((state.get("positions") or {}).values())
 
-    except Exception as e:
-        pnl_store.mark_closing(bot_id, symbol, False)
-        print(f"[EXIT] create_market_order error: {e}")
-        return _json_error(f"close error: {e}", 500)
+            for pos in positions:
+                symbol = pos["symbol"]
+                bot_id = pos["bot_id"]
+                direction = pos["direction"].upper()
+
+                mark = client.get_last_price(symbol) or Decimal("0")
+                if mark <= 0:
+                    bid, ask = client.get_best_bid_ask(symbol)
+                    mark = (bid if direction == "LONG" else ask) or Decimal("0")
+
+                if mark <= 0:
+                    continue
+
+                apply_ladder(pos, mark)
+
+                # reload (可能刚被 ladder 更新过)
+                pos2 = pnl_store.get_position(bot_id, symbol)
+                if not pos2:
+                    continue
+
+                if should_stop(pos2, mark):
+                    side = exit_side_for(direction)
+                    qty = _d(pos2.get("qty", "0"))
+                    if qty > 0:
+                        client.create_market_order(
+                            symbol=symbol,
+                            side=side,
+                            size=qty,
+                            reduce_only=True,
+                            client_order_id=f"risk-{bot_id}-{int(time.time())}",
+                        )
+                    pnl_store.clear_position(bot_id, symbol)
+
+        except Exception as e:
+            # 不让线程死；你要更详细日志我再加
+            print(f"[RISK] loop error: {e}")
+
+        time.sleep(float(os.getenv("RISK_POLL_SEC", "0.5")))
+
+
+# 启动风控线程
+import threading
+threading.Thread(target=_risk_loop, daemon=True).start()
+print("[RISK] ladder/baseSL thread started")
 
 
 if __name__ == "__main__":
-    # DO App Platform 生产环境请用 gunicorn，不建议 python app.py
-    start_risk_thread()
-    port = int(os.getenv("PORT", "8080"))
-    app.run(host="0.0.0.0", port=port)
-else:
-    # gunicorn import app:app 时也启动风控线程
-    start_risk_thread()
+    # 本地调试用；DO 上用 gunicorn
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")), debug=False)
