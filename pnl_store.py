@@ -1,102 +1,302 @@
-import json
 import os
-import threading
+import sqlite3
+import time
 from decimal import Decimal
-from typing import Any, Dict, Optional, Tuple
+from typing import Dict, Tuple, Any, List, Optional
 
-_STORE_LOCK = threading.Lock()
-_STORE_PATH = os.getenv("PNL_STORE_PATH", "/tmp/pnl_store.json")
+DB_PATH = os.getenv("PNL_DB_PATH", "pnl.sqlite3")
 
 
-def _d(x: Any) -> Decimal:
-    try:
-        return Decimal(str(x))
-    except Exception:
+def _now() -> int:
+    return int(time.time())
+
+
+def _d(x) -> Decimal:
+    if x is None:
         return Decimal("0")
+    if isinstance(x, Decimal):
+        return x
+    return Decimal(str(x))
 
 
-def _load() -> Dict[str, Any]:
-    if not os.path.exists(_STORE_PATH):
-        return {"positions": {}}
+def _connect():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
     try:
-        with open(_STORE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f) or {"positions": {}}
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA busy_timeout=3000;")
     except Exception:
-        return {"positions": {}}
+        pass
+    return conn
 
 
-def _save(data: Dict[str, Any]) -> None:
-    os.makedirs(os.path.dirname(_STORE_PATH), exist_ok=True)
-    with open(_STORE_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def init_db():
+    conn = _connect()
+    cur = conn.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS lots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        bot_id TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        direction TEXT NOT NULL,        -- LONG / SHORT
+        entry_side TEXT NOT NULL,       -- BUY / SELL
+        qty TEXT NOT NULL,              -- Decimal as text
+        entry_price TEXT NOT NULL,      -- Decimal as text (REFERENCE PRICE)
+        remaining_qty TEXT NOT NULL,    -- Decimal as text
+        reason TEXT,
+        ts INTEGER NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS exits (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        bot_id TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        direction TEXT NOT NULL,
+        entry_side TEXT NOT NULL,
+        exit_side TEXT NOT NULL,
+        exit_qty TEXT NOT NULL,
+        entry_price TEXT NOT NULL,
+        exit_price TEXT NOT NULL,
+        realized_pnl TEXT NOT NULL,
+        reason TEXT,
+        ts INTEGER NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS processed_signals (
+        bot_id TEXT NOT NULL,
+        signal_id TEXT NOT NULL,
+        ts INTEGER NOT NULL,
+        PRIMARY KEY (bot_id, signal_id)
+    )
+    """)
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_lots_bot_symbol ON lots(bot_id, symbol, direction, ts)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_exits_bot_ts ON exits(bot_id, ts)")
+    conn.commit()
+    conn.close()
 
 
-def _key(bot_id: str, symbol: str) -> str:
-    return f"{bot_id}::{symbol}"
+def _side_to_direction(entry_side: str) -> str:
+    s = str(entry_side).upper()
+    return "LONG" if s == "BUY" else "SHORT"
 
 
-def get_position(bot_id: str, symbol: str) -> Optional[Dict[str, Any]]:
-    with _STORE_LOCK:
-        data = _load()
-        return data.get("positions", {}).get(_key(bot_id, symbol))
-
-
-def set_position(
+def record_entry(
     bot_id: str,
     symbol: str,
-    direction: str,           # "LONG" or "SHORT"
-    qty: str,
-    entry_price: str,
-    sl_price: str = "0",
-    tp_price: str = "0",
-) -> None:
-    with _STORE_LOCK:
-        data = _load()
-        data.setdefault("positions", {})
-        data["positions"][_key(bot_id, symbol)] = {
-            "bot_id": bot_id,
-            "symbol": symbol,
-            "direction": direction.upper(),
-            "qty": str(qty),
-            "entry_price": str(entry_price),
-            "sl_price": str(sl_price),
-            "tp_price": str(tp_price),
-            # ladder lock
-            "lock_level_pct": "0",     # e.g. 0.10 means lock +0.10%
-            "max_profit_pct": "0",
-            "updated_at": int(__import__("time").time()),
-        }
-        _save(data)
+    side: str,
+    qty: Decimal,
+    price: Decimal,
+    reason: str = "strategy_entry",
+):
+    direction = _side_to_direction(side)
+    q = _d(qty)
+    p = _d(price)
+
+    if q <= 0 or p <= 0:
+        raise ValueError("record_entry requires qty>0 and price>0")
+
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO lots (bot_id, symbol, direction, entry_side, qty, entry_price, remaining_qty, reason, ts)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        bot_id, symbol, direction, str(side).upper(),
+        str(q), str(p), str(q), reason, _now()
+    ))
+    conn.commit()
+    conn.close()
 
 
-def update_position(bot_id: str, symbol: str, patch: Dict[str, Any]) -> None:
-    with _STORE_LOCK:
-        data = _load()
-        k = _key(bot_id, symbol)
-        pos = data.get("positions", {}).get(k)
-        if not pos:
-            return
-        pos.update(patch)
-        pos["updated_at"] = int(__import__("time").time())
-        data["positions"][k] = pos
-        _save(data)
+def record_exit_fifo(
+    bot_id: str,
+    symbol: str,
+    entry_side: str,
+    exit_qty: Decimal,
+    exit_price: Decimal,
+    reason: str = "strategy_exit",
+):
+    direction = _side_to_direction(entry_side)
+    exit_side = "SELL" if direction == "LONG" else "BUY"
+
+    need = _d(exit_qty)
+    px_exit = _d(exit_price)
+
+    if need <= 0 or px_exit <= 0:
+        raise ValueError("record_exit_fifo requires exit_qty>0 and exit_price>0")
+
+    conn = _connect()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT * FROM lots
+        WHERE bot_id=? AND symbol=? AND direction=? AND CAST(remaining_qty AS REAL) > 0
+        ORDER BY ts ASC, id ASC
+    """, (bot_id, symbol, direction))
+
+    rows = cur.fetchall()
+    if not rows:
+        conn.close()
+        return
+
+    ts = _now()
+    for r in rows:
+        if need <= 0:
+            break
+
+        lot_id = r["id"]
+        rem = _d(r["remaining_qty"])
+        entry_price = _d(r["entry_price"])
+
+        if rem <= 0:
+            continue
+
+        take = rem if rem <= need else need
+
+        if direction == "LONG":
+            pnl = (px_exit - entry_price) * take
+        else:
+            pnl = (entry_price - px_exit) * take
+
+        new_rem = rem - take
+
+        cur.execute("UPDATE lots SET remaining_qty=? WHERE id=?", (str(new_rem), lot_id))
+
+        cur.execute("""
+            INSERT INTO exits (
+                bot_id, symbol, direction, entry_side, exit_side,
+                exit_qty, entry_price, exit_price, realized_pnl, reason, ts
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            bot_id, symbol, direction, str(entry_side).upper(), exit_side,
+            str(take), str(entry_price), str(px_exit), str(pnl), reason, ts
+        ))
+
+        need -= take
+
+    conn.commit()
+    conn.close()
 
 
-def clear_position(bot_id: str, symbol: str) -> None:
-    with _STORE_LOCK:
-        data = _load()
-        data.setdefault("positions", {})
-        data["positions"].pop(_key(bot_id, symbol), None)
-        _save(data)
+def get_bot_open_positions(bot_id: str) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    conn = _connect()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT symbol, direction,
+               SUM(CAST(remaining_qty AS REAL)) AS qty_sum,
+               SUM(CAST(remaining_qty AS REAL) * CAST(entry_price AS REAL)) AS notional_sum
+        FROM lots
+        WHERE bot_id=? AND CAST(remaining_qty AS REAL) > 0
+        GROUP BY symbol, direction
+    """, (bot_id,))
+
+    out: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for r in cur.fetchall():
+        symbol = r["symbol"]
+        direction = r["direction"]
+        qty_sum = _d(r["qty_sum"] or "0")
+        notional_sum = _d(r["notional_sum"] or "0")
+
+        weighted = (notional_sum / qty_sum) if qty_sum > 0 else Decimal("0")
+        out[(symbol, direction)] = {"qty": qty_sum, "weighted_entry": weighted}
+
+    conn.close()
+    return out
 
 
-def list_positions() -> Dict[str, Any]:
-    with _STORE_LOCK:
-        return _load()
+def list_bots_with_activity() -> List[str]:
+    conn = _connect()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT DISTINCT bot_id FROM lots
+        UNION
+        SELECT DISTINCT bot_id FROM exits
+    """)
+    bots = sorted([r[0] for r in cur.fetchall() if r[0]])
+    conn.close()
+    return bots
 
 
-# ---- 你日志里报过 ImportError: cannot import name 'get_lock_level_pct' ----
-# 这里补齐，app.py 直接 import 就不会再炸。
-def get_lock_level_pct(bot_id: str, symbol: str) -> Decimal:
-    pos = get_position(bot_id, symbol) or {}
-    return _d(pos.get("lock_level_pct", "0"))
+def get_bot_summary(bot_id: str) -> Dict[str, Any]:
+    conn = _connect()
+    cur = conn.cursor()
+
+    now = _now()
+    day_ago = now - 24 * 3600
+    week_ago = now - 7 * 24 * 3600
+
+    def _sum_since(ts_from: int) -> Decimal:
+        cur.execute("""
+            SELECT SUM(CAST(realized_pnl AS REAL)) AS s
+            FROM exits
+            WHERE bot_id=? AND ts>=?
+        """, (bot_id, ts_from))
+        v = cur.fetchone()["s"]
+        return _d(v or "0")
+
+    cur.execute("""
+        SELECT SUM(CAST(realized_pnl AS REAL)) AS s, COUNT(*) AS c
+        FROM exits WHERE bot_id=?
+    """, (bot_id,))
+    row = cur.fetchone()
+    total = _d(row["s"] or "0")
+    count = int(row["c"] or 0)
+
+    out = {
+        "bot_id": bot_id,
+        "realized_day": str(_sum_since(day_ago)),
+        "realized_week": str(_sum_since(week_ago)),
+        "realized_total": str(total),
+        "trades_count": count,
+    }
+
+    conn.close()
+    return out
+
+
+def list_recent_exits(bot_id: str, limit: int = 30) -> List[Dict[str, Any]]:
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT bot_id, symbol, direction, exit_qty, entry_price, exit_price, realized_pnl, reason, ts
+        FROM exits
+        WHERE bot_id=?
+        ORDER BY ts DESC, id DESC
+        LIMIT ?
+    """, (bot_id, int(limit)))
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+# ---------------------------
+# Idempotency (signal dedup)
+# ---------------------------
+def is_signal_processed(bot_id: str, signal_id: str) -> bool:
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM processed_signals WHERE bot_id=? AND signal_id=?", (bot_id, signal_id))
+    row = cur.fetchone()
+    conn.close()
+    return row is not None
+
+
+def mark_signal_processed(bot_id: str, signal_id: str):
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT OR IGNORE INTO processed_signals (bot_id, signal_id, ts)
+        VALUES (?, ?, ?)
+    """, (bot_id, signal_id, _now()))
+    conn.commit()
+    conn.close()
