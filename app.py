@@ -1,318 +1,400 @@
 import os
+import json
 import time
 from decimal import Decimal
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple, List
 
-from flask import Flask, jsonify, request
+from flask import Flask, request, jsonify
 
-from apex_client import get_client
+import apex_client
 import pnl_store
 
 app = Flask(__name__)
 
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+# ----------------------------
+# Env / Config
+# ----------------------------
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+PORT = int(os.getenv("PORT", "8080"))
 
-TP_PCT = Decimal(os.getenv("TP_PCT", "0.60"))       # 默认 0.60%
-BASE_SL_PCT = Decimal(os.getenv("BASE_SL_PCT", "0.50"))  # 默认 0.50%
+DEFAULT_SIZE_USDT = os.getenv("DEFAULT_SIZE_USDT", "60")
 
-# ladder: 触发阈值 -> 锁定收益阈值（百分比）
-# 例：到 +0.15% 就把止损抬到 +0.10%
-# 你可以按你最新规则改这里；也可做成 env 字符串解析（你要我再加也行）
-LADDER = [
-    (Decimal("0.15"), Decimal("0.10")),
-    (Decimal("0.30"), Decimal("0.20")),
-    (Decimal("0.45"), Decimal("0.30")),
-    (Decimal("0.60"), Decimal("0.40")),
-]
+# Optional: allow bots outside 1-20 (default off)
+ALLOW_OTHER_BOTS = os.getenv("ALLOW_OTHER_BOTS", "false").lower() in ("1", "true", "yes", "y", "on")
 
-def _d(x: Any) -> Decimal:
+# ----------------------------
+# Init DB
+# ----------------------------
+pnl_store.init_db()
+
+
+def _d(x) -> Decimal:
+    return x if isinstance(x, Decimal) else Decimal(str(x))
+
+
+def _log(event: str, **fields):
+    rec = {"ts": int(time.time()), "event": event, **fields}
+    print(json.dumps(rec, ensure_ascii=False))
+
+
+# ----------------------------
+# Bot profiles / Rules
+# ----------------------------
+def _parse_bot_number(bot_id: str) -> Optional[int]:
+    s = str(bot_id).strip().lower().replace("bot", "").replace("_", "")
+    if not s:
+        return None
     try:
-        return Decimal(str(x))
+        return int(s)
     except Exception:
-        return Decimal("0")
+        return None
 
 
-def bot_forced_direction(bot_id: int) -> Optional[str]:
-    if 1 <= bot_id <= 5:
-        return "LONG"
-    if 6 <= bot_id <= 10:
-        return "SHORT"
-    return None
+def bot_profile(bot_id: str) -> Dict[str, Any]:
+    """
+    Required:
+    - BOT_1..BOT_10 => LONG only (BUY entries)
+    - BOT_11..BOT_20 => SHORT only (SELL entries)
+    - No SL/TP for any bot
+    """
+    n = _parse_bot_number(bot_id)
+    if n is None:
+        return {"bot_num": None, "force_direction": "NONE"}
+
+    if 1 <= n <= 10:
+        return {"bot_num": n, "force_direction": "LONG"}
+    if 11 <= n <= 20:
+        return {"bot_num": n, "force_direction": "SHORT"}
+
+    return {"bot_num": n, "force_direction": "ANY" if ALLOW_OTHER_BOTS else "NONE"}
 
 
-def entry_side_for(direction: str) -> str:
+def _direction_from_side(side: str) -> str:
+    return "LONG" if str(side).upper() == "BUY" else "SHORT"
+
+
+def _entry_side_for_direction(direction: str) -> str:
     return "BUY" if direction.upper() == "LONG" else "SELL"
 
 
-def exit_side_for(direction: str) -> str:
+def _exit_side_for_direction(direction: str) -> str:
     return "SELL" if direction.upper() == "LONG" else "BUY"
 
 
-def compute_sl_tp(entry_price: Decimal, direction: str) -> Dict[str, str]:
-    """
-    SL/TP 全部基于“交易所真实成交均价 entry_price”来算。
-    """
-    if entry_price <= 0:
-        return {"sl": "0", "tp": "0"}
+# ----------------------------
+# Idempotency
+# ----------------------------
+def get_signal_id(payload: Dict[str, Any]) -> str:
+    sid = payload.get("signal_id") or payload.get("alert_id") or payload.get("id")
+    if sid:
+        return str(sid)
 
-    if direction.upper() == "LONG":
-        sl = entry_price * (Decimal("1") - BASE_SL_PCT / Decimal("100"))
-        tp = entry_price * (Decimal("1") + TP_PCT / Decimal("100"))
-    else:
-        sl = entry_price * (Decimal("1") + BASE_SL_PCT / Decimal("100"))
-        tp = entry_price * (Decimal("1") - TP_PCT / Decimal("100"))
-
-    return {"sl": str(sl), "tp": str(tp)}
+    ts = payload.get("ts") or payload.get("time") or int(time.time())
+    return f"auto:{ts}:{payload.get('symbol')}:{payload.get('action')}:{payload.get('bot_id')}"
 
 
-def apply_ladder(pos: Dict[str, Any], mark: Decimal) -> None:
-    """
-    简化版 ladder：只更新 lock_level_pct 和 sl_price（抬止损）
-    """
-    direction = pos["direction"].upper()
-    entry = _d(pos["entry_price"])
-    if entry <= 0 or mark <= 0:
-        return
-
-    # profit pct
-    if direction == "LONG":
-        profit_pct = (mark - entry) / entry * Decimal("100")
-    else:
-        profit_pct = (entry - mark) / entry * Decimal("100")
-
-    cur_lock = _d(pos.get("lock_level_pct", "0"))
-    best_lock = cur_lock
-
-    for trig, lock in LADDER:
-        if profit_pct >= trig and lock > best_lock:
-            best_lock = lock
-
-    if best_lock > cur_lock:
-        # 抬 SL 到 “锁定收益价”
-        if direction == "LONG":
-            new_sl = entry * (Decimal("1") + best_lock / Decimal("100"))
-        else:
-            new_sl = entry * (Decimal("1") - best_lock / Decimal("100"))
-
-        pnl_store.update_position(pos["bot_id"], pos["symbol"], {
-            "lock_level_pct": str(best_lock),
-            "sl_price": str(new_sl),
-            "max_profit_pct": str(max(_d(pos.get("max_profit_pct", "0")), profit_pct)),
-        })
+# ----------------------------
+# Auth
+# ----------------------------
+def _auth_ok() -> bool:
+    if not WEBHOOK_SECRET:
+        return True
+    got = request.headers.get("X-WEBHOOK-SECRET") or request.args.get("secret") or ""
+    return str(got) == str(WEBHOOK_SECRET)
 
 
-def should_stop(pos: Dict[str, Any], mark: Decimal) -> bool:
-    direction = pos["direction"].upper()
-    sl = _d(pos.get("sl_price", "0"))
-    tp = _d(pos.get("tp_price", "0"))
-    if mark <= 0:
+# ----------------------------
+# Single-position policy (per bot + symbol)
+# ----------------------------
+def _has_local_open_lot(bot_id: str, symbol: str) -> bool:
+    try:
+        opens = pnl_store.get_bot_open_positions(bot_id)
+        for (sym, _dir), v in opens.items():
+            if str(sym).upper() == str(symbol).upper() and _d(v.get("qty", 0)) > 0:
+                return True
+        return False
+    except Exception:
         return False
 
-    if direction == "LONG":
-        if sl > 0 and mark <= sl:
-            return True
-        if tp > 0 and mark >= tp:
-            return True
-    else:
-        if sl > 0 and mark >= sl:
-            return True
-        if tp > 0 and mark <= tp:
-            return True
-    return False
 
+# ----------------------------
+# Core handlers
+# ----------------------------
+def handle_entry(payload: Dict[str, Any]) -> Dict[str, Any]:
+    bot_id = str(payload.get("bot_id") or payload.get("bot") or "bot0")
+    symbol = str(payload.get("symbol") or "").strip()
+    side = str(payload.get("side") or payload.get("entry_side") or "").upper()  # BUY/SELL
+    size_usdt = payload.get("size_usdt") or payload.get("usdt") or DEFAULT_SIZE_USDT
 
-@app.get("/healthz")
-def healthz():
-    return jsonify({"ok": True, "ts": int(time.time())})
+    if not symbol or side not in ("BUY", "SELL"):
+        return {"ok": False, "error": "missing symbol or invalid side (BUY/SELL required)"}
 
+    prof = bot_profile(bot_id)
+    if prof["force_direction"] == "NONE":
+        return {"ok": False, "error": "bot_id not allowed (only BOT_1..BOT_20 by default)"}
 
-@app.get("/dashboard")
-def dashboard():
-    return jsonify(pnl_store.list_positions())
+    direction = _direction_from_side(side)
 
+    # enforce long-only/short-only
+    if prof["force_direction"] == "LONG" and direction != "LONG":
+        return {"ok": False, "error": "BOT_1..BOT_10 are LONG only (BUY only)"}
+    if prof["force_direction"] == "SHORT" and direction != "SHORT":
+        return {"ok": False, "error": "BOT_11..BOT_20 are SHORT only (SELL only)"}
 
-@app.get("/api/pnl")
-def api_pnl():
-    return jsonify(pnl_store.list_positions())
+    signal_id = get_signal_id(payload)
 
+    # idempotency
+    if pnl_store.is_signal_processed(bot_id, signal_id):
+        return {"ok": True, "dedup": True, "signal_id": signal_id}
 
-@app.post("/webhook")
-def webhook():
-    body = request.get_json(silent=True) or {}
-    secret = str(body.get("secret", ""))
-    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
-        return jsonify({"ok": False, "error": "bad secret"}), 403
+    pnl_store.mark_signal_processed(bot_id, signal_id)
 
-    bot_id = int(body.get("bot_id", 0))
-    action = str(body.get("action", "")).lower()   # open / close
-    symbol = str(body.get("symbol", "")).strip()
+    # enforce "one position per bot per symbol" (local)
+    if _has_local_open_lot(bot_id, symbol):
+        _log("entry_blocked_local_open", bot_id=bot_id, symbol=symbol, direction=direction, signal_id=signal_id)
+        return {"ok": False, "error": "local_open_position_exists_for_bot_symbol", "signal_id": signal_id}
 
-    if bot_id <= 0 or not symbol or action not in ("open", "close"):
-        return jsonify({"ok": False, "error": "bad payload"}), 400
+    _log("entry_submit", bot_id=bot_id, symbol=symbol, side=side, size_usdt=str(size_usdt), signal_id=signal_id)
 
-    client = get_client()
-
-    forced = bot_forced_direction(bot_id)
-
-    if action == "open":
-        direction = forced or str(body.get("direction", "")).upper() or "LONG"
-        if direction not in ("LONG", "SHORT"):
-            direction = "LONG"
-
-        side = entry_side_for(direction)
-
-        # 你 TV payload 里经常 size=15（像是 USDT 预算），这里按“预算/现价”换算 qty
-        budget = _d(body.get("size", "0"))
-        if budget <= 0:
-            return jsonify({"ok": False, "error": "size must be >0"}), 400
-
-        mark = client.get_last_price(symbol) or Decimal("0")
-        if mark <= 0:
-            # 再试 depth
-            bid, ask = client.get_best_bid_ask(symbol)
-            mark = (ask if side == "BUY" else bid) or Decimal("0")
-
-        if mark <= 0:
-            return jsonify({"ok": False, "error": "price unavailable"}), 500
-
-        qty = budget / mark
-        qty = client.snap_qty(symbol, qty)
-        if qty <= 0:
-            return jsonify({"ok": False, "error": "qty too small after snap"}), 400
-
-        resp = client.create_market_order(
+    # Place order (simple, no fill polling)
+    try:
+        res = apex_client.create_market_order_simple(
             symbol=symbol,
             side=side,
-            size=qty,
+            size_usdt=size_usdt,
             reduce_only=False,
-            client_order_id=str(body.get("client_id") or ""),
+            client_tag=f"{bot_id}:{signal_id}",
         )
+    except Exception as e:
+        _log("entry_order_error", bot_id=bot_id, symbol=symbol, side=side, signal_id=signal_id, err=str(e))
+        return {"ok": False, "error": "order_failed", "detail": str(e), "signal_id": signal_id}
 
-        data = resp.get("data") or resp
-        order_id = str(data.get("id") or "")
+    # reference entry price (worstPrice used for placement)
+    placed = res.get("placed", {})
+    qty = _d(placed.get("size"))
+    px = _d(placed.get("price_for_order"))
 
-        fill = {"ok": False}
-        if order_id:
-            fill = client.get_fill_summary(symbol=symbol, order_id=order_id, max_wait_sec=3.0)
-
-        entry_price = _d(fill.get("avg_price", "0"))
-        if entry_price <= 0:
-            # 最后兜底：用下单时 mark（但你要求“尽量用交易所成交价”，这里只是兜底）
-            entry_price = mark
-
-        sltp = compute_sl_tp(entry_price, direction)
-        pnl_store.set_position(
-            bot_id=str(bot_id),
-            symbol=symbol,
-            direction=direction,
-            qty=str(qty),
-            entry_price=str(entry_price),
-            sl_price=sltp["sl"],
-            tp_price=sltp["tp"],
-        )
-
-        return jsonify({
-            "ok": True,
-            "action": "open",
-            "bot_id": bot_id,
-            "symbol": symbol,
-            "direction": direction,
-            "qty": str(qty),
-            "order_id": order_id,
-            "fill": fill,
-        })
-
-    # close
-    pos = pnl_store.get_position(str(bot_id), symbol)
-    if not pos:
-        return jsonify({"ok": False, "error": "no local position"}), 200
-
-    direction = pos["direction"].upper()
-    side = exit_side_for(direction)
-    qty = _d(pos.get("qty", "0"))
-    if qty <= 0:
-        pnl_store.clear_position(str(bot_id), symbol)
-        return jsonify({"ok": True, "action": "close", "note": "qty=0 cleared"}), 200
-
-    resp = client.create_market_order(
+    # record entry as reference PnL baseline
+    pnl_store.record_entry(
+        bot_id=bot_id,
         symbol=symbol,
         side=side,
-        size=qty,
-        reduce_only=True,
-        client_order_id=str(body.get("client_id") or ""),
+        qty=qty,
+        price=px,
+        reason="entry_reference_price",
     )
 
-    pnl_store.clear_position(str(bot_id), symbol)
+    _log(
+        "entry_accepted",
+        bot_id=bot_id,
+        symbol=symbol,
+        direction=direction,
+        qty=str(qty),
+        ref_entry=str(px),
+        order_id=res.get("order_id"),
+        client_order_id=res.get("client_order_id"),
+        signal_id=signal_id,
+    )
 
-    return jsonify({
+    return {
         "ok": True,
-        "action": "close",
-        "bot_id": bot_id,
-        "symbol": symbol,
-        "direction": direction,
-        "order": resp,
-    })
+        "signal_id": signal_id,
+        "qty": str(qty),
+        "ref_entry": str(px),
+        "order_id": res.get("order_id"),
+        "client_order_id": res.get("client_order_id"),
+    }
 
 
-def _risk_loop():
+def handle_exit(payload: Dict[str, Any]) -> Dict[str, Any]:
+    bot_id = str(payload.get("bot_id") or payload.get("bot") or "bot0")
+    symbol = str(payload.get("symbol") or "").strip()
+
+    if not symbol:
+        return {"ok": False, "error": "missing symbol"}
+
+    signal_id = get_signal_id(payload)
+
+    if pnl_store.is_signal_processed(bot_id, signal_id):
+        return {"ok": True, "dedup": True, "signal_id": signal_id}
+
+    pnl_store.mark_signal_processed(bot_id, signal_id)
+
+    # Determine direction: prefer exchange position if available, else payload direction
+    pos = apex_client.get_open_position_for_symbol(symbol)
+    if pos and pos.get("side") in ("LONG", "SHORT") and pos.get("size") and _d(pos["size"]) > 0:
+        pos_side = str(pos["side"]).upper()
+        qty = _d(pos["size"])
+    else:
+        # fallback: payload must provide direction + qty
+        pos_side = str(payload.get("direction") or "").upper()
+        qty = _d(payload.get("qty") or payload.get("size") or "0")
+        if pos_side not in ("LONG", "SHORT") or qty <= 0:
+            _log("exit_need_direction_qty", bot_id=bot_id, symbol=symbol, signal_id=signal_id, pos=pos)
+            return {"ok": False, "error": "need_exchange_position_or_payload_direction_and_qty", "signal_id": signal_id}
+
+    exit_side = _exit_side_for_direction(pos_side)
+    entry_side = _entry_side_for_direction(pos_side)
+
+    _log("exit_submit", bot_id=bot_id, symbol=symbol, direction=pos_side, qty=str(qty), signal_id=signal_id)
+
+    # Place reduce-only close (simple)
+    try:
+        res = apex_client.create_market_order_simple(
+            symbol=symbol,
+            side=exit_side,
+            size=str(qty),
+            reduce_only=True,
+            client_tag=f"{bot_id}:{signal_id}:EXIT",
+        )
+    except Exception as e:
+        _log("exit_order_error", bot_id=bot_id, symbol=symbol, direction=pos_side, signal_id=signal_id, err=str(e))
+        return {"ok": False, "error": "order_failed", "detail": str(e), "signal_id": signal_id}
+
+    placed = res.get("placed", {})
+    exit_qty = _d(placed.get("size"))
+    exit_px = _d(placed.get("price_for_order"))
+
+    # record exit as reference PnL
+    pnl_store.record_exit_fifo(
+        bot_id=bot_id,
+        symbol=symbol,
+        entry_side=entry_side,
+        exit_qty=exit_qty,
+        exit_price=exit_px,
+        reason="exit_reference_price",
+    )
+
+    _log(
+        "exit_accepted",
+        bot_id=bot_id,
+        symbol=symbol,
+        direction=pos_side,
+        qty=str(exit_qty),
+        ref_exit=str(exit_px),
+        order_id=res.get("order_id"),
+        client_order_id=res.get("client_order_id"),
+        signal_id=signal_id,
+    )
+
+    return {
+        "ok": True,
+        "signal_id": signal_id,
+        "qty": str(exit_qty),
+        "ref_exit": str(exit_px),
+        "order_id": res.get("order_id"),
+        "client_order_id": res.get("client_order_id"),
+    }
+
+
+# ----------------------------
+# Routes
+# ----------------------------
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"ok": True})
+
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    if not _auth_ok():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    payload = request.get_json(silent=True) or {}
+
+    action = str(payload.get("action") or "").lower().strip()
+    if action not in ("entry", "exit"):
+        return jsonify({"ok": False, "error": "action must be 'entry' or 'exit'"}), 400
+
+    try:
+        out = handle_entry(payload) if action == "entry" else handle_exit(payload)
+    except Exception as e:
+        _log("webhook_exception", err=str(e), payload=payload)
+        return jsonify({"ok": False, "error": "server_error", "detail": str(e)}), 500
+
+    code = 200 if out.get("ok") else 409
+    return jsonify(out), code
+
+
+@app.route("/pnl", methods=["GET"])
+def pnl_page():
     """
-    简化风控线程：轮询本地仓位 -> 更新 ladder -> 触发 SL/TP 自动平仓
+    Mobile-friendly PnL dashboard (reference-price based).
     """
-    client = None
-    while True:
+    bots = pnl_store.list_bots_with_activity()
+    if not bots:
+        bots = [f"bot{i}" for i in range(1, 21)]
+
+    summaries = []
+    for b in bots:
         try:
-            if client is None:
-                client = get_client()
+            s = pnl_store.get_bot_summary(b)
+            opens = pnl_store.get_bot_open_positions(b)
+            s["open_positions"] = [
+                {"symbol": sym, "direction": d, "qty": str(v["qty"]), "weighted_entry": str(v["weighted_entry"])}
+                for (sym, d), v in opens.items()
+                if _d(v.get("qty", 0)) > 0
+            ]
+            summaries.append(s)
+        except Exception:
+            continue
 
-            state = pnl_store.list_positions()
-            positions = list((state.get("positions") or {}).values())
+    # simple HTML
+    lines: List[str] = []
+    lines.append("<html><head><meta name='viewport' content='width=device-width, initial-scale=1' />")
+    lines.append("<title>Bot PnL</title>")
+    lines.append("<style>body{font-family:Arial;padding:12px} .card{border:1px solid #ddd;border-radius:10px;padding:10px;margin:10px 0} .small{color:#666;font-size:12px} table{width:100%;border-collapse:collapse} td,th{padding:6px;border-bottom:1px solid #eee;text-align:left}</style>")
+    lines.append("</head><body>")
+    lines.append("<h2>Bot PnL (Reference Price)</h2>")
+    lines.append("<div class='small'>Entry/Exit prices are reference (worstPrice used for placement), not exact exchange fill price.</div>")
 
-            for pos in positions:
-                symbol = pos["symbol"]
-                bot_id = pos["bot_id"]
-                direction = pos["direction"].upper()
+    # sort by bot number if possible
+    def _bot_key(x):
+        n = _parse_bot_number(x.get("bot_id", ""))
+        return (9999 if n is None else n)
 
-                mark = client.get_last_price(symbol) or Decimal("0")
-                if mark <= 0:
-                    bid, ask = client.get_best_bid_ask(symbol)
-                    mark = (bid if direction == "LONG" else ask) or Decimal("0")
+    summaries.sort(key=_bot_key)
 
-                if mark <= 0:
-                    continue
+    for s in summaries:
+        lines.append("<div class='card'>")
+        lines.append(f"<b>{s['bot_id']}</b><div class='small'>trades: {s['trades_count']}</div>")
+        lines.append("<table>")
+        lines.append("<tr><th>24h</th><th>7d</th><th>Total</th></tr>")
+        lines.append(f"<tr><td>{s['realized_day']}</td><td>{s['realized_week']}</td><td>{s['realized_total']}</td></tr>")
+        lines.append("</table>")
 
-                apply_ladder(pos, mark)
+        ops = s.get("open_positions") or []
+        if ops:
+            lines.append("<div class='small' style='margin-top:8px'>Open positions (local lots)</div>")
+            lines.append("<table>")
+            lines.append("<tr><th>Symbol</th><th>Dir</th><th>Qty</th><th>W.Entry</th></tr>")
+            for o in ops:
+                lines.append(f"<tr><td>{o['symbol']}</td><td>{o['direction']}</td><td>{o['qty']}</td><td>{o['weighted_entry']}</td></tr>")
+            lines.append("</table>")
+        lines.append("</div>")
 
-                # reload (可能刚被 ladder 更新过)
-                pos2 = pnl_store.get_position(bot_id, symbol)
-                if not pos2:
-                    continue
-
-                if should_stop(pos2, mark):
-                    side = exit_side_for(direction)
-                    qty = _d(pos2.get("qty", "0"))
-                    if qty > 0:
-                        client.create_market_order(
-                            symbol=symbol,
-                            side=side,
-                            size=qty,
-                            reduce_only=True,
-                            client_order_id=f"risk-{bot_id}-{int(time.time())}",
-                        )
-                    pnl_store.clear_position(bot_id, symbol)
-
-        except Exception as e:
-            # 不让线程死；你要更详细日志我再加
-            print(f"[RISK] loop error: {e}")
-
-        time.sleep(float(os.getenv("RISK_POLL_SEC", "0.5")))
+    lines.append("</body></html>")
+    return "\n".join(lines), 200, {"Content-Type": "text/html; charset=utf-8"}
 
 
-# 启动风控线程
-import threading
-threading.Thread(target=_risk_loop, daemon=True).start()
-print("[RISK] ladder/baseSL thread started")
+@app.route("/pnl/json", methods=["GET"])
+def pnl_json():
+    bots = pnl_store.list_bots_with_activity()
+    if not bots:
+        bots = [f"bot{i}" for i in range(1, 21)]
+
+    out = []
+    for b in bots:
+        s = pnl_store.get_bot_summary(b)
+        opens = pnl_store.get_bot_open_positions(b)
+        s["open_positions"] = {
+            f"{sym}:{d}": {"qty": str(v["qty"]), "weighted_entry": str(v["weighted_entry"])}
+            for (sym, d), v in opens.items()
+        }
+        out.append(s)
+
+    return jsonify({"ok": True, "bots": out})
 
 
 if __name__ == "__main__":
-    # 本地调试用；DO 上用 gunicorn
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")), debug=False)
+    app.run(host="0.0.0.0", port=PORT)
