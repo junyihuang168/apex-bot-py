@@ -14,7 +14,7 @@ from apexomni.constants import (
 )
 
 # -------------------------------------------------------------------
-# Trading rules (default)
+# 交易规则（默认：最小数量 0.01，步长 0.01，小数点后 2 位）
 # -------------------------------------------------------------------
 DEFAULT_SYMBOL_RULES = {
     "min_qty": Decimal("0.01"),
@@ -96,39 +96,36 @@ def _safe_call(fn, **kwargs):
         allowed = set(sig.parameters.keys())
         call_kwargs = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
         return fn(**call_kwargs)
-    except (ValueError, TypeError):
+    except Exception:
+        # fallback: best-effort
         return fn(**{k: v for k, v in kwargs.items() if v is not None})
 
 
-def _extract_order_ids(raw_order: Any) -> Tuple[Optional[str], Optional[str]]:
-    order_id = None
-    client_order_id = None
+def _install_compat_shims(client: HttpPrivateSign):
+    """
+    DO NOT change business logic.
+    Only add alias methods for SDK version differences.
+    """
+    # get_account_v3 <-> accountV3
+    if not hasattr(client, "get_account_v3") and hasattr(client, "accountV3"):
+        client.get_account_v3 = getattr(client, "accountV3")  # type: ignore
+    if not hasattr(client, "accountV3") and hasattr(client, "get_account_v3"):
+        client.accountV3 = getattr(client, "get_account_v3")  # type: ignore
 
-    def _pick(d: dict, *keys):
-        for k in keys:
-            v = d.get(k)
-            if v is not None:
-                return v
-        return None
+    # configs_v3 <-> configsV3
+    if not hasattr(client, "configs_v3") and hasattr(client, "configsV3"):
+        client.configs_v3 = getattr(client, "configsV3")  # type: ignore
+    if not hasattr(client, "configsV3") and hasattr(client, "configs_v3"):
+        client.configsV3 = getattr(client, "configs_v3")  # type: ignore
 
-    if isinstance(raw_order, dict):
-        order_id = _pick(raw_order, "orderId", "id")
-        client_order_id = _pick(raw_order, "clientOrderId", "clientId")
-
-        data = raw_order.get("data")
-        if isinstance(data, dict):
-            order_id = order_id or _pick(data, "orderId", "id")
-            client_order_id = client_order_id or _pick(data, "clientOrderId", "clientId")
-
-    return (str(order_id) if order_id else None, str(client_order_id) if client_order_id else None)
+    # create_order_v3 <-> createOrderV3
+    if not hasattr(client, "create_order_v3") and hasattr(client, "createOrderV3"):
+        client.create_order_v3 = getattr(client, "createOrderV3")  # type: ignore
+    if not hasattr(client, "createOrderV3") and hasattr(client, "create_order_v3"):
+        client.createOrderV3 = getattr(client, "create_order_v3")  # type: ignore
 
 
 def get_client() -> HttpPrivateSign:
-    """
-    NOTE:
-    - APEX_L2KEY_SEEDS is allowed to be empty ("") to match your old working setup.
-    - We do NOT force get_account_v3 at startup to avoid boot-time failures.
-    """
     global _CLIENT
     if _CLIENT is not None:
         return _CLIENT
@@ -136,13 +133,8 @@ def get_client() -> HttpPrivateSign:
     base_url, network_id = _get_base_and_network()
     api_creds = _get_api_credentials()
 
-    zk_seeds = os.getenv("APEX_ZK_SEEDS", "")
-    zk_l2 = os.getenv("APEX_L2KEY_SEEDS") or ""  # allowed empty
-
-    if not zk_seeds:
-        # You previously said L2 can be empty; seeds still commonly required for signed order flow.
-        # We make it explicit and actionable:
-        raise RuntimeError("Missing env APEX_ZK_SEEDS (Omni Key Seed). Set it in DO env vars.")
+    zk_seeds = os.environ["APEX_ZK_SEEDS"]
+    zk_l2 = os.getenv("APEX_L2KEY_SEEDS") or ""
 
     client = HttpPrivateSign(
         base_url,
@@ -152,11 +144,20 @@ def get_client() -> HttpPrivateSign:
         api_key_credentials=api_creds,
     )
 
+    _install_compat_shims(client)
+
     try:
-        _safe_call(client.configs_v3)
-        print("[apex_client] configs_v3 ok")
+        cfg = _safe_call(client.configs_v3)
+        print("[apex_client] configs_v3 ok:", cfg)
     except Exception as e:
         print("[apex_client] WARNING configs_v3 error:", e)
+
+    # 保留你原先的启动查仓行为（不改逻辑）
+    try:
+        acc = _safe_call(client.get_account_v3)
+        print("[apex_client] get_account_v3 ok:", acc)
+    except Exception as e:
+        print("[apex_client] WARNING get_account_v3 error:", e)
 
     _CLIENT = client
     return client
@@ -164,14 +165,10 @@ def get_client() -> HttpPrivateSign:
 
 def get_account():
     client = get_client()
-    return client.get_account_v3()
+    return _safe_call(client.get_account_v3)
 
 
 def get_market_price(symbol: str, side: str, size: str) -> str:
-    """
-    For MARKET order placement on ApeX Omni: price field required.
-    We use worstPrice as executable conservative reference.
-    """
     base_url, network_id = _get_base_and_network()
     api_creds = _get_api_credentials()
 
@@ -200,32 +197,187 @@ def get_market_price(symbol: str, side: str, size: str) -> str:
             price = res["data"]["worstPrice"]
 
     if price is None:
-        raise RuntimeError(f"[apex_client] get_worst_price_v3 unexpected: {res}")
+        raise RuntimeError(f"[apex_client] get_worst_price_v3 返回异常: {res}")
 
-    return str(price)
+    price_str = str(price)
+    print(f"[apex_client] worst price for {symbol} {side} size={size_str}: {price_str}")
+    return price_str
 
 
-def create_market_order_simple(
+def _extract_order_ids(raw_order: Any) -> Tuple[Optional[str], Optional[str]]:
+    """
+    尽量从 Apex 返回中拿 orderId / clientOrderId
+    """
+    order_id = None
+    client_order_id = None
+
+    def _pick(d: dict, *keys):
+        for k in keys:
+            v = d.get(k)
+            if v is not None:
+                return v
+        return None
+
+    if isinstance(raw_order, dict):
+        order_id = _pick(raw_order, "orderId", "id")
+        client_order_id = _pick(raw_order, "clientOrderId", "clientId")
+
+        data = raw_order.get("data")
+        if isinstance(data, dict):
+            order_id = order_id or _pick(data, "orderId", "id")
+            client_order_id = client_order_id or _pick(data, "clientOrderId", "clientId")
+
+    return (str(order_id) if order_id else None, str(client_order_id) if client_order_id else None)
+
+
+# ------------------------------------------------------------
+# ✅ 真实成交价格获取 (保持你原逻辑，不做你禁止的增强项)
+# ------------------------------------------------------------
+def get_fill_summary(
+    symbol: str,
+    order_id: Optional[str] = None,
+    client_order_id: Optional[str] = None,
+    max_wait_sec: float = 2.0,
+    poll_interval: float = 0.25,
+) -> Dict[str, Any]:
+    client = get_client()
+    start = time.time()
+
+    while True:
+        last_err = None
+
+        candidates = [
+            "get_order_v3",
+            "get_order_detail_v3",
+            "get_order_by_id_v3",
+            "get_order_v3_by_id",
+        ]
+
+        order_obj = None
+        for name in candidates:
+            if hasattr(client, name) and order_id:
+                try:
+                    fn = getattr(client, name)
+                    # 保持你的原实现风格：尽量适配
+                    try:
+                        order_obj = fn(orderId=order_id)
+                    except Exception:
+                        order_obj = fn(order_id)
+                    break
+                except Exception as e:
+                    last_err = e
+
+        fills_obj = None
+        fill_candidates = [
+            "get_fills_v3",
+            "get_order_fills_v3",
+            "get_trade_fills_v3",
+        ]
+        for name in fill_candidates:
+            if hasattr(client, name):
+                try:
+                    fn = getattr(client, name)
+                    if order_id:
+                        try:
+                            fills_obj = fn(orderId=order_id)
+                        except Exception:
+                            fills_obj = fn(order_id)
+                    elif client_order_id:
+                        try:
+                            fills_obj = fn(clientId=client_order_id)
+                        except Exception:
+                            fills_obj = fn(client_order_id)
+                    else:
+                        continue
+                    break
+                except Exception as e:
+                    last_err = e
+
+        def _as_list(x):
+            if x is None:
+                return []
+            if isinstance(x, list):
+                return x
+            if isinstance(x, dict):
+                data = x.get("data")
+                if isinstance(data, list):
+                    return data
+                if isinstance(data, dict) and "fills" in data and isinstance(data["fills"], list):
+                    return data["fills"]
+            return []
+
+        fills_list = _as_list(fills_obj)
+
+        total_qty = Decimal("0")
+        total_notional = Decimal("0")
+
+        for f in fills_list:
+            if not isinstance(f, dict):
+                continue
+            q = f.get("size") or f.get("qty") or f.get("filledSize") or f.get("fillSize")
+            p = f.get("price") or f.get("fillPrice")
+            if q is None or p is None:
+                continue
+            dq = Decimal(str(q))
+            dp = Decimal(str(p))
+            if dq <= 0 or dp <= 0:
+                continue
+            total_qty += dq
+            total_notional += dq * dp
+
+        if total_qty > 0:
+            avg = (total_notional / total_qty)
+            return {
+                "symbol": symbol,
+                "order_id": order_id,
+                "client_order_id": client_order_id,
+                "filled_qty": total_qty,
+                "avg_fill_price": avg,
+                "raw_order": order_obj,
+                "raw_fills": fills_obj,
+            }
+
+        if isinstance(order_obj, dict):
+            data = order_obj.get("data") if isinstance(order_obj.get("data"), dict) else order_obj
+            if isinstance(data, dict):
+                fq = data.get("filledSize") or data.get("cumFilledSize") or data.get("sizeFilled")
+                ap = data.get("avgPrice") or data.get("averagePrice") or data.get("fillAvgPrice")
+                try:
+                    if fq and ap:
+                        dq = Decimal(str(fq))
+                        dp = Decimal(str(ap))
+                        if dq > 0 and dp > 0:
+                            return {
+                                "symbol": symbol,
+                                "order_id": order_id,
+                                "client_order_id": client_order_id,
+                                "filled_qty": dq,
+                                "avg_fill_price": dp,
+                                "raw_order": order_obj,
+                                "raw_fills": fills_obj,
+                            }
+                except Exception as e:
+                    last_err = e
+
+        if time.time() - start >= max_wait_sec:
+            raise RuntimeError(f"fill summary unavailable, last_err={last_err!r}")
+
+        time.sleep(poll_interval)
+
+
+def create_market_order(
     symbol: str,
     side: str,
     size: NumberLike | None = None,
     size_usdt: NumberLike | None = None,
     reduce_only: bool = False,
-    client_tag: Optional[str] = None,
+    client_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Simple MARKET order:
-    - Uses worstPrice ONLY for required order 'price' field and qty estimation.
-    - Does NOT poll fills / order detail.
-    - Returns quickly with order ids + reference prices.
-    """
     client = get_client()
     side = side.upper()
 
     rules = _get_symbol_rules(symbol)
     decimals = rules["qty_decimals"]
-
-    used_budget_est = None
 
     if size_usdt is not None:
         budget = Decimal(str(size_usdt))
@@ -233,62 +385,79 @@ def create_market_order_simple(
             raise ValueError("size_usdt must be > 0")
 
         min_qty = rules["min_qty"]
-
-        # estimate qty by worstPrice(min_qty)
         ref_price_decimal = Decimal(get_market_price(symbol, side, str(min_qty)))
         theoretical_qty = budget / ref_price_decimal
         snapped_qty = _snap_quantity(symbol, theoretical_qty)
 
-        price_for_order = get_market_price(symbol, side, str(snapped_qty))
-        price_decimal = Decimal(price_for_order)
+        price_str = get_market_price(symbol, side, str(snapped_qty))
+        price_decimal = Decimal(price_str)
 
         size_str = format(snapped_qty, f".{decimals}f")
-        used_budget_est = (snapped_qty * price_decimal).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+        used_budget = (snapped_qty * price_decimal).quantize(
+            Decimal("0.01"), rounding=ROUND_DOWN
+        )
+
+        print(
+            f"[apex_client] budget={budget} USDT -> qty={size_str}, "
+            f"used≈{used_budget} USDT (price {price_str})"
+        )
     else:
         if size is None:
             raise ValueError("size or size_usdt must be provided")
         size_str = str(size)
-        price_for_order = get_market_price(symbol, side, size_str)
+        price_str = get_market_price(symbol, side, size_str)
+        price_decimal = Decimal(price_str)
+        used_budget = (price_decimal * Decimal(size_str)).quantize(
+            Decimal("0.01"), rounding=ROUND_DOWN
+        )
 
     ts = int(time.time())
     apex_client_id = _random_client_id()
-    if client_tag:
-        # optional tag for your own logs; not guaranteed to become clientOrderId
-        print(f"[apex_client] client_tag={client_tag} apex_clientId={apex_client_id}")
+
+    if client_id:
+        print(f"[apex_client] tv_client_id={client_id} -> apex_clientId={apex_client_id}")
+    else:
+        print(f"[apex_client] apex_clientId={apex_client_id} (no tv_client_id)")
 
     params = {
         "symbol": symbol,
         "side": side,
         "type": "MARKET",
         "size": size_str,
-        "price": str(price_for_order),
+        "price": price_str,
         "timestampSeconds": ts,
         "reduceOnly": reduce_only,
         "clientId": apex_client_id,
     }
 
-    raw_order = client.create_order_v3(**params)
+    print("[apex_client] create_market_order params:", params)
+
+    raw_order = _safe_call(client.create_order_v3, **params)
+    print("[apex_client] order response:", raw_order)
+
+    data = raw_order["data"] if isinstance(raw_order, dict) and "data" in raw_order else raw_order
     order_id, client_order_id = _extract_order_ids(raw_order)
 
     return {
+        "data": data,
         "raw_order": raw_order,
         "order_id": order_id,
         "client_order_id": client_order_id,
-        "apex_client_id": apex_client_id,
-        "placed": {
+        "computed": {
             "symbol": symbol,
             "side": side,
             "size": size_str,
-            "price_for_order": str(price_for_order),  # reference only
+            "price": price_str,
+            "used_budget": str(used_budget),
             "reduce_only": reduce_only,
-            "used_budget_est": str(used_budget_est) if used_budget_est is not None else None,
         },
     }
 
 
-# ---------------------------
-# Remote position query
-# ---------------------------
+# ------------------------------------------------------------
+# ✅ 远程查仓兜底（保持你原逻辑）
+# ------------------------------------------------------------
 def _norm_symbol(s: str) -> str:
     return str(s or "").upper().replace("-", "").replace("_", "").strip()
 
@@ -305,28 +474,21 @@ def get_open_position_for_symbol(symbol: str) -> Optional[Dict[str, Any]]:
         data = acc if isinstance(acc, dict) else {}
 
     positions = (
-        data.get("positions")
-        or data.get("openPositions")
-        or data.get("position")
-        or data.get("positionV3")
-        or []
+        data.get("positions") or data.get("openPositions") or data.get("position") or data.get("positionV3") or []
     )
-
     if not isinstance(positions, list):
         return None
 
     target = _norm_symbol(symbol)
-
     for p in positions:
         if not isinstance(p, dict):
             continue
-
         psym = _norm_symbol(p.get("symbol", ""))
         if psym != target:
             continue
 
         size = p.get("size")
-        side = str(p.get("side", "")).upper()  # LONG/SHORT
+        side = str(p.get("side", "")).upper()
         entry = p.get("entryPrice")
 
         try:
@@ -351,7 +513,6 @@ def get_open_position_for_symbol(symbol: str) -> Optional[Dict[str, Any]]:
             "entryPrice": entry_dec,
             "raw": p,
         }
-
     return None
 
 
