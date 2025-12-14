@@ -96,10 +96,23 @@ def get_signal_id(payload: Dict[str, Any]) -> str:
 # ----------------------------
 # Auth
 # ----------------------------
-def _auth_ok() -> bool:
+def _auth_ok(payload: Optional[Dict[str, Any]] = None) -> bool:
+    """
+    Accept secret from:
+    - Header: X-WEBHOOK-SECRET
+    - Query : ?secret=...
+    - Body  : {"secret": "..."}   ✅ added
+    """
     if not WEBHOOK_SECRET:
         return True
-    got = request.headers.get("X-WEBHOOK-SECRET") or request.args.get("secret") or ""
+
+    payload = payload or {}
+    got = (
+        request.headers.get("X-WEBHOOK-SECRET")
+        or request.args.get("secret")
+        or payload.get("secret")
+        or ""
+    )
     return str(got) == str(WEBHOOK_SECRET)
 
 
@@ -297,10 +310,23 @@ def health():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    if not _auth_ok():
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    # ✅ Robust payload parse:
+    # 1) force JSON parse (even if content-type is not application/json)
+    # 2) fallback to raw body json.loads
+    payload = request.get_json(force=True, silent=True)
+    if not isinstance(payload, dict):
+        payload = {}
 
-    payload = request.get_json(silent=True) or {}
+    if not payload:
+        raw = (request.get_data(as_text=True) or "").strip()
+        if raw:
+            try:
+                payload = json.loads(raw)
+            except Exception:
+                payload = {}
+
+    if not _auth_ok(payload):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
 
     action = str(payload.get("action") or "").lower().strip()
     if action not in ("entry", "exit"):
