@@ -1,6 +1,7 @@
 apexomni>=3.0.8
 flask>=3.0.0
 gunicorn>=21.2.0
+supervisor
 
 requests
 python-dateutil
