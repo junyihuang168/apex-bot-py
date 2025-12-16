@@ -9,11 +9,14 @@ from flask import Flask, request, jsonify, Response
 from apex_client import (
     create_market_order,
     get_market_price,
-    get_fill_summary,              # ✅ 真实成交回写（保持你原逻辑）
-    get_open_position_for_symbol,  # ✅ 远程查仓兜底（按你规则严格限制触发）
-    map_position_side_to_exit_order_side,
+    get_fill_summary,
+    get_open_position_for_symbol,
     _get_symbol_rules,
     _snap_quantity,
+    start_private_ws,
+    pop_fill_event,
+    create_trigger_order,
+    cancel_order,
 )
 
 from pnl_store import (
@@ -23,35 +26,55 @@ from pnl_store import (
     list_bots_with_activity,
     get_bot_summary,
     get_bot_open_positions,
-    get_lock_level_pct,
-    set_lock_level_pct,
     clear_lock_level_pct,
-    # ✅ 新增：幂等去重
     is_signal_processed,
     mark_signal_processed,
+    # ✅ protective orders
+    set_protective_orders,
+    get_protective_orders,
+    clear_protective_orders,
+    find_protective_owner_by_order_id,
 )
 
 app = Flask(__name__)
 
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
-
-# Dashboard token（可选）
 DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "")
 
-# 退出互斥窗口（秒）：防止 webhook exit 与 risk exit 同时触发重复平仓
+# 退出互斥窗口（秒）：防止重复平仓
 EXIT_COOLDOWN_SEC = float(os.getenv("EXIT_COOLDOWN_SEC", "2.0"))
 
 # 远程兜底白名单：只有本地无 lots 且 symbol 在白名单，才允许 remote fallback
-# 例：REMOTE_FALLBACK_SYMBOLS="ZEC-USDT,BTC-USDT"
 REMOTE_FALLBACK_SYMBOLS = {
     s.strip().upper() for s in os.getenv("REMOTE_FALLBACK_SYMBOLS", "").split(",") if s.strip()
 }
 
-# 风控轮询间隔
-RISK_POLL_INTERVAL = float(os.getenv("RISK_POLL_INTERVAL", "2.0"))
+# ✅ 固定止损/止盈（百分比）
+FIXED_SL_PCT = Decimal(os.getenv("FIXED_SL_PCT", "0.5"))  # -0.5%
+FIXED_TP_PCT = Decimal(os.getenv("FIXED_TP_PCT", "1.0"))  # +1.0%
 
-# ✅ 基础止损默认 0.5%
-BASE_SL_PCT = Decimal(os.getenv("BASE_SL_PCT", "0.5"))
+# ✅ 保护单模式：MARKET（默认稳） or LIMIT（你若坚持“限价止损/止盈”）
+PROTECTIVE_ORDER_MODE = str(os.getenv("PROTECTIVE_ORDER_MODE", "MARKET")).upper().strip()
+# LIMIT 模式下：给限价一个“更差一点”的价格，提升成交概率
+PROTECTIVE_SLIPPAGE_PCT = Decimal(os.getenv("PROTECTIVE_SLIPPAGE_PCT", "0.15"))  # 0.15%
+
+# ✅ TP/SL 订单有效期（秒时间戳），默认 30 天
+PROTECTIVE_EXPIRE_SEC = int(os.getenv("PROTECTIVE_EXPIRE_SEC", str(30 * 24 * 3600)))
+
+# 本地 cache（仅辅助）
+BOT_POSITIONS: Dict[Tuple[str, str], dict] = {}
+
+_MONITOR_THREAD_STARTED = False
+_MONITOR_LOCK = threading.Lock()
+
+# ✅ 退出互斥：bot+symbol 粒度 cooldown
+_EXIT_LOCK = threading.Lock()
+_LAST_EXIT_TS: Dict[Tuple[str, str], float] = {}
+
+# ✅ WS fills 处理线程
+_FILLS_THREAD_STARTED = False
+_FILLS_LOCK = threading.Lock()
+
 
 def _require_token() -> bool:
     if not DASHBOARD_TOKEN:
@@ -65,55 +88,53 @@ def _parse_bot_list(env_val: str) -> Set[str]:
 
 
 def _canon_bot_id(bot_id: str) -> str:
-    """
-    Canonicalize bot id:
-    - Accept: "BOT_1", "bot1", "bot_1", "BOT 1"
-    - Output: "BOT_1"
-    """
     s = str(bot_id or "").strip().upper().replace(" ", "").replace("-", "_")
     if not s:
         return "BOT_0"
-
     if s.startswith("BOT_"):
         core = s[4:]
     elif s.startswith("BOT"):
         core = s[3:]
     else:
-        # If user passes pure number "1"
         core = s
-
     core = core.replace("_", "")
     if core.isdigit():
         return f"BOT_{int(core)}"
-    # fallback
     return s
 
 
-# BOT 1-10：做多风控
-LONG_LADDER_BOTS = _parse_bot_list(
-    os.getenv("LONG_LADDER_BOTS", ",".join([f"BOT_{i}" for i in range(1, 11)]))
-)
+def _bot_num(bot_id: str) -> int:
+    b = _canon_bot_id(bot_id)
+    try:
+        return int(b.split("_", 1)[1])
+    except Exception:
+        return 0
 
-# BOT 11-20：做空风控
-SHORT_LADDER_BOTS = _parse_bot_list(
-    os.getenv("SHORT_LADDER_BOTS", ",".join([f"BOT_{i}" for i in range(11, 21)]))
-)
 
-# 本地 cache（仅辅助）
-BOT_POSITIONS: Dict[Tuple[str, str], dict] = {}
+# ----------------------------
+# ✅ 新 BOT 分组（按你要求）
+# ----------------------------
+LONG_TPSL_BOTS = _parse_bot_list(os.getenv("LONG_TPSL_BOTS", ",".join([f"BOT_{i}" for i in range(1, 11)])))
+SHORT_TPSL_BOTS = _parse_bot_list(os.getenv("SHORT_TPSL_BOTS", ",".join([f"BOT_{i}" for i in range(11, 21)])))
+LONG_PNL_ONLY_BOTS = _parse_bot_list(os.getenv("LONG_PNL_ONLY_BOTS", ",".join([f"BOT_{i}" for i in range(21, 31)])))
+SHORT_PNL_ONLY_BOTS = _parse_bot_list(os.getenv("SHORT_PNL_ONLY_BOTS", ",".join([f"BOT_{i}" for i in range(31, 41)])))
 
-_MONITOR_THREAD_STARTED = False
-_MONITOR_LOCK = threading.Lock()
 
-# ✅ 退出互斥：bot+symbol 粒度 cooldown
-_EXIT_LOCK = threading.Lock()
-_LAST_EXIT_TS: Dict[Tuple[str, str], float] = {}
+def _bot_expected_entry_side(bot_id: str) -> Optional[str]:
+    b = _canon_bot_id(bot_id)
+    if b in LONG_TPSL_BOTS or b in LONG_PNL_ONLY_BOTS:
+        return "BUY"
+    if b in SHORT_TPSL_BOTS or b in SHORT_PNL_ONLY_BOTS:
+        return "SELL"
+    return None
+
+
+def _bot_has_exchange_brackets(bot_id: str) -> bool:
+    b = _canon_bot_id(bot_id)
+    return (b in LONG_TPSL_BOTS) or (b in SHORT_TPSL_BOTS)
 
 
 def _exit_guard_allow(bot_id: str, symbol: str) -> bool:
-    """
-    Return True if allowed to execute an exit now; False if within cooldown window.
-    """
     key = (_canon_bot_id(bot_id), str(symbol or "").upper().strip())
     now = time.time()
     with _EXIT_LOCK:
@@ -175,17 +196,11 @@ def _order_status_and_reason(order: dict):
 # 幂等 Signal ID（webhook）
 # ----------------------------
 def _get_signal_id(body: dict, mode: str, bot_id: str, symbol: str) -> str:
-    """
-    Prefer user-provided ids:
-    - signal_id / alert_id / id / tv_id
-    Otherwise generate a stable-ish id by timestamp + core fields.
-    """
     for k in ("signal_id", "alert_id", "id", "tv_id", "client_id"):
         v = body.get(k)
         if v:
             return f"{mode}:{bot_id}:{symbol}:{str(v)}"
 
-    # fallback to time bucket (seconds) to dedup typical retries
     ts = body.get("ts") or body.get("time") or int(time.time())
     try:
         ts_int = int(float(str(ts)))
@@ -199,242 +214,286 @@ def _get_signal_id(body: dict, mode: str, bot_id: str, symbol: str) -> str:
 
 
 # ----------------------------
-# 你的阶梯锁盈规则 (Local Ladder Logic - Original)
+# ✅ 交易所 TP/SL（固定百分比）下单
 # ----------------------------
-TRIGGER_1 = Decimal("0.18")
-LOCK_1 = Decimal("0.10")
-TRIGGER_2 = Decimal("0.38")
-LOCK_2 = Decimal("0.20")
-STEP = Decimal("0.20")
-
-
-def _desired_lock_level_pct(pnl_pct: Decimal) -> Decimal:
-    if pnl_pct < TRIGGER_1:
-        return Decimal("0")
-    if pnl_pct < TRIGGER_2:
-        return LOCK_1
-    n = (pnl_pct - TRIGGER_2) // STEP
-    return LOCK_2 + STEP * n
-
-
-def _bot_allows_direction(bot_id: str, direction: str) -> bool:
-    bot_id = _canon_bot_id(bot_id)
-    d = direction.upper()
-    if bot_id in LONG_LADDER_BOTS and d == "LONG":
-        return True
-    if bot_id in SHORT_LADDER_BOTS and d == "SHORT":
-        return True
-    return False
-
-
-def _get_current_price(symbol: str, direction: str) -> Optional[Decimal]:
-    try:
-        rules = _get_symbol_rules(symbol)
-        min_qty = rules["min_qty"]
-        exit_side = "SELL" if direction.upper() == "LONG" else "BUY"
-        px_str = get_market_price(symbol, exit_side, str(min_qty))
-        return Decimal(str(px_str))
-    except Exception as e:
-        print(f"[RISK] get_market_price error symbol={symbol} direction={direction}: {e}")
-        return None
-
-
-def _calc_pnl_pct(direction: str, entry_price: Decimal, current_price: Decimal) -> Decimal:
+def _compute_fixed_bracket_prices(direction: str, entry_price: Decimal) -> Tuple[Decimal, Decimal]:
+    """
+    return (sl_trigger, tp_trigger)
+    """
     if entry_price <= 0:
-        return Decimal("0")
+        return Decimal("0"), Decimal("0")
+
+    sl_pct = FIXED_SL_PCT / Decimal("100")
+    tp_pct = FIXED_TP_PCT / Decimal("100")
+
     if direction.upper() == "LONG":
-        return (current_price - entry_price) * Decimal("100") / entry_price
+        sl = entry_price * (Decimal("1") - sl_pct)
+        tp = entry_price * (Decimal("1") + tp_pct)
     else:
-        return (entry_price - current_price) * Decimal("100") / entry_price
+        sl = entry_price * (Decimal("1") + sl_pct)
+        tp = entry_price * (Decimal("1") - tp_pct)
+
+    return sl, tp
 
 
-def _base_sl_hit(direction: str, entry_price: Decimal, current_price: Decimal) -> bool:
-    pct = BASE_SL_PCT / Decimal("100")
-    if direction.upper() == "LONG":
-        stop_price = entry_price * (Decimal("1") - pct)
-        return current_price <= stop_price
-    else:
-        stop_price = entry_price * (Decimal("1") + pct)
-        return current_price >= stop_price
-
-
-def _lock_hit(direction: str, entry_price: Decimal, current_price: Decimal, lock_level_pct: Decimal) -> bool:
-    if lock_level_pct <= 0:
-        return False
-    pct = lock_level_pct / Decimal("100")
-    if direction.upper() == "LONG":
-        lock_price = entry_price * (Decimal("1") + pct)
-        return current_price <= lock_price
-    else:
-        lock_price = entry_price * (Decimal("1") - pct)
-        return current_price >= lock_price
-
-
-def _execute_virtual_exit(bot_id: str, symbol: str, direction: str, qty: Decimal, reason: str):
+def _apply_limit_slippage(direction: str, kind: str, trigger: Decimal) -> Decimal:
     """
-    Risk-thread exit. Uses lots as truth source (same as your original),
-    adds:
-    - exit cooldown guard (avoid duplicates)
-    - processed_signals idempotency record
+    LIMIT 模式：给“更差一点”的限价，提升成交概率。
+    kind: "SL" or "TP"
     """
-    bot_id = _canon_bot_id(bot_id)
-    symbol_u = str(symbol or "").upper().strip()
-    direction_u = direction.upper()
+    slip = (PROTECTIVE_SLIPPAGE_PCT / Decimal("100"))
+    d = direction.upper()
+    k = kind.upper()
 
-    if qty <= 0:
+    if d == "LONG":
+        # SELL orders: use <= trigger
+        return trigger * (Decimal("1") - slip)
+    else:
+        # SHORT closing BUY orders: use >= trigger
+        return trigger * (Decimal("1") + slip)
+
+
+def _cancel_existing_brackets(bot_id: str, symbol: str, direction: str):
+    po = get_protective_orders(bot_id, symbol, direction)
+    if not po:
         return
-
-    # cooldown guard
-    if not _exit_guard_allow(bot_id, symbol_u):
-        print(f"[RISK] EXIT SKIP (cooldown) bot={bot_id} symbol={symbol_u} reason={reason}")
-        return
-
-    # idempotency key
-    sig_id = f"risk_exit:{bot_id}:{symbol_u}:{direction_u}:{reason}:{int(time.time())}"
-    if is_signal_processed(bot_id, sig_id):
-        print(f"[RISK] EXIT SKIP (dedup) bot={bot_id} symbol={symbol_u} reason={reason} sig={sig_id}")
-        return
-    mark_signal_processed(bot_id, sig_id, kind="risk_exit")
-
-    entry_side = "BUY" if direction_u == "LONG" else "SELL"
-    exit_side = "SELL" if direction_u == "LONG" else "BUY"
-
-    exit_price = _get_current_price(symbol_u, direction_u)
-    if exit_price is None:
-        print(f"[RISK] skip exit due to no price bot={bot_id} symbol={symbol_u}")
-        return
-
-    print(
-        f"[RISK] EXIT bot={bot_id} symbol={symbol_u} direction={direction_u} "
-        f"qty={qty} reason={reason} ref_exit={exit_price}"
-    )
-
-    try:
-        order = create_market_order(
-            symbol=symbol_u,
-            side=exit_side,
-            size=str(qty),
-            reduce_only=True,
-            client_id=None,
-        )
-        status, cancel_reason = _order_status_and_reason(order)
-        print(f"[RISK] exit order status={status} cancelReason={cancel_reason!r}")
-
-        if status in ("CANCELED", "REJECTED"):
-            return
-
-        # FIFO 记账，仅扣该 bot 自己的 lots
+    sl_oid = po.get("sl_order_id")
+    tp_oid = po.get("tp_order_id")
+    if sl_oid:
         try:
-            record_exit_fifo(
-                bot_id=bot_id,
-                symbol=symbol_u,
-                entry_side=entry_side,
-                exit_qty=qty,
-                exit_price=exit_price,
-                reason=reason,
-            )
-        except Exception as e:
-            print("[PNL] record_exit_fifo error (risk):", e)
-
-        # 清理锁盈状态
-        try:
-            clear_lock_level_pct(bot_id, symbol_u, direction_u)
+            cancel_order(str(sl_oid))
         except Exception:
             pass
-
-        # 本地 cache 清理（非真相源）
-        key = (bot_id, symbol_u)
-        pos = BOT_POSITIONS.get(key)
-        if pos:
-            pos_qty = Decimal(str(pos.get("qty") or "0"))
-            new_qty = pos_qty - qty
-            if new_qty < 0:
-                new_qty = Decimal("0")
-            pos["qty"] = new_qty
-            if new_qty == 0:
-                pos["entry_price"] = None
-
-    except Exception as e:
-        print(f"[RISK] create_market_order error bot={bot_id} symbol={symbol_u}: {e}")
-
-
-def _risk_loop():
-    print("[RISK] ladder/baseSL thread started (using The Polling Loop)")
-    while True:
+    if tp_oid:
         try:
-            bots = sorted(list(LONG_LADDER_BOTS | SHORT_LADDER_BOTS))
+            cancel_order(str(tp_oid))
+        except Exception:
+            pass
+    try:
+        clear_protective_orders(bot_id, symbol, direction)
+    except Exception:
+        pass
 
-            for bot_id in bots:
-                bot_id = _canon_bot_id(bot_id)
-                opens = get_bot_open_positions(bot_id)
 
-                for (symbol, direction), v in opens.items():
-                    symbol_u = str(symbol or "").upper().strip()
-                    direction_u = direction.upper()
+def _place_fixed_brackets(bot_id: str, symbol: str, direction: str, qty: Decimal, entry_price: Decimal):
+    """
+    BOT_1-20 才会走这里：
+    - 下 SL & TP（reduceOnly=True）
+    - 记录到 DB protective_orders，供 WS fills 自动记账 + OCO
+    """
+    bot_id = _canon_bot_id(bot_id)
+    symbol = str(symbol).upper().strip()
+    direction = direction.upper()
 
-                    if not _bot_allows_direction(bot_id, direction_u):
-                        continue
+    if qty <= 0 or entry_price <= 0:
+        return
 
-                    qty = v["qty"]
-                    entry_price = v["weighted_entry"]
+    # 先取消旧的（避免重复挂单）
+    _cancel_existing_brackets(bot_id, symbol, direction)
 
-                    if qty <= 0 or entry_price <= 0:
-                        continue
+    sl_trigger, tp_trigger = _compute_fixed_bracket_prices(direction, entry_price)
+    if sl_trigger <= 0 or tp_trigger <= 0:
+        return
 
-                    current_price = _get_current_price(symbol_u, direction_u)
-                    if current_price is None:
-                        continue
+    # expiration：当前时间 + N 秒
+    expiration = int(time.time()) + int(PROTECTIVE_EXPIRE_SEC)
 
-                    pnl_pct = _calc_pnl_pct(direction_u, entry_price, current_price)
+    if direction == "LONG":
+        exit_side = "SELL"
+    else:
+        exit_side = "BUY"
 
-                    # 1) 基础止损优先（默认 0.5%）
-                    if _base_sl_hit(direction_u, entry_price, current_price):
-                        _execute_virtual_exit(
-                            bot_id=bot_id,
-                            symbol=symbol_u,
-                            direction=direction_u,
-                            qty=qty,
-                            reason="base_sl_exit",
-                        )
-                        continue
+    # 订单类型
+    if PROTECTIVE_ORDER_MODE == "LIMIT":
+        sl_type = "STOP_LIMIT"
+        tp_type = "TAKE_PROFIT_LIMIT"
+        sl_price = _apply_limit_slippage(direction, "SL", sl_trigger)
+        tp_price = _apply_limit_slippage(direction, "TP", tp_trigger)
+    else:
+        sl_type = "STOP_MARKET"
+        tp_type = "TAKE_PROFIT_MARKET"
+        # MARKET 模式下 price 给一个占位（worstPrice/trigger），由 apex_client 内部兜底
+        sl_price = None
+        tp_price = None
 
-                    # 2) 计算目标锁盈档位 (Local Ladder Logic)
-                    desired_lock = _desired_lock_level_pct(pnl_pct)
-                    current_lock = get_lock_level_pct(bot_id, symbol_u, direction_u)
+    # 给 clientId 做一个“数字-only”的可追踪串（不依赖 tv client_id）
+    bnum = _bot_num(bot_id)
+    ts = int(time.time())
+    sl_client = f"{bnum:03d}{ts}01"
+    tp_client = f"{bnum:03d}{ts}02"
 
-                    if desired_lock > current_lock:
-                        set_lock_level_pct(bot_id, symbol_u, direction_u, desired_lock)
-                        current_lock = desired_lock
-                        print(
-                            f"[RISK] LOCK UP bot={bot_id} symbol={symbol_u} direction={direction_u} "
-                            f"pnl={pnl_pct:.4f}% lock_level={current_lock}%"
-                        )
+    # 下单（reduceOnly=True）
+    sl_res = create_trigger_order(
+        symbol=symbol,
+        side=exit_side,
+        order_type=sl_type,
+        size=str(qty),
+        trigger_price=str(sl_trigger),
+        price=str(sl_price) if sl_price is not None else None,
+        reduce_only=True,
+        client_id=sl_client,
+        expiration_sec=expiration,
+    )
+    tp_res = create_trigger_order(
+        symbol=symbol,
+        side=exit_side,
+        order_type=tp_type,
+        size=str(qty),
+        trigger_price=str(tp_trigger),
+        price=str(tp_price) if tp_price is not None else None,
+        reduce_only=True,
+        client_id=tp_client,
+        expiration_sec=expiration,
+    )
 
-                    # 3) 锁盈触发
-                    if _lock_hit(direction_u, entry_price, current_price, current_lock):
-                        _execute_virtual_exit(
-                            bot_id=bot_id,
-                            symbol=symbol_u,
-                            direction=direction_u,
-                            qty=qty,
-                            reason="ladder_lock_exit",
-                        )
+    sl_oid = sl_res.get("order_id")
+    tp_oid = tp_res.get("order_id")
+
+    set_protective_orders(
+        bot_id=bot_id,
+        symbol=symbol,
+        direction=direction,
+        sl_order_id=str(sl_oid) if sl_oid else None,
+        tp_order_id=str(tp_oid) if tp_oid else None,
+        sl_client_id=sl_res.get("client_order_id") or sl_client,
+        tp_client_id=tp_res.get("client_order_id") or tp_client,
+        sl_price=sl_trigger,
+        tp_price=tp_trigger,
+        is_active=True,
+    )
+
+    print(
+        f"[BRACKET] set bot={bot_id} {direction} {symbol} qty={qty} entry={entry_price} "
+        f"SL({sl_type}) trigger={sl_trigger} oid={sl_oid} | TP({tp_type}) trigger={tp_trigger} oid={tp_oid}"
+    )
+
+
+# ----------------------------
+# ✅ WS fills -> 自动记账 + OCO
+# ----------------------------
+def _fills_loop():
+    print("[WS-FILLS] loop started")
+    while True:
+        evt = pop_fill_event(timeout=0.5)
+        if not evt:
+            continue
+
+        try:
+            fill_id = str(evt.get("id") or "")
+            order_id = str(evt.get("orderId") or "")
+            symbol = str(evt.get("symbol") or "").upper().strip()
+            side = str(evt.get("side") or "").upper().strip()  # BUY/SELL
+            px = evt.get("price")
+            sz = evt.get("size")
+
+            if not fill_id or not order_id or not symbol or px is None or sz is None:
+                continue
+
+            # 找到这个 fill 是否属于我们的 TP/SL 保护单
+            owner = find_protective_owner_by_order_id(order_id)
+            if not owner:
+                continue
+
+            bot_id = _canon_bot_id(owner["bot_id"])
+            direction = str(owner["direction"]).upper()
+            kind = str(owner.get("kind") or "").upper()  # SL / TP
+
+            # 幂等：同一 fill_id 只记一次账
+            sig_id = f"fill:{fill_id}"
+            if is_signal_processed(bot_id, sig_id):
+                continue
+            mark_signal_processed(bot_id, sig_id, kind=f"ws_{kind.lower()}_fill")
+
+            dq = Decimal(str(sz))
+            dp = Decimal(str(px))
+            if dq <= 0 or dp <= 0:
+                continue
+
+            entry_side = "BUY" if direction == "LONG" else "SELL"
+
+            # 记账：把这次成交当作“平仓成交”
+            record_exit_fifo(
+                bot_id=bot_id,
+                symbol=symbol,
+                entry_side=entry_side,
+                exit_qty=dq,
+                exit_price=dp,
+                reason=f"exchange_{kind.lower()}_fill",
+            )
+
+            # 如果仓位已经清空：OCO（取消另一边）+ 清理 protective_orders
+            opens = get_bot_open_positions(bot_id)
+            remaining = opens.get((symbol, direction), {}).get("qty", Decimal("0"))
+
+            po = get_protective_orders(bot_id, symbol, direction)
+            sl_oid = po.get("sl_order_id") if po else None
+            tp_oid = po.get("tp_order_id") if po else None
+
+            if remaining <= 0:
+                # cancel the other leg
+                other_oid = None
+                if kind == "SL":
+                    other_oid = tp_oid
+                elif kind == "TP":
+                    other_oid = sl_oid
+                if other_oid:
+                    try:
+                        cancel_order(str(other_oid))
+                    except Exception:
+                        pass
+
+                try:
+                    clear_protective_orders(bot_id, symbol, direction)
+                except Exception:
+                    pass
+                try:
+                    clear_lock_level_pct(bot_id, symbol, direction)
+                except Exception:
+                    pass
+
+                # 本地 cache 清理
+                key_local = (bot_id, symbol)
+                if key_local in BOT_POSITIONS:
+                    BOT_POSITIONS[key_local]["qty"] = Decimal("0")
+                    BOT_POSITIONS[key_local]["entry_price"] = None
+
+                print(f"[WS-FILLS] position closed by {kind}. bot={bot_id} {direction} {symbol} now flat. OCO done.")
+            else:
+                # 部分成交：保留 protective_orders（你也可以选择在这里“重挂剩余 qty 的 TP/SL”，先不做复杂化）
+                print(
+                    f"[WS-FILLS] partial {kind} fill bot={bot_id} {direction} {symbol} "
+                    f"fill_qty={dq} fill_px={dp} remaining={remaining}"
+                )
 
         except Exception as e:
-            print("[RISK] loop top-level error:", e)
+            print("[WS-FILLS] error:", e)
 
-        time.sleep(RISK_POLL_INTERVAL)
+
+def _ensure_ws_fills_thread():
+    global _FILLS_THREAD_STARTED
+    with _FILLS_LOCK:
+        if _FILLS_THREAD_STARTED:
+            return
+        t = threading.Thread(target=_fills_loop, daemon=True)
+        t.start()
+        _FILLS_THREAD_STARTED = True
+        print("[WS-FILLS] thread created")
 
 
 def _ensure_monitor_thread():
     global _MONITOR_THREAD_STARTED
     with _MONITOR_LOCK:
-        if not _MONITOR_THREAD_STARTED:
-            init_db()
-            t = threading.Thread(target=_risk_loop, daemon=True)
-            t.start()
-            _MONITOR_THREAD_STARTED = True
-            print("[RISK] thread created")
+        if _MONITOR_THREAD_STARTED:
+            return
+
+        init_db()
+
+        # ✅ WS：启动一次就好
+        start_private_ws()
+        _ensure_ws_fills_thread()
+
+        _MONITOR_THREAD_STARTED = True
+        print("[SYSTEM] monitor/ws threads ready")
 
 
 @app.route("/", methods=["GET"])
@@ -474,8 +533,14 @@ def api_pnl():
             if qty <= 0:
                 continue
 
-            px = _get_current_price(symbol, direction)
-            if px is None:
+            # mark price 用 worstPrice(min_qty) 近似（够用）
+            try:
+                rules = _get_symbol_rules(symbol)
+                min_qty = rules["min_qty"]
+                exit_side = "SELL" if direction.upper() == "LONG" else "BUY"
+                px_str = get_market_price(symbol, exit_side, str(min_qty))
+                px = Decimal(str(px_str))
+            except Exception:
                 continue
 
             if direction.upper() == "LONG":
@@ -497,7 +562,6 @@ def api_pnl():
         })
         out.append(base)
 
-    # 默认按总已实现排序
     def _rt(x):
         try:
             return Decimal(str(x.get("realized_total", "0")))
@@ -505,7 +569,6 @@ def api_pnl():
             return Decimal("0")
 
     out.sort(key=_rt, reverse=True)
-
     return jsonify({"ts": int(time.time()), "bots": out}), 200
 
 
@@ -560,7 +623,7 @@ def dashboard():
 <header>
   <div>
     <h1>Bot PnL Dashboard</h1>
-    <div class="muted">独立 lots 记账 · 真实成交价优先 · 基础止损默认 0.5% · 阶梯锁盈 · Exit cooldown 防重复</div>
+    <div class="muted">WS fills 自动记账 · BOT 分组方向固定 · TP/SL 挂交易所（BOT_1-20）· reduceOnly 平仓风控</div>
   </div>
   <div class="muted" id="lastUpdate">Loading...</div>
 </header>
@@ -582,9 +645,10 @@ def dashboard():
     <div class="card full">
       <div class="row">
         <div class="group">
-          <span class="pill">BOT 1-10: LONG 阶梯锁盈 + 基础SL(0.5%)</span>
-          <span class="pill">BOT 11-20: SHORT 阶梯锁盈 + 基础SL(0.5%)</span>
-          <span class="pill">REMOTE_FALLBACK_SYMBOLS: 仅本地无 lots 才允许远程兜底</span>
+          <span class="pill">BOT_1-10: LONG + Exchange TP/SL (-0.5% / +1%)</span>
+          <span class="pill">BOT_11-20: SHORT + Exchange TP/SL (-0.5% / +1%)</span>
+          <span class="pill">BOT_21-30: LONG PnL-only (no TP/SL)</span>
+          <span class="pill">BOT_31-40: SHORT PnL-only (no TP/SL)</span>
         </div>
         <div class="small">数据来自 /api/pnl</div>
       </div>
@@ -737,10 +801,9 @@ def tv_webhook():
         return "bad payload", 400
 
     # 2) secret check
-    if WEBHOOK_SECRET:
-        if body.get("secret") != WEBHOOK_SECRET:
-            print("[WEBHOOK] invalid secret")
-            return "forbidden", 403
+    if WEBHOOK_SECRET and body.get("secret") != WEBHOOK_SECRET:
+        print("[WEBHOOK] invalid secret")
+        return "forbidden", 403
 
     symbol = body.get("symbol")
     if not symbol:
@@ -748,9 +811,9 @@ def tv_webhook():
     symbol = str(symbol).upper().strip()
 
     bot_id = _canon_bot_id(body.get("bot_id", "BOT_1"))
-    side_raw = str(body.get("side", "")).upper()
-    signal_type_raw = str(body.get("signal_type", "")).lower()
-    action_raw = str(body.get("action", "")).lower()
+    side_raw = str(body.get("side", "")).upper().strip()
+    signal_type_raw = str(body.get("signal_type", "")).lower().strip()
+    action_raw = str(body.get("action", "")).lower().strip()
     tv_client_id = body.get("client_id")
 
     # 3) mode
@@ -779,6 +842,19 @@ def tv_webhook():
     # ENTRY
     # -------------------------
     if mode == "entry":
+        expected = _bot_expected_entry_side(bot_id)
+        if expected is not None:
+            if side_raw and side_raw != expected:
+                return jsonify({
+                    "status": "rejected_wrong_direction",
+                    "bot_id": bot_id,
+                    "symbol": symbol,
+                    "expected_side": expected,
+                    "got_side": side_raw,
+                    "signal_id": sig_id,
+                }), 200
+            side_raw = expected  # 强制固定方向
+
         if side_raw not in ("BUY", "SELL"):
             return "missing or invalid side", 400
 
@@ -828,7 +904,7 @@ def tv_webhook():
                 "signal_id": sig_id,
             }), 200
 
-        # ✅ 真实成交价优先 (保持你原逻辑)
+        # ✅ 真实成交价优先：WS/REST fill summary
         computed = (order or {}).get("computed") or {}
         fallback_price_str = computed.get("price")
 
@@ -868,7 +944,7 @@ def tv_webhook():
             "entry_price": entry_price_dec,
         }
 
-        # ✅ 独立 lots 记账
+        # ✅ lots 记账
         if entry_price_dec is not None and final_qty > 0:
             try:
                 record_entry(
@@ -881,6 +957,20 @@ def tv_webhook():
                 )
             except Exception as e:
                 print("[PNL] record_entry error:", e)
+
+        # ✅ BOT_1-20：挂交易所 TP/SL（reduceOnly=True）
+        if _bot_has_exchange_brackets(bot_id) and entry_price_dec is not None and final_qty > 0:
+            direction = "LONG" if side_raw == "BUY" else "SHORT"
+            try:
+                _place_fixed_brackets(
+                    bot_id=bot_id,
+                    symbol=symbol,
+                    direction=direction,
+                    qty=final_qty,
+                    entry_price=entry_price_dec,
+                )
+            except Exception as e:
+                print("[BRACKET] place error:", e)
 
         return jsonify({
             "status": "ok",
@@ -898,18 +988,14 @@ def tv_webhook():
         }), 200
 
     # -------------------------
-    # EXIT（策略出场）
-    # lots 为准，裁剪只平本 bot
-    # 远程兜底：仅本地无 lots 且 symbol 在 REMOTE_FALLBACK_SYMBOLS
+    # EXIT（策略出场 / TV 出场）
     # -------------------------
     if mode == "exit":
-        # exit cooldown guard
         if not _exit_guard_allow(bot_id, symbol):
             print(f"[EXIT] SKIP (cooldown) bot={bot_id} symbol={symbol} sig={sig_id}")
             return jsonify({"status": "cooldown_skip", "mode": "exit", "bot_id": bot_id, "symbol": symbol, "signal_id": sig_id}), 200
 
         opens = get_bot_open_positions(bot_id)
-
         long_key = (symbol, "LONG")
         short_key = (symbol, "SHORT")
 
@@ -945,11 +1031,15 @@ def tv_webhook():
                     qty_to_close = remote["size"]
                     print(f"[EXIT] remote fallback found: {direction_to_close} {qty_to_close} symbol={symbol}")
                 else:
-                    print(f"[EXIT] no position to close (local empty + remote none). bot={bot_id} symbol={symbol}")
                     return jsonify({"status": "no_position"}), 200
             else:
-                print(f"[EXIT] local lots empty; remote fallback DISABLED (not whitelisted). bot={bot_id} symbol={symbol} sig={sig_id}")
                 return jsonify({"status": "no_position"}), 200
+
+        # ✅ 先取消交易所挂的 TP/SL（避免手动 exit 后还有残留单）
+        try:
+            _cancel_existing_brackets(bot_id, symbol, direction_to_close)
+        except Exception:
+            pass
 
         entry_side = "BUY" if direction_to_close == "LONG" else "SELL"
         exit_side = "SELL" if direction_to_close == "LONG" else "BUY"
@@ -964,7 +1054,7 @@ def tv_webhook():
                 symbol=symbol,
                 side=exit_side,
                 size=str(qty_to_close),
-                reduce_only=True,
+                reduce_only=True,   # ✅ reduceOnly 风控
                 client_id=tv_client_id,
             )
         except Exception as e:
@@ -987,7 +1077,14 @@ def tv_webhook():
                 "signal_id": sig_id,
             }), 200
 
-        exit_price = _get_current_price(symbol, direction_to_close) or Decimal("0")
+        # exit_price 用 worstPrice(min_qty) 近似（记账够用）
+        try:
+            rules = _get_symbol_rules(symbol)
+            min_qty = rules["min_qty"]
+            px_str = get_market_price(symbol, exit_side, str(min_qty))
+            exit_price = Decimal(str(px_str))
+        except Exception:
+            exit_price = Decimal("0")
 
         try:
             record_exit_fifo(
@@ -995,7 +1092,7 @@ def tv_webhook():
                 symbol=symbol,
                 entry_side=entry_side,
                 exit_qty=qty_to_close,
-                exit_price=exit_price,
+                exit_price=exit_price if exit_price > 0 else Decimal("0.00000001"),
                 reason="strategy_exit",
             )
         except Exception as e:
