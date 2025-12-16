@@ -2,16 +2,21 @@ import os
 import time
 import threading
 from decimal import Decimal
-from typing import Dict, Tuple, Optional, Set, Any
+from typing import Dict, Tuple, Optional, Set
 
 from flask import Flask, request, jsonify, Response
 
 from apex_client import (
     create_market_order,
-    wait_fills_for_order,
-    place_fixed_tpsl_orders,
+    get_market_price,
+    get_fill_summary,
+    get_open_position_for_symbol,
+    _get_symbol_rules,
+    _snap_quantity,
+    start_private_ws,
+    pop_fill_event,
+    create_trigger_order,
     cancel_order,
-    set_on_fill_callback,
 )
 
 from pnl_store import (
@@ -21,15 +26,14 @@ from pnl_store import (
     list_bots_with_activity,
     get_bot_summary,
     get_bot_open_positions,
+    clear_lock_level_pct,
     is_signal_processed,
     mark_signal_processed,
-    # NEW mappings
-    record_order_map,
-    find_order_map,
-    record_bracket,
-    find_bracket_by_order,
-    is_fill_seen,
-    mark_fill_seen,
+    # ✅ protective orders
+    set_protective_orders,
+    get_protective_orders,
+    clear_protective_orders,
+    find_protective_owner_by_order_id,
 )
 
 app = Flask(__name__)
@@ -37,16 +41,38 @@ app = Flask(__name__)
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "")
 
-WS_FILL_WAIT_SEC = float(os.getenv("WS_FILL_WAIT_SEC", "5"))
+# 退出互斥窗口（秒）：防止重复平仓
+EXIT_COOLDOWN_SEC = float(os.getenv("EXIT_COOLDOWN_SEC", "2.0"))
 
-TPSL_SL_PCT = Decimal(os.getenv("TPSL_SL_PCT", "0.5"))
-TPSL_TP_PCT = Decimal(os.getenv("TPSL_TP_PCT", "1.0"))
+# 远程兜底白名单：只有本地无 lots 且 symbol 在白名单，才允许 remote fallback
+REMOTE_FALLBACK_SYMBOLS = {
+    s.strip().upper() for s in os.getenv("REMOTE_FALLBACK_SYMBOLS", "").split(",") if s.strip()
+}
+
+# ✅ 固定止损/止盈（百分比）
+FIXED_SL_PCT = Decimal(os.getenv("FIXED_SL_PCT", "0.5"))  # -0.5%
+FIXED_TP_PCT = Decimal(os.getenv("FIXED_TP_PCT", "1.0"))  # +1.0%
+
+# ✅ 保护单模式：MARKET（默认稳） or LIMIT
+PROTECTIVE_ORDER_MODE = str(os.getenv("PROTECTIVE_ORDER_MODE", "MARKET")).upper().strip()
+PROTECTIVE_SLIPPAGE_PCT = Decimal(os.getenv("PROTECTIVE_SLIPPAGE_PCT", "0.15"))  # LIMIT 模式滑点 0.15%
+
+# ✅ TP/SL 订单有效期（秒时间戳），默认 30 天
+PROTECTIVE_EXPIRE_SEC = int(os.getenv("PROTECTIVE_EXPIRE_SEC", str(30 * 24 * 3600)))
+
+# 本地 cache（仅辅助）
+BOT_POSITIONS: Dict[Tuple[str, str], dict] = {}
 
 _MONITOR_THREAD_STARTED = False
 _MONITOR_LOCK = threading.Lock()
 
-# local cache (辅助显示)
-BOT_POSITIONS: Dict[Tuple[str, str], dict] = {}
+# ✅ 退出互斥：bot+symbol 粒度 cooldown
+_EXIT_LOCK = threading.Lock()
+_LAST_EXIT_TS: Dict[Tuple[str, str], float] = {}
+
+# ✅ WS fills 处理线程
+_FILLS_THREAD_STARTED = False
+_FILLS_LOCK = threading.Lock()
 
 
 def _require_token() -> bool:
@@ -76,133 +102,357 @@ def _canon_bot_id(bot_id: str) -> str:
     return s
 
 
-# -----------------------------
-# BOT 分组（你新需求）
-# -----------------------------
-BOT_1_10_LONG_TPSL = _parse_bot_list(os.getenv("BOT_1_10_LONG_TPSL", ",".join([f"BOT_{i}" for i in range(1, 11)])))
-BOT_11_20_SHORT_TPSL = _parse_bot_list(os.getenv("BOT_11_20_SHORT_TPSL", ",".join([f"BOT_{i}" for i in range(11, 21)])))
-BOT_21_30_LONG_NO_TPSL = _parse_bot_list(os.getenv("BOT_21_30_LONG_NO_TPSL", ",".join([f"BOT_{i}" for i in range(21, 31)])))
-BOT_31_40_SHORT_NO_TPSL = _parse_bot_list(os.getenv("BOT_31_40_SHORT_NO_TPSL", ",".join([f"BOT_{i}" for i in range(31, 41)])))
-
-
-def _bot_profile(bot_id: str) -> Dict[str, Any]:
+def _bot_num(bot_id: str) -> int:
     b = _canon_bot_id(bot_id)
-    if b in BOT_1_10_LONG_TPSL:
-        return {"direction": "LONG", "tpsl": True}
-    if b in BOT_11_20_SHORT_TPSL:
-        return {"direction": "SHORT", "tpsl": True}
-    if b in BOT_21_30_LONG_NO_TPSL:
-        return {"direction": "LONG", "tpsl": False}
-    if b in BOT_31_40_SHORT_NO_TPSL:
-        return {"direction": "SHORT", "tpsl": False}
-    # default: deny unless you want permissive
-    return {"direction": None, "tpsl": False}
+    try:
+        return int(b.split("_", 1)[1])
+    except Exception:
+        return 0
 
 
+# ----------------------------
+# ✅ BOT 分组（按你要求）
+# ----------------------------
+LONG_TPSL_BOTS = _parse_bot_list(os.getenv("LONG_TPSL_BOTS", ",".join([f"BOT_{i}" for i in range(1, 11)])))
+SHORT_TPSL_BOTS = _parse_bot_list(os.getenv("SHORT_TPSL_BOTS", ",".join([f"BOT_{i}" for i in range(11, 21)])))
+LONG_PNL_ONLY_BOTS = _parse_bot_list(os.getenv("LONG_PNL_ONLY_BOTS", ",".join([f"BOT_{i}" for i in range(21, 31)])))
+SHORT_PNL_ONLY_BOTS = _parse_bot_list(os.getenv("SHORT_PNL_ONLY_BOTS", ",".join([f"BOT_{i}" for i in range(31, 41)])))
+
+
+def _bot_expected_entry_side(bot_id: str) -> Optional[str]:
+    b = _canon_bot_id(bot_id)
+    if b in LONG_TPSL_BOTS or b in LONG_PNL_ONLY_BOTS:
+        return "BUY"
+    if b in SHORT_TPSL_BOTS or b in SHORT_PNL_ONLY_BOTS:
+        return "SELL"
+    return None
+
+
+def _bot_has_exchange_brackets(bot_id: str) -> bool:
+    b = _canon_bot_id(bot_id)
+    return (b in LONG_TPSL_BOTS) or (b in SHORT_TPSL_BOTS)
+
+
+def _exit_guard_allow(bot_id: str, symbol: str) -> bool:
+    key = (_canon_bot_id(bot_id), str(symbol or "").upper().strip())
+    now = time.time()
+    with _EXIT_LOCK:
+        last = _LAST_EXIT_TS.get(key, 0.0)
+        if now - last < EXIT_COOLDOWN_SEC:
+            return False
+        _LAST_EXIT_TS[key] = now
+        return True
+
+
+# ----------------------------
+# 预算提取
+# ----------------------------
 def _extract_budget_usdt(body: dict) -> Decimal:
-    size_field = body.get("position_size_usdt") or body.get("size_usdt") or body.get("size")
+    size_field = (
+        body.get("position_size_usdt")
+        or body.get("size_usdt")
+        or body.get("size")
+    )
     if size_field is None:
         raise ValueError("missing position_size_usdt / size_usdt / size")
+
     budget = Decimal(str(size_field))
     if budget <= 0:
         raise ValueError("size_usdt must be > 0")
     return budget
 
 
+# ----------------------------
+# 预算 -> snapped qty
+# ----------------------------
+def _compute_entry_qty(symbol: str, side: str, budget: Decimal) -> Decimal:
+    rules = _get_symbol_rules(symbol)
+    min_qty = rules["min_qty"]
+
+    ref_price_dec = Decimal(get_market_price(symbol, side, str(min_qty)))
+    theoretical_qty = budget / ref_price_dec
+    snapped_qty = _snap_quantity(symbol, theoretical_qty)
+
+    if snapped_qty <= 0:
+        raise ValueError(f"snapped_qty <= 0, symbol={symbol}, budget={budget}")
+
+    return snapped_qty
+
+
 def _order_status_and_reason(order: dict):
-    data = (order or {}).get("raw_order", {}) or {}
-    if isinstance(data, dict) and "data" in data and isinstance(data["data"], dict):
-        data = data["data"]
-    status = str((data or {}).get("status", "")).upper()
-    cancel_reason = str((data or {}).get("cancelReason") or (data or {}).get("rejectReason") or (data or {}).get("errorMessage") or "")
+    data = (order or {}).get("data", {}) or {}
+    status = str(data.get("status", "")).upper()
+    cancel_reason = str(
+        data.get("cancelReason")
+        or data.get("rejectReason")
+        or data.get("errorMessage")
+        or ""
+    )
     return status, cancel_reason
 
 
-# -----------------------------
-# WS fill 回调：负责真实记账
-# -----------------------------
-def _on_ws_fill(fill: dict):
-    """
-    fill schema in ws_zk_accounts_v3 push includes id/orderId/price/size/side/symbol ... 
-    """
+# ----------------------------
+# 幂等 Signal ID（webhook）
+# ----------------------------
+def _get_signal_id(body: dict, mode: str, bot_id: str, symbol: str) -> str:
+    for k in ("signal_id", "alert_id", "id", "tv_id", "client_id"):
+        v = body.get(k)
+        if v:
+            return f"{mode}:{bot_id}:{symbol}:{str(v)}"
+
+    ts = body.get("ts") or body.get("time") or int(time.time())
     try:
-        fill_id = str(fill.get("id") or "")
-        order_id = str(fill.get("orderId") or "")
-        symbol = str(fill.get("symbol") or "").upper().strip()
-        side = str(fill.get("side") or "").upper().strip()
-        price = Decimal(str(fill.get("price") or "0"))
-        size = Decimal(str(fill.get("size") or "0"))
+        ts_int = int(float(str(ts)))
     except Exception:
+        ts_int = int(time.time())
+
+    sig = str(body.get("signal_type") or body.get("action") or "").lower().strip()
+    side = str(body.get("side") or "").upper().strip()
+
+    return f"{mode}:{bot_id}:{symbol}:{sig}:{side}:{ts_int}"
+
+
+# ----------------------------
+# ✅ 交易所 TP/SL（固定百分比）下单
+# ----------------------------
+def _compute_fixed_bracket_prices(direction: str, entry_price: Decimal) -> Tuple[Decimal, Decimal]:
+    """
+    return (sl_trigger, tp_trigger)
+    """
+    if entry_price <= 0:
+        return Decimal("0"), Decimal("0")
+
+    sl_pct = FIXED_SL_PCT / Decimal("100")
+    tp_pct = FIXED_TP_PCT / Decimal("100")
+
+    if direction.upper() == "LONG":
+        sl = entry_price * (Decimal("1") - sl_pct)
+        tp = entry_price * (Decimal("1") + tp_pct)
+    else:
+        sl = entry_price * (Decimal("1") + sl_pct)
+        tp = entry_price * (Decimal("1") - tp_pct)
+
+    return sl, tp
+
+
+def _apply_limit_slippage(direction: str, trigger: Decimal) -> Decimal:
+    """
+    LIMIT 模式：给“更差一点”的限价，提升成交概率。
+    LONG 平仓 SELL：更低一点
+    SHORT 平仓 BUY：更高一点
+    """
+    slip = (PROTECTIVE_SLIPPAGE_PCT / Decimal("100"))
+    d = direction.upper()
+    if d == "LONG":
+        return trigger * (Decimal("1") - slip)
+    else:
+        return trigger * (Decimal("1") + slip)
+
+
+def _cancel_existing_brackets(bot_id: str, symbol: str, direction: str):
+    po = get_protective_orders(bot_id, symbol, direction)
+    if not po:
         return
-
-    if not fill_id or not order_id or not symbol or price <= 0 or size <= 0:
-        return
-
-    # dedup
-    if is_fill_seen(fill_id):
-        return
-    mark_fill_seen(fill_id, order_id)
-
-    omap = find_order_map(order_id)
-    if not omap:
-        # not ours
-        return
-
-    bot_id = _canon_bot_id(omap["bot_id"])
-    intent = str(omap["intent"]).upper()
-    entry_side = str(omap["entry_side"]).upper()
-    direction = str(omap["direction"]).upper()
-
-    if intent == "ENTRY":
-        # 每个 fill 记一条 lot（更精确，且不怕多次成交）
+    sl_oid = po.get("sl_order_id")
+    tp_oid = po.get("tp_order_id")
+    if sl_oid:
         try:
-            record_entry(
+            cancel_order(str(sl_oid))
+        except Exception:
+            pass
+    if tp_oid:
+        try:
+            cancel_order(str(tp_oid))
+        except Exception:
+            pass
+    try:
+        clear_protective_orders(bot_id, symbol, direction)
+    except Exception:
+        pass
+
+
+def _place_fixed_brackets(bot_id: str, symbol: str, direction: str, qty: Decimal, entry_price: Decimal):
+    """
+    BOT_1-20 才会走这里：
+    - 下 SL & TP（reduceOnly=True）
+    - 记录到 DB protective_orders，供 WS fills 自动记账 + OCO
+    """
+    bot_id = _canon_bot_id(bot_id)
+    symbol = str(symbol).upper().strip()
+    direction = direction.upper()
+
+    if qty <= 0 or entry_price <= 0:
+        return
+
+    # 先取消旧的（避免重复挂单）
+    _cancel_existing_brackets(bot_id, symbol, direction)
+
+    sl_trigger, tp_trigger = _compute_fixed_bracket_prices(direction, entry_price)
+    if sl_trigger <= 0 or tp_trigger <= 0:
+        return
+
+    expiration = int(time.time()) + int(PROTECTIVE_EXPIRE_SEC)
+    exit_side = "SELL" if direction == "LONG" else "BUY"
+
+    if PROTECTIVE_ORDER_MODE == "LIMIT":
+        sl_type = "STOP_LIMIT"
+        tp_type = "TAKE_PROFIT_LIMIT"
+        sl_price = _apply_limit_slippage(direction, sl_trigger)
+        tp_price = _apply_limit_slippage(direction, tp_trigger)
+    else:
+        sl_type = "STOP_MARKET"
+        tp_type = "TAKE_PROFIT_MARKET"
+        sl_price = None
+        tp_price = None
+
+    bnum = _bot_num(bot_id)
+    ts = int(time.time())
+    sl_client = f"{bnum:03d}{ts}01"
+    tp_client = f"{bnum:03d}{ts}02"
+
+    sl_res = create_trigger_order(
+        symbol=symbol,
+        side=exit_side,
+        order_type=sl_type,
+        size=str(qty),
+        trigger_price=str(sl_trigger),
+        price=str(sl_price) if sl_price is not None else None,
+        reduce_only=True,
+        client_id=sl_client,
+        expiration_sec=expiration,
+    )
+    tp_res = create_trigger_order(
+        symbol=symbol,
+        side=exit_side,
+        order_type=tp_type,
+        size=str(qty),
+        trigger_price=str(tp_trigger),
+        price=str(tp_price) if tp_price is not None else None,
+        reduce_only=True,
+        client_id=tp_client,
+        expiration_sec=expiration,
+    )
+
+    sl_oid = sl_res.get("order_id")
+    tp_oid = tp_res.get("order_id")
+
+    set_protective_orders(
+        bot_id=bot_id,
+        symbol=symbol,
+        direction=direction,
+        sl_order_id=str(sl_oid) if sl_oid else None,
+        tp_order_id=str(tp_oid) if tp_oid else None,
+        sl_client_id=sl_res.get("client_order_id") or sl_client,
+        tp_client_id=tp_res.get("client_order_id") or tp_client,
+        sl_price=sl_trigger,
+        tp_price=tp_trigger,
+        is_active=True,
+    )
+
+    print(
+        f"[BRACKET] set bot={bot_id} {direction} {symbol} qty={qty} entry={entry_price} "
+        f"SL({sl_type}) trigger={sl_trigger} oid={sl_oid} | TP({tp_type}) trigger={tp_trigger} oid={tp_oid}"
+    )
+
+
+# ----------------------------
+# ✅ WS fills -> 自动记账 + OCO
+# ----------------------------
+def _fills_loop():
+    print("[WS-FILLS] loop started")
+    while True:
+        evt = pop_fill_event(timeout=0.5)
+        if not evt:
+            continue
+
+        try:
+            fill_id = str(evt.get("id") or "")
+            order_id = str(evt.get("orderId") or "")
+            symbol = str(evt.get("symbol") or "").upper().strip()
+            px = evt.get("price")
+            sz = evt.get("size")
+
+            if not fill_id or not order_id or not symbol or px is None or sz is None:
+                continue
+
+            owner = find_protective_owner_by_order_id(order_id)
+            if not owner:
+                continue
+
+            bot_id = _canon_bot_id(owner["bot_id"])
+            direction = str(owner["direction"]).upper()
+            kind = str(owner.get("kind") or "").upper()  # SL / TP
+
+            sig_id = f"fill:{fill_id}"
+            if is_signal_processed(bot_id, sig_id):
+                continue
+            mark_signal_processed(bot_id, sig_id, kind=f"ws_{kind.lower()}_fill")
+
+            dq = Decimal(str(sz))
+            dp = Decimal(str(px))
+            if dq <= 0 or dp <= 0:
+                continue
+
+            entry_side = "BUY" if direction == "LONG" else "SELL"
+
+            record_exit_fifo(
                 bot_id=bot_id,
                 symbol=symbol,
-                side=entry_side,   # BUY->LONG, SELL->SHORT
-                qty=size,
-                price=price,
-                reason="ws_entry_fill",
+                entry_side=entry_side,
+                exit_qty=dq,
+                exit_price=dp,
+                reason=f"exchange_{kind.lower()}_fill",
             )
+
+            opens = get_bot_open_positions(bot_id)
+            remaining = opens.get((symbol, direction), {}).get("qty", Decimal("0"))
+
+            po = get_protective_orders(bot_id, symbol, direction)
+            sl_oid = po.get("sl_order_id") if po else None
+            tp_oid = po.get("tp_order_id") if po else None
+
+            if remaining <= 0:
+                other_oid = tp_oid if kind == "SL" else sl_oid
+                if other_oid:
+                    try:
+                        cancel_order(str(other_oid))
+                    except Exception:
+                        pass
+
+                try:
+                    clear_protective_orders(bot_id, symbol, direction)
+                except Exception:
+                    pass
+                try:
+                    clear_lock_level_pct(bot_id, symbol, direction)
+                except Exception:
+                    pass
+
+                key_local = (bot_id, symbol)
+                if key_local in BOT_POSITIONS:
+                    BOT_POSITIONS[key_local]["qty"] = Decimal("0")
+                    BOT_POSITIONS[key_local]["entry_price"] = None
+
+                print(f"[WS-FILLS] position closed by {kind}. bot={bot_id} {direction} {symbol} now flat. OCO done.")
+            else:
+                print(
+                    f"[WS-FILLS] partial {kind} fill bot={bot_id} {direction} {symbol} "
+                    f"fill_qty={dq} fill_px={dp} remaining={remaining}"
+                )
+
         except Exception as e:
-            print("[PNL] record_entry(ws) error:", e)
+            print("[WS-FILLS] error:", e)
 
-        BOT_POSITIONS[(bot_id, symbol)] = {"side": entry_side, "qty": size, "entry_price": price}
-        return
 
-    # EXIT/TP/SL -> FIFO 出场
-    reason = "exchange_exit"
-    if intent == "TP":
-        reason = "exchange_tp"
-    elif intent == "SL":
-        reason = "exchange_sl"
-    elif intent == "EXIT":
-        reason = "exchange_exit"
-
-    try:
-        record_exit_fifo(
-            bot_id=bot_id,
-            symbol=symbol,
-            entry_side=entry_side,
-            exit_qty=size,
-            exit_price=price,
-            reason=reason,
-        )
-    except Exception as e:
-        print("[PNL] record_exit_fifo(ws) error:", e)
-
-    # 如果这是 bracket 触发，尽量取消另一侧单（避免残留）
-    br = find_bracket_by_order(order_id)
-    if br:
-        tp_oid = str(br.get("tp_order_id") or "")
-        sl_oid = str(br.get("sl_order_id") or "")
-        other = ""
-        if order_id == tp_oid:
-            other = sl_oid
-        elif order_id == sl_oid:
-            other = tp_oid
-        if other:
-            cancel_order(other)
+def _ensure_ws_fills_thread():
+    global _FILLS_THREAD_STARTED
+    with _FILLS_LOCK:
+        if _FILLS_THREAD_STARTED:
+            return
+        t = threading.Thread(target=_fills_loop, daemon=True)
+        t.start()
+        _FILLS_THREAD_STARTED = True
+        print("[WS-FILLS] thread created")
 
 
 def _ensure_monitor_thread():
@@ -210,10 +460,14 @@ def _ensure_monitor_thread():
     with _MONITOR_LOCK:
         if _MONITOR_THREAD_STARTED:
             return
+
         init_db()
-        set_on_fill_callback(_on_ws_fill)
+
+        start_private_ws()
+        _ensure_ws_fills_thread()
+
         _MONITOR_THREAD_STARTED = True
-        print("[SYSTEM] monitor/ws ready")
+        print("[SYSTEM] monitor/ws threads ready")
 
 
 @app.route("/", methods=["GET"])
@@ -250,12 +504,26 @@ def api_pnl():
             if qty <= 0:
                 continue
 
-            # 这里不再强行拉 mark（避免额外 API 波动）；只展示账面
+            try:
+                rules = _get_symbol_rules(symbol)
+                min_qty = rules["min_qty"]
+                exit_side = "SELL" if direction.upper() == "LONG" else "BUY"
+                px_str = get_market_price(symbol, exit_side, str(min_qty))
+                px = Decimal(str(px_str))
+            except Exception:
+                continue
+
+            if direction.upper() == "LONG":
+                unrealized += (px - wentry) * qty
+            else:
+                unrealized += (wentry - px) * qty
+
             open_rows.append({
                 "symbol": str(symbol).upper(),
                 "direction": direction.upper(),
                 "qty": str(qty),
                 "weighted_entry": str(wentry),
+                "mark_price": str(px),
             })
 
         base.update({
@@ -278,8 +546,11 @@ def api_pnl():
 def dashboard():
     if not _require_token():
         return Response("Forbidden", status=403)
+
     _ensure_monitor_thread()
-    return Response("OK (use /api/pnl)", mimetype="text/plain")
+
+    # 这里保持你原来的 dashboard HTML（略），你可直接保留你贴的那份
+    return Response("OK", mimetype="text/plain")
 
 
 @app.route("/webhook", methods=["POST"])
@@ -292,22 +563,26 @@ def tv_webhook():
         print("[WEBHOOK] invalid json:", e)
         return "invalid json", 400
 
+    print("[WEBHOOK] raw body:", body)
+
     if not isinstance(body, dict):
         return "bad payload", 400
 
     if WEBHOOK_SECRET and body.get("secret") != WEBHOOK_SECRET:
+        print("[WEBHOOK] invalid secret")
         return "forbidden", 403
 
-    symbol = str(body.get("symbol") or "").upper().strip()
+    symbol = body.get("symbol")
     if not symbol:
         return "missing symbol", 400
+    symbol = str(symbol).upper().strip()
 
     bot_id = _canon_bot_id(body.get("bot_id", "BOT_1"))
-    side_raw = str(body.get("side", "")).upper()
-    signal_type_raw = str(body.get("signal_type", "")).lower()
-    action_raw = str(body.get("action", "")).lower()
+    side_raw = str(body.get("side", "")).upper().strip()
+    signal_type_raw = str(body.get("signal_type", "")).lower().strip()
+    action_raw = str(body.get("action", "")).lower().strip()
+    tv_client_id = body.get("client_id")
 
-    # mode
     mode: Optional[str] = None
     if signal_type_raw in ("entry", "open"):
         mode = "entry"
@@ -322,148 +597,194 @@ def tv_webhook():
     if mode is None:
         return "missing or invalid signal_type / action", 400
 
-    # webhook idempotency (保持你原逻辑)
-    sig_id = f"{mode}:{bot_id}:{symbol}:{body.get('id') or body.get('signal_id') or int(time.time())}"
+    sig_id = _get_signal_id(body, mode, bot_id, symbol)
     if is_signal_processed(bot_id, sig_id):
+        print(f"[WEBHOOK] dedup: bot={bot_id} symbol={symbol} mode={mode} sig={sig_id}")
         return jsonify({"status": "dedup", "mode": mode, "bot_id": bot_id, "symbol": symbol, "signal_id": sig_id}), 200
     mark_signal_processed(bot_id, sig_id, kind=f"webhook_{mode}")
-
-    prof = _bot_profile(bot_id)
-    allowed_dir = prof["direction"]
-    use_tpsl = bool(prof["tpsl"])
 
     # -------------------------
     # ENTRY
     # -------------------------
     if mode == "entry":
+        expected = _bot_expected_entry_side(bot_id)
+        if expected is not None:
+            if side_raw and side_raw != expected:
+                return jsonify({
+                    "status": "rejected_wrong_direction",
+                    "bot_id": bot_id,
+                    "symbol": symbol,
+                    "expected_side": expected,
+                    "got_side": side_raw,
+                    "signal_id": sig_id,
+                }), 200
+            side_raw = expected
+
         if side_raw not in ("BUY", "SELL"):
             return "missing or invalid side", 400
-
-        # enforce direction
-        if allowed_dir == "LONG" and side_raw != "BUY":
-            return jsonify({"status": "rejected", "reason": "bot long-only", "bot_id": bot_id}), 200
-        if allowed_dir == "SHORT" and side_raw != "SELL":
-            return jsonify({"status": "rejected", "reason": "bot short-only", "bot_id": bot_id}), 200
-        if allowed_dir is None:
-            return jsonify({"status": "rejected", "reason": "bot not in allowed groups", "bot_id": bot_id}), 200
 
         try:
             budget = _extract_budget_usdt(body)
         except Exception as e:
+            print("[ENTRY] budget error:", e)
             return str(e), 400
 
-        # 直接用 size_usdt 下 market（qty snapping 在 apex_client 内完成）
+        try:
+            snapped_qty = _compute_entry_qty(symbol, side_raw, budget)
+        except Exception as e:
+            print("[ENTRY] qty compute error:", e)
+            return "qty compute error", 500
+
+        size_str = str(snapped_qty)
+        print(f"[ENTRY] bot={bot_id} symbol={symbol} side={side_raw} budget={budget} -> qty={size_str} sig={sig_id}")
+
         try:
             order = create_market_order(
                 symbol=symbol,
                 side=side_raw,
-                size_usdt=str(budget),
+                size=size_str,
                 reduce_only=False,
-                client_id=None,
+                client_id=tv_client_id,
             )
         except Exception as e:
             print("[ENTRY] create_market_order error:", e)
             return "order error", 500
 
+        status, cancel_reason = _order_status_and_reason(order)
+        print(f"[ENTRY] order status={status} cancelReason={cancel_reason!r}")
+
+        if status in ("CANCELED", "REJECTED"):
+            return jsonify({
+                "status": "order_rejected",
+                "mode": "entry",
+                "bot_id": bot_id,
+                "symbol": symbol,
+                "side": side_raw,
+                "request_qty": size_str,
+                "order_status": status,
+                "cancel_reason": cancel_reason,
+                "signal_id": sig_id,
+            }), 200
+
+        computed = (order or {}).get("computed") or {}
+        fallback_price_str = computed.get("price")
+
         order_id = order.get("order_id")
-        client_order_id = order.get("client_order_id") or order.get("apex_client_id") or ""
+        client_order_id = order.get("client_order_id")
 
-        if not order_id:
-            return jsonify({"status": "order_no_id", "bot_id": bot_id, "symbol": symbol}), 200
+        entry_price_dec: Optional[Decimal] = None
+        final_qty = snapped_qty
 
-        direction = "LONG" if side_raw == "BUY" else "SHORT"
-
-        # map order -> bot for WS attribution
-        record_order_map(
-            order_id=order_id,
-            client_order_id=str(client_order_id),
-            bot_id=bot_id,
-            symbol=symbol,
-            direction=direction,
-            entry_side=side_raw,
-            intent="ENTRY",
-            reduce_only=False,
-        )
-
-        # wait WS fills
         try:
-            fill = wait_fills_for_order(order_id, timeout_sec=WS_FILL_WAIT_SEC)
-            entry_price = Decimal(str(fill["avg_fill_price"]))
-            filled_qty = Decimal(str(fill["filled_qty"]))
+            fill = get_fill_summary(
+                symbol=symbol,
+                order_id=order_id,
+                client_order_id=client_order_id,
+                max_wait_sec=float(os.getenv("FILL_MAX_WAIT_SEC", "2.0")),
+                poll_interval=float(os.getenv("FILL_POLL_INTERVAL", "0.25")),
+            )
+            entry_price_dec = Decimal(str(fill["avg_fill_price"]))
+            final_qty = Decimal(str(fill["filled_qty"]))
+            print(f"[ENTRY] fill ok bot={bot_id} symbol={symbol} filled_qty={final_qty} avg_fill={entry_price_dec}")
         except Exception as e:
-            print("[ENTRY] wait WS fills error:", e)
-            return jsonify({"status": "ws_fill_timeout", "order_id": order_id, "bot_id": bot_id, "symbol": symbol}), 200
-
-        # place exchange TP/SL if needed
-        tp_order_id = ""
-        sl_order_id = ""
-        tp_trigger = None
-        sl_trigger = None
-
-        if use_tpsl:
+            print(f"[ENTRY] fill fallback bot={bot_id} symbol={symbol} err:", e)
             try:
-                tpsl = place_fixed_tpsl_orders(
+                if fallback_price_str is not None:
+                    entry_price_dec = Decimal(str(fallback_price_str))
+            except Exception:
+                entry_price_dec = None
+
+        key = (bot_id, symbol)
+        BOT_POSITIONS[key] = {"side": side_raw, "qty": final_qty, "entry_price": entry_price_dec}
+
+        if entry_price_dec is not None and final_qty > 0:
+            try:
+                record_entry(
+                    bot_id=bot_id,
                     symbol=symbol,
-                    direction=direction,
-                    qty=filled_qty,
-                    entry_price=entry_price,
-                    sl_pct=TPSL_SL_PCT,
-                    tp_pct=TPSL_TP_PCT,
+                    side=side_raw,
+                    qty=final_qty,
+                    price=entry_price_dec,
+                    reason="strategy_entry_fill" if order_id else "strategy_entry",
                 )
-
-                sl = tpsl["sl"]
-                tp = tpsl["tp"]
-
-                sl_order_id = sl.get("order_id") or ""
-                tp_order_id = tp.get("order_id") or ""
-                sl_trigger = tpsl.get("sl_trigger")
-                tp_trigger = tpsl.get("tp_trigger")
-
-                if sl_order_id:
-                    record_order_map(sl_order_id, sl.get("client_order_id") or "", bot_id, symbol, direction, side_raw, "SL", True)
-                if tp_order_id:
-                    record_order_map(tp_order_id, tp.get("client_order_id") or "", bot_id, symbol, direction, side_raw, "TP", True)
-
-                record_bracket(bot_id, symbol, direction, entry_order_id=order_id, tp_order_id=tp_order_id, sl_order_id=sl_order_id)
-
             except Exception as e:
-                print("[TPSL] place_fixed_tpsl_orders error:", e)
+                print("[PNL] record_entry error:", e)
+
+        # ✅ BOT_1-20：挂交易所 TP/SL（reduceOnly=True）
+        if _bot_has_exchange_brackets(bot_id) and entry_price_dec is not None and final_qty > 0:
+            direction = "LONG" if side_raw == "BUY" else "SHORT"
+            try:
+                _place_fixed_brackets(bot_id, symbol, direction, final_qty, entry_price_dec)
+            except Exception as e:
+                print("[BRACKET] place error:", e)
 
         return jsonify({
             "status": "ok",
             "mode": "entry",
             "bot_id": bot_id,
             "symbol": symbol,
-            "direction": direction,
-            "use_tpsl": use_tpsl,
-            "entry_price": str(entry_price),
-            "filled_qty": str(filled_qty),
-            "entry_order_id": order_id,
-            "tp_order_id": tp_order_id,
-            "sl_order_id": sl_order_id,
-            "tp_trigger": tp_trigger,
-            "sl_trigger": sl_trigger,
+            "side": side_raw,
+            "qty": str(final_qty),
+            "entry_price": str(entry_price_dec) if entry_price_dec else None,
+            "requested_qty": size_str,
+            "order_status": status,
+            "cancel_reason": cancel_reason,
+            "order_id": order_id,
             "signal_id": sig_id,
         }), 200
 
     # -------------------------
-    # EXIT (manual/strategy close)
+    # EXIT（策略出场 / TV 出场）
     # -------------------------
     if mode == "exit":
-        if allowed_dir is None:
-            return jsonify({"status": "rejected", "reason": "bot not in allowed groups", "bot_id": bot_id}), 200
-
-        # figure direction from bot profile (simplified)
-        direction = allowed_dir
-        entry_side = "BUY" if direction == "LONG" else "SELL"
-        exit_side = "SELL" if direction == "LONG" else "BUY"
+        if not _exit_guard_allow(bot_id, symbol):
+            print(f"[EXIT] SKIP (cooldown) bot={bot_id} symbol={symbol} sig={sig_id}")
+            return jsonify({"status": "cooldown_skip", "mode": "exit", "bot_id": bot_id, "symbol": symbol, "signal_id": sig_id}), 200
 
         opens = get_bot_open_positions(bot_id)
-        k = (symbol, direction)
-        qty_to_close = opens.get(k, {}).get("qty", Decimal("0"))
+        long_key = (symbol, "LONG")
+        short_key = (symbol, "SHORT")
 
-        if qty_to_close <= 0:
-            return jsonify({"status": "no_position", "bot_id": bot_id, "symbol": symbol}), 200
+        long_qty = opens.get(long_key, {}).get("qty", Decimal("0"))
+        short_qty = opens.get(short_key, {}).get("qty", Decimal("0"))
+
+        key_local = (bot_id, symbol)
+        local = BOT_POSITIONS.get(key_local)
+        preferred = "LONG"
+        if local and str(local.get("side", "")).upper() == "SELL":
+            preferred = "SHORT"
+
+        direction_to_close = None
+        qty_to_close = Decimal("0")
+
+        if preferred == "LONG" and long_qty > 0:
+            direction_to_close, qty_to_close = "LONG", long_qty
+        elif preferred == "SHORT" and short_qty > 0:
+            direction_to_close, qty_to_close = "SHORT", short_qty
+        elif long_qty > 0:
+            direction_to_close, qty_to_close = "LONG", long_qty
+        elif short_qty > 0:
+            direction_to_close, qty_to_close = "SHORT", short_qty
+
+        if (not direction_to_close or qty_to_close <= 0):
+            if symbol in REMOTE_FALLBACK_SYMBOLS:
+                remote = get_open_position_for_symbol(symbol)
+                if remote and remote["size"] > 0:
+                    direction_to_close = remote["side"]
+                    qty_to_close = remote["size"]
+                else:
+                    return jsonify({"status": "no_position"}), 200
+            else:
+                return jsonify({"status": "no_position"}), 200
+
+        # ✅ 手动/TV exit：先取消交易所挂的 TP/SL
+        try:
+            _cancel_existing_brackets(bot_id, symbol, direction_to_close)
+        except Exception:
+            pass
+
+        entry_side = "BUY" if direction_to_close == "LONG" else "SELL"
+        exit_side = "SELL" if direction_to_close == "LONG" else "BUY"
 
         try:
             order = create_market_order(
@@ -471,57 +792,66 @@ def tv_webhook():
                 side=exit_side,
                 size=str(qty_to_close),
                 reduce_only=True,
-                client_id=None,
+                client_id=tv_client_id,
             )
         except Exception as e:
             print("[EXIT] create_market_order error:", e)
             return "order error", 500
 
-        order_id = order.get("order_id")
-        client_order_id = order.get("client_order_id") or order.get("apex_client_id") or ""
+        status, cancel_reason = _order_status_and_reason(order)
+        print(f"[EXIT] order status={status} cancelReason={cancel_reason!r}")
 
-        if not order_id:
-            return jsonify({"status": "order_no_id", "bot_id": bot_id, "symbol": symbol}), 200
+        if status in ("CANCELED", "REJECTED"):
+            return jsonify({
+                "status": "exit_rejected",
+                "mode": "exit",
+                "bot_id": bot_id,
+                "symbol": symbol,
+                "exit_side": exit_side,
+                "requested_qty": str(qty_to_close),
+                "order_status": status,
+                "cancel_reason": cancel_reason,
+                "signal_id": sig_id,
+            }), 200
 
-        record_order_map(
-            order_id=order_id,
-            client_order_id=str(client_order_id),
-            bot_id=bot_id,
-            symbol=symbol,
-            direction=direction,
-            entry_side=entry_side,
-            intent="EXIT",
-            reduce_only=True,
-        )
-
-        # best-effort: if bot had bracket, cancel them now
-        br = find_bracket_by_order(order_id)
-        if br:
-            tp_oid = str(br.get("tp_order_id") or "")
-            sl_oid = str(br.get("sl_order_id") or "")
-            if tp_oid:
-                cancel_order(tp_oid)
-            if sl_oid:
-                cancel_order(sl_oid)
-
-        # wait WS fills for response
         try:
-            fill = wait_fills_for_order(order_id, timeout_sec=WS_FILL_WAIT_SEC)
-            exit_price = Decimal(str(fill["avg_fill_price"]))
-            filled_qty = Decimal(str(fill["filled_qty"]))
+            rules = _get_symbol_rules(symbol)
+            min_qty = rules["min_qty"]
+            px_str = get_market_price(symbol, exit_side, str(min_qty))
+            exit_price = Decimal(str(px_str))
         except Exception:
-            exit_price = None
-            filled_qty = None
+            exit_price = Decimal("0.00000001")
+
+        try:
+            record_exit_fifo(
+                bot_id=bot_id,
+                symbol=symbol,
+                entry_side=entry_side,
+                exit_qty=qty_to_close,
+                exit_price=exit_price,
+                reason="strategy_exit",
+            )
+        except Exception as e:
+            print("[PNL] record_exit_fifo error (strategy):", e)
+
+        try:
+            clear_lock_level_pct(bot_id, symbol, direction_to_close)
+        except Exception:
+            pass
+
+        if key_local in BOT_POSITIONS:
+            BOT_POSITIONS[key_local]["qty"] = Decimal("0")
+            BOT_POSITIONS[key_local]["entry_price"] = None
 
         return jsonify({
             "status": "ok",
             "mode": "exit",
             "bot_id": bot_id,
             "symbol": symbol,
-            "direction": direction,
-            "exit_order_id": order_id,
-            "exit_price": str(exit_price) if exit_price else None,
-            "filled_qty": str(filled_qty) if filled_qty else None,
+            "exit_side": exit_side,
+            "closed_qty": str(qty_to_close),
+            "order_status": status,
+            "cancel_reason": cancel_reason,
             "signal_id": sig_id,
         }), 200
 
