@@ -556,13 +556,319 @@ def api_pnl():
 
 @app.route("/dashboard", methods=["GET"])
 def dashboard():
-    if not _require_token():
-        return Response("Forbidden", status=403)
-
+    # ✅ Mobile-friendly dashboard (HTML)
+    # Security model:
+    # - /api/pnl is protected by DASHBOARD_TOKEN (if set).
+    # - /dashboard can load without a token; the page will ask for token if needed.
     _ensure_monitor_thread()
 
-    # 这里保持你原来的 dashboard HTML（略），你可直接保留你贴的那份
-    return Response("OK", mimetype="text/plain")
+    html = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Apex Bot PnL Dashboard</title>
+  <style>
+    :root { --bg:#0b1020; --card:#121a33; --muted:#9aa4b2; --text:#eef2ff; --line:#24304f; --bad:#ff6b6b; --good:#6bff95; }
+    body { margin:0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; background:var(--bg); color:var(--text); }
+    a { color:inherit; }
+    .wrap { max-width: 1100px; margin: 0 auto; padding: 16px; }
+    .top { display:flex; flex-direction:column; gap:12px; }
+    .title { font-size: 20px; font-weight: 700; }
+    .sub { color:var(--muted); font-size: 12px; }
+    .row { display:flex; gap:12px; flex-wrap:wrap; }
+    .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:12px; box-shadow: 0 6px 18px rgba(0,0,0,.25); }
+    .controls { display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end; }
+    label { display:block; color:var(--muted); font-size: 12px; margin-bottom:6px; }
+    input, select, button { border-radius:10px; border:1px solid var(--line); background:#0f1730; color:var(--text); padding:10px 10px; font-size:14px; }
+    input { width: 260px; }
+    input.small { width: 140px; }
+    button { cursor:pointer; }
+    button.primary { background:#1b2a55; }
+    button.danger { background:#3a1530; }
+    .grid { display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap:12px; }
+    @media (min-width: 860px) { .grid { grid-template-columns: repeat(5, minmax(0, 1fr)); } }
+    .k { color:var(--muted); font-size: 12px; }
+    .v { font-size: 18px; font-weight: 700; margin-top: 6px; }
+    .v.good { color: var(--good); }
+    .v.bad { color: var(--bad); }
+    .err { color: var(--bad); font-size: 13px; white-space: pre-wrap; }
+    .ok { color: var(--good); font-size: 13px; }
+    .tableWrap { overflow:auto; }
+    table { width:100%; border-collapse: collapse; min-width: 860px; }
+    th, td { text-align:left; padding:10px 10px; border-bottom:1px solid var(--line); font-size: 13px; }
+    th { position: sticky; top: 0; background: #0f1730; z-index: 1; }
+    tr:hover td { background: rgba(255,255,255,0.03); }
+    details { border:1px solid var(--line); border-radius:12px; padding:10px; background:#0f1730; }
+    summary { cursor:pointer; font-weight: 700; }
+    .pill { display:inline-block; padding:2px 8px; border-radius: 999px; border:1px solid var(--line); color:var(--muted); font-size:12px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <div>
+        <div class="title">Apex Bot PnL Dashboard</div>
+        <div class="sub">Mobile-friendly view. Data loads from <span class="pill">/api/pnl</span>. If you set <span class="pill">DASHBOARD_TOKEN</span>, paste it below.</div>
+      </div>
+
+      <div class="card">
+        <div class="controls">
+          <div>
+            <label>Token (optional; required if DASHBOARD_TOKEN is set)</label>
+            <input id="token" placeholder="paste DASHBOARD_TOKEN" />
+          </div>
+          <div>
+            <label>Bot filter (optional)</label>
+            <input id="bot" class="small" placeholder="BOT_1" />
+          </div>
+          <div>
+            <label>Auto refresh</label>
+            <select id="refresh">
+              <option value="0">Off</option>
+              <option value="2">2s</option>
+              <option value="5" selected>5s</option>
+              <option value="10">10s</option>
+              <option value="30">30s</option>
+            </select>
+          </div>
+          <div>
+            <button class="primary" id="load">Load</button>
+            <button id="save">Save Token</button>
+            <button class="danger" id="clear">Clear Token</button>
+          </div>
+          <div style="flex:1"></div>
+          <div class="sub" id="status">Idle.</div>
+        </div>
+      </div>
+
+      <div class="grid" id="cards">
+        <div class="card"><div class="k">Realized (24h)</div><div class="v" id="c_day">—</div></div>
+        <div class="card"><div class="k">Realized (7d)</div><div class="v" id="c_week">—</div></div>
+        <div class="card"><div class="k">Realized (total)</div><div class="v" id="c_total">—</div></div>
+        <div class="card"><div class="k">Unrealized (mark)</div><div class="v" id="c_unr">—</div></div>
+        <div class="card"><div class="k">Bots / Trades</div><div class="v" id="c_meta">—</div></div>
+      </div>
+
+      <div class="card">
+        <div class="row" style="align-items:center; justify-content:space-between">
+          <div style="font-weight:700">Bots</div>
+          <div class="sub" id="updated">Not loaded.</div>
+        </div>
+        <div class="tableWrap">
+          <table>
+            <thead>
+              <tr>
+                <th>bot_id</th>
+                <th>realized_day</th>
+                <th>realized_week</th>
+                <th>realized_total</th>
+                <th>unrealized</th>
+                <th>trades</th>
+                <th>open_positions</th>
+              </tr>
+            </thead>
+            <tbody id="tbody">
+              <tr><td colspan="7" class="sub">Click “Load” to fetch data.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <details>
+          <summary>Quick links</summary>
+          <div class="sub" style="margin-top:10px; line-height:1.6">
+            API (all): <a href="/api/pnl" target="_blank">/api/pnl</a><br />
+            API (single bot): <span class="pill">/api/pnl?bot_id=BOT_1</span><br />
+            If token is enabled: add <span class="pill">&amp;token=YOUR_TOKEN</span>
+          </div>
+        </details>
+      </div>
+
+      <div id="msg" class="err" style="display:none"></div>
+    </div>
+  </div>
+
+  <script>
+    const el = (id) => document.getElementById(id);
+    const tokenEl = el('token');
+    const botEl = el('bot');
+    const refreshEl = el('refresh');
+    const statusEl = el('status');
+    const msgEl = el('msg');
+
+    const fmt = (x) => {
+      if (x === null || x === undefined) return '0';
+      const n = Number(x);
+      if (Number.isNaN(n)) return String(x);
+      return n.toFixed(4);
+    };
+    const clsPNL = (x) => {
+      const n = Number(x);
+      if (Number.isNaN(n)) return '';
+      if (n > 0) return 'good';
+      if (n < 0) return 'bad';
+      return '';
+    };
+
+    function setStatus(s, ok=false) {
+      statusEl.textContent = s;
+      statusEl.className = ok ? 'ok' : 'sub';
+    }
+
+    function setErr(s) {
+      if (!s) { msgEl.style.display='none'; msgEl.textContent=''; return; }
+      msgEl.style.display='block';
+      msgEl.textContent = s;
+    }
+
+    function getSavedToken() {
+      try { return localStorage.getItem('apex_pnl_token') || ''; } catch(e) { return ''; }
+    }
+    function saveToken(t) {
+      try { localStorage.setItem('apex_pnl_token', t || ''); } catch(e) {}
+    }
+    function clearToken() {
+      try { localStorage.removeItem('apex_pnl_token'); } catch(e) {}
+    }
+
+    // preload token from URL or localStorage
+    const qs = new URLSearchParams(location.search);
+    const qsToken = qs.get('token') || '';
+    const qsBot = qs.get('bot_id') || qs.get('bot') || '';
+    tokenEl.value = qsToken || getSavedToken();
+    botEl.value = qsBot;
+    if (qsToken) saveToken(qsToken);
+
+    let timer = null;
+
+    async function fetchPnL() {
+      setErr('');
+      const token = (tokenEl.value || '').trim();
+      const bot = (botEl.value || '').trim();
+      const url = new URL('/api/pnl', location.origin);
+      if (bot) url.searchParams.set('bot_id', bot);
+      if (token) url.searchParams.set('token', token);
+
+      setStatus('Loading...');
+      const t0 = Date.now();
+      let res;
+      try {
+        res = await fetch(url.toString(), { method: 'GET' });
+      } catch (e) {
+        setStatus('Network error');
+        setErr(String(e));
+        return;
+      }
+      const dt = Date.now() - t0;
+
+      let data;
+      try { data = await res.json(); } catch (e) { data = null; }
+
+      if (!res.ok) {
+        setStatus('Failed');
+        const hint = (res.status === 403)
+          ? '403 Forbidden. If you set DASHBOARD_TOKEN, paste it above (or open /dashboard?token=...).'
+          : `HTTP ${res.status}`;
+        setErr(hint + (data ? ('\n' + JSON.stringify(data, null, 2)) : ''));
+        return;
+      }
+
+      const bots = (data && data.bots) ? data.bots : [];
+
+      // totals
+      let day=0, week=0, total=0, unr=0, trades=0;
+      for (const b of bots) {
+        day += Number(b.realized_day || 0);
+        week += Number(b.realized_week || 0);
+        total += Number(b.realized_total || 0);
+        unr += Number(b.unrealized || 0);
+        trades += Number(b.trades_count || 0);
+      }
+
+      el('c_day').textContent = fmt(day); el('c_day').className = 'v ' + clsPNL(day);
+      el('c_week').textContent = fmt(week); el('c_week').className = 'v ' + clsPNL(week);
+      el('c_total').textContent = fmt(total); el('c_total').className = 'v ' + clsPNL(total);
+      el('c_unr').textContent = fmt(unr); el('c_unr').className = 'v ' + clsPNL(unr);
+      el('c_meta').textContent = `${bots.length} / ${trades}`;
+
+      const ts = data && data.ts ? Number(data.ts) : null;
+      el('updated').textContent = ts ? ('Updated: ' + new Date(ts*1000).toLocaleString()) : 'Updated.';
+      setStatus(`Loaded in ${dt}ms`, true);
+
+      const tbody = el('tbody');
+      tbody.innerHTML = '';
+      if (!bots.length) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td colspan="7" class="sub">No bots with activity yet (no lots/exits recorded).</td>`;
+        tbody.appendChild(tr);
+        return;
+      }
+
+      for (const b of bots) {
+        const opens = Array.isArray(b.open_positions) ? b.open_positions : [];
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td><a href="/dashboard?bot_id=${encodeURIComponent(b.bot_id || '')}${token ? ('&token=' + encodeURIComponent(token)) : ''}">${b.bot_id || ''}</a></td>
+          <td class="${clsPNL(b.realized_day)}">${fmt(b.realized_day)}</td>
+          <td class="${clsPNL(b.realized_week)}">${fmt(b.realized_week)}</td>
+          <td class="${clsPNL(b.realized_total)}">${fmt(b.realized_total)}</td>
+          <td class="${clsPNL(b.unrealized)}">${fmt(b.unrealized)}</td>
+          <td>${b.trades_count ?? 0}</td>
+          <td>${opens.length}</td>
+        `;
+        tbody.appendChild(tr);
+
+        if (opens.length) {
+          const tr2 = document.createElement('tr');
+          const rows = opens.map(p => {
+            const dir = String(p.direction || '');
+            return `<tr>
+              <td>${p.symbol || ''}</td>
+              <td>${dir}</td>
+              <td>${p.qty || ''}</td>
+              <td>${p.weighted_entry || ''}</td>
+              <td>${p.mark_price || ''}</td>
+            </tr>`;
+          }).join('');
+          tr2.innerHTML = `
+            <td colspan="7">
+              <details>
+                <summary>Open positions for ${b.bot_id} (${opens.length})</summary>
+                <div class="tableWrap" style="margin-top:10px;">
+                  <table style="min-width:620px;">
+                    <thead><tr><th>symbol</th><th>direction</th><th>qty</th><th>weighted_entry</th><th>mark_price</th></tr></thead>
+                    <tbody>${rows}</tbody>
+                  </table>
+                </div>
+              </details>
+            </td>
+          `;
+          tbody.appendChild(tr2);
+        }
+      }
+    }
+
+    function setAutoRefresh() {
+      if (timer) { clearInterval(timer); timer = null; }
+      const sec = Number(refreshEl.value || 0);
+      if (sec > 0) timer = setInterval(fetchPnL, sec * 1000);
+    }
+
+    el('load').addEventListener('click', () => { fetchPnL(); });
+    el('save').addEventListener('click', () => { saveToken((tokenEl.value||'').trim()); setStatus('Token saved.', true); });
+    el('clear').addEventListener('click', () => { tokenEl.value=''; clearToken(); setStatus('Token cleared.', true); });
+    refreshEl.addEventListener('change', setAutoRefresh);
+
+    setAutoRefresh();
+    // auto-load once on open
+    fetchPnL();
+  </script>
+</body>
+</html>"""
+
+    return Response(html, mimetype="text/html")
 
 
 @app.route("/webhook", methods=["POST"])
