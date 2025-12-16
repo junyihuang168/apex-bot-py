@@ -4,6 +4,7 @@ import time
 from decimal import Decimal
 from typing import Dict, Tuple, Any, List, Callable, Optional
 
+# ✅ 修改：使用绝对路径，避免不同运行环境找不到文件
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, os.getenv("PNL_DB_PATH", "pnl.sqlite3"))
 
@@ -12,9 +13,6 @@ print(f"[PNL] Database path set to: {DB_PATH}")
 SQLITE_BUSY_TIMEOUT_MS = int(os.getenv("SQLITE_BUSY_TIMEOUT_MS", "5000"))
 SQLITE_WRITE_RETRY = int(os.getenv("SQLITE_WRITE_RETRY", "5"))
 SQLITE_WRITE_RETRY_SLEEP = float(os.getenv("SQLITE_WRITE_RETRY_SLEEP", "0.15"))
-
-# ✅ 迁移覆盖：设置 PNL_MIGRATE_OVERWRITE=1 会 DROP 旧表并重建
-PNL_MIGRATE_OVERWRITE = os.getenv("PNL_MIGRATE_OVERWRITE", "0").lower() in ("1", "true", "yes", "y", "on")
 
 
 def _now() -> int:
@@ -66,21 +64,17 @@ def _write_with_retry(fn: Callable[[sqlite3.Connection], Any]) -> Any:
 
 
 def init_db():
-    conn = _connect()
+    """
+    ✅ 迁移策略：
+    - CREATE TABLE IF NOT EXISTS：补齐缺失表
+    - CREATE INDEX IF NOT EXISTS：补齐索引
+    - 不删除老表/不改老字段，确保“直接迁移覆盖”安全
+    """
     try:
+        conn = _connect()
         cur = conn.cursor()
 
-        if PNL_MIGRATE_OVERWRITE:
-            print("[PNL] PNL_MIGRATE_OVERWRITE=1 -> dropping existing tables...")
-            cur.execute("DROP TABLE IF EXISTS lots")
-            cur.execute("DROP TABLE IF EXISTS exits")
-            cur.execute("DROP TABLE IF EXISTS lock_levels")
-            cur.execute("DROP TABLE IF EXISTS processed_signals")
-            cur.execute("DROP TABLE IF EXISTS orders")
-            cur.execute("DROP TABLE IF EXISTS brackets")
-            cur.execute("DROP TABLE IF EXISTS fills_seen")
-
-        # lots: 每次 entry 一条（WS fill 可多笔 -> 多条 lot）
+        # lots: 每次 entry 一条
         cur.execute("""
         CREATE TABLE IF NOT EXISTS lots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -96,7 +90,7 @@ def init_db():
         )
         """)
 
-        # exits: 每次出场记录（FIFO）
+        # exits: 每次出场记录（可多笔 lot 贡献）
         cur.execute("""
         CREATE TABLE IF NOT EXISTS exits (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -114,7 +108,7 @@ def init_db():
         )
         """)
 
-        # lock levels（你旧逻辑保留，不一定用）
+        # lock levels（保留旧逻辑兼容）
         cur.execute("""
         CREATE TABLE IF NOT EXISTS lock_levels (
             bot_id TEXT NOT NULL,
@@ -126,7 +120,7 @@ def init_db():
         )
         """)
 
-        # processed signals（你旧逻辑保留）
+        # processed_signals：幂等去重（你已有）
         cur.execute("""
         CREATE TABLE IF NOT EXISTS processed_signals (
             bot_id TEXT NOT NULL,
@@ -137,54 +131,35 @@ def init_db():
         )
         """)
 
-        # ✅ NEW: orders 映射（orderId -> bot/意图），用于 WS fill 归因
+        # ✅ NEW：交易所挂 TP/SL 的保护单记录（用于 WS fills 自动记账 + OCO）
         cur.execute("""
-        CREATE TABLE IF NOT EXISTS orders (
-            order_id TEXT PRIMARY KEY,
-            client_order_id TEXT,
+        CREATE TABLE IF NOT EXISTS protective_orders (
             bot_id TEXT NOT NULL,
             symbol TEXT NOT NULL,
-            direction TEXT NOT NULL,      -- LONG/SHORT（仓位方向）
-            entry_side TEXT NOT NULL,     -- BUY/SELL（开仓方向）
-            intent TEXT NOT NULL,         -- ENTRY/EXIT/TP/SL
-            reduce_only INTEGER NOT NULL, -- 0/1
-            ts INTEGER NOT NULL
-        )
-        """)
-
-        # ✅ NEW: brackets（entry 对应的 TP/SL 订单）
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS brackets (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            bot_id TEXT NOT NULL,
-            symbol TEXT NOT NULL,
-            direction TEXT NOT NULL,
-            entry_order_id TEXT,
-            tp_order_id TEXT,
+            direction TEXT NOT NULL,              -- LONG / SHORT
             sl_order_id TEXT,
-            ts INTEGER NOT NULL
-        )
-        """)
-
-        # ✅ NEW: fills_seen（WS fills 去重：fillId 唯一）
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS fills_seen (
-            fill_id TEXT PRIMARY KEY,
-            order_id TEXT,
-            ts INTEGER NOT NULL
+            tp_order_id TEXT,
+            sl_client_id TEXT,
+            tp_client_id TEXT,
+            sl_price TEXT,
+            tp_price TEXT,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            updated_ts INTEGER NOT NULL,
+            PRIMARY KEY (bot_id, symbol, direction)
         )
         """)
 
         cur.execute("CREATE INDEX IF NOT EXISTS idx_lots_bot_symbol ON lots(bot_id, symbol, direction, ts)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_exits_bot_ts ON exits(bot_id, ts)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_ps_bot_ts ON processed_signals(bot_id, ts)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_bot_symbol ON orders(bot_id, symbol, direction, ts)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_brackets_bot_symbol ON brackets(bot_id, symbol, direction, ts)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_po_sl ON protective_orders(sl_order_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_po_tp ON protective_orders(tp_order_id)")
 
         conn.commit()
-        print("[PNL] Database initialized successfully.")
-    finally:
         conn.close()
+        print("[PNL] Database initialized/migrated successfully.")
+    except Exception as e:
+        print(f"[PNL] CRITICAL ERROR initializing database at {DB_PATH}: {e}")
 
 
 def _side_to_direction(entry_side: str) -> str:
@@ -193,7 +168,7 @@ def _side_to_direction(entry_side: str) -> str:
 
 
 # ---------------------------
-# Idempotency helpers（保留你原逻辑）
+# Idempotency helpers
 # ---------------------------
 def is_signal_processed(bot_id: str, signal_id: str) -> bool:
     if not bot_id or not signal_id:
@@ -206,7 +181,8 @@ def is_signal_processed(bot_id: str, signal_id: str) -> bool:
             WHERE bot_id=? AND signal_id=?
             LIMIT 1
         """, (str(bot_id), str(signal_id)))
-        return cur.fetchone() is not None
+        row = cur.fetchone()
+        return row is not None
     finally:
         conn.close()
 
@@ -227,121 +203,7 @@ def mark_signal_processed(bot_id: str, signal_id: str, kind: str = ""):
 
 
 # ---------------------------
-# ✅ WS fill 去重
-# ---------------------------
-def is_fill_seen(fill_id: str) -> bool:
-    if not fill_id:
-        return False
-    conn = _connect()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT 1 FROM fills_seen WHERE fill_id=? LIMIT 1", (str(fill_id),))
-        return cur.fetchone() is not None
-    finally:
-        conn.close()
-
-
-def mark_fill_seen(fill_id: str, order_id: str = ""):
-    if not fill_id:
-        return
-
-    def _w(conn: sqlite3.Connection):
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT OR IGNORE INTO fills_seen (fill_id, order_id, ts)
-            VALUES (?, ?, ?)
-        """, (str(fill_id), str(order_id or ""), _now()))
-        return True
-
-    _write_with_retry(_w)
-
-
-# ---------------------------
-# ✅ orders / brackets 映射
-# ---------------------------
-def record_order_map(
-    order_id: str,
-    client_order_id: str,
-    bot_id: str,
-    symbol: str,
-    direction: str,
-    entry_side: str,
-    intent: str,
-    reduce_only: bool,
-):
-    if not order_id:
-        return
-
-    def _w(conn: sqlite3.Connection):
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT OR REPLACE INTO orders (
-                order_id, client_order_id, bot_id, symbol, direction, entry_side, intent, reduce_only, ts
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            str(order_id),
-            str(client_order_id or ""),
-            str(bot_id),
-            str(symbol),
-            str(direction).upper(),
-            str(entry_side).upper(),
-            str(intent).upper(),
-            1 if reduce_only else 0,
-            _now(),
-        ))
-        return True
-
-    _write_with_retry(_w)
-
-
-def find_order_map(order_id: str) -> Optional[Dict[str, Any]]:
-    if not order_id:
-        return None
-    conn = _connect()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM orders WHERE order_id=? LIMIT 1", (str(order_id),))
-        row = cur.fetchone()
-        return dict(row) if row else None
-    finally:
-        conn.close()
-
-
-def record_bracket(bot_id: str, symbol: str, direction: str, entry_order_id: str, tp_order_id: str, sl_order_id: str):
-    def _w(conn: sqlite3.Connection):
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO brackets (bot_id, symbol, direction, entry_order_id, tp_order_id, sl_order_id, ts)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (
-            str(bot_id), str(symbol), str(direction).upper(),
-            str(entry_order_id or ""), str(tp_order_id or ""), str(sl_order_id or ""),
-            _now()
-        ))
-        return True
-    _write_with_retry(_w)
-
-
-def find_bracket_by_order(order_id: str) -> Optional[Dict[str, Any]]:
-    if not order_id:
-        return None
-    conn = _connect()
-    try:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT * FROM brackets
-            WHERE tp_order_id=? OR sl_order_id=? OR entry_order_id=?
-            ORDER BY id DESC
-            LIMIT 1
-        """, (str(order_id), str(order_id), str(order_id)))
-        row = cur.fetchone()
-        return dict(row) if row else None
-    finally:
-        conn.close()
-
-
-# ---------------------------
-# 记账：entry / exit（你原逻辑，略作封装）
+# Core PnL
 # ---------------------------
 def record_entry(
     bot_id: str,
@@ -349,7 +211,7 @@ def record_entry(
     side: str,
     qty: Decimal,
     price: Decimal,
-    reason: str = "ws_entry_fill",
+    reason: str = "strategy_entry",
 ):
     direction = _side_to_direction(side)
     q = _d(qty)
@@ -379,7 +241,7 @@ def record_exit_fifo(
     entry_side: str,
     exit_qty: Decimal,
     exit_price: Decimal,
-    reason: str = "exchange_exit",
+    reason: str = "strategy_exit",
 ):
     direction = _side_to_direction(entry_side)
     exit_side = "SELL" if direction == "LONG" else "BUY"
@@ -419,6 +281,7 @@ def record_exit_fifo(
 
             take = rem if rem <= remaining_need else remaining_need
 
+            # realized pnl
             if direction == "LONG":
                 pnl = (px_exit - entry_price) * take
             else:
@@ -426,8 +289,13 @@ def record_exit_fifo(
 
             new_rem = rem - take
 
-            cur.execute("UPDATE lots SET remaining_qty=? WHERE id=?", (str(new_rem), lot_id))
+            # update lot remaining
+            cur.execute("""
+                UPDATE lots SET remaining_qty=?
+                WHERE id=?
+            """, (str(new_rem), lot_id))
 
+            # write exit record
             cur.execute("""
                 INSERT INTO exits (
                     bot_id, symbol, direction, entry_side, exit_side,
@@ -448,6 +316,15 @@ def record_exit_fifo(
 
 
 def get_bot_open_positions(bot_id: str) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    """
+    返回：
+    {
+      (symbol, direction): {
+          "qty": Decimal,
+          "weighted_entry": Decimal
+      }
+    }
+    """
     conn = _connect()
     cur = conn.cursor()
 
@@ -468,8 +345,13 @@ def get_bot_open_positions(bot_id: str) -> Dict[Tuple[str, str], Dict[str, Any]]
         direction = r["direction"]
         qty_sum = _d(r["qty_sum"] or "0")
         notional_sum = _d(r["notional_sum"] or "0")
+
         weighted = (notional_sum / qty_sum) if qty_sum > 0 else Decimal("0")
-        out[(symbol, direction)] = {"qty": qty_sum, "weighted_entry": weighted}
+
+        out[(symbol, direction)] = {
+            "qty": qty_sum,
+            "weighted_entry": weighted
+        }
 
     conn.close()
     return out
@@ -478,11 +360,13 @@ def get_bot_open_positions(bot_id: str) -> Dict[Tuple[str, str], Dict[str, Any]]
 def list_bots_with_activity() -> List[str]:
     conn = _connect()
     cur = conn.cursor()
+
     cur.execute("""
         SELECT DISTINCT bot_id FROM lots
         UNION
         SELECT DISTINCT bot_id FROM exits
     """)
+
     bots = sorted([r[0] for r in cur.fetchall() if r[0]])
     conn.close()
     return bots
@@ -525,6 +409,9 @@ def get_bot_summary(bot_id: str) -> Dict[str, Any]:
     return out
 
 
+# ---------------------------
+# Lock level persistence（保留兼容）
+# ---------------------------
 def get_lock_level_pct(bot_id: str, symbol: str, direction: str) -> Decimal:
     conn = _connect()
     cur = conn.cursor()
@@ -568,3 +455,108 @@ def clear_lock_level_pct(bot_id: str, symbol: str, direction: str):
         return True
 
     _write_with_retry(_w)
+
+
+# ---------------------------
+# ✅ Protective Orders (TP/SL) persistence
+# ---------------------------
+def set_protective_orders(
+    bot_id: str,
+    symbol: str,
+    direction: str,
+    sl_order_id: Optional[str],
+    tp_order_id: Optional[str],
+    sl_client_id: Optional[str],
+    tp_client_id: Optional[str],
+    sl_price: Optional[Decimal],
+    tp_price: Optional[Decimal],
+    is_active: bool = True,
+):
+    def _w(conn: sqlite3.Connection):
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO protective_orders (
+                bot_id, symbol, direction,
+                sl_order_id, tp_order_id, sl_client_id, tp_client_id,
+                sl_price, tp_price, is_active, updated_ts
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(bot_id, symbol, direction)
+            DO UPDATE SET
+                sl_order_id=excluded.sl_order_id,
+                tp_order_id=excluded.tp_order_id,
+                sl_client_id=excluded.sl_client_id,
+                tp_client_id=excluded.tp_client_id,
+                sl_price=excluded.sl_price,
+                tp_price=excluded.tp_price,
+                is_active=excluded.is_active,
+                updated_ts=excluded.updated_ts
+        """, (
+            bot_id, symbol, direction.upper(),
+            str(sl_order_id) if sl_order_id else None,
+            str(tp_order_id) if tp_order_id else None,
+            str(sl_client_id) if sl_client_id else None,
+            str(tp_client_id) if tp_client_id else None,
+            str(_d(sl_price)) if sl_price is not None else None,
+            str(_d(tp_price)) if tp_price is not None else None,
+            1 if is_active else 0,
+            _now(),
+        ))
+        return True
+
+    _write_with_retry(_w)
+
+
+def get_protective_orders(bot_id: str, symbol: str, direction: str) -> Dict[str, Any]:
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT * FROM protective_orders
+            WHERE bot_id=? AND symbol=? AND direction=?
+            LIMIT 1
+        """, (bot_id, symbol, direction.upper()))
+        row = cur.fetchone()
+        if not row:
+            return {}
+        return dict(row)
+    finally:
+        conn.close()
+
+
+def clear_protective_orders(bot_id: str, symbol: str, direction: str):
+    def _w(conn: sqlite3.Connection):
+        cur = conn.cursor()
+        cur.execute("""
+            DELETE FROM protective_orders
+            WHERE bot_id=? AND symbol=? AND direction=?
+        """, (bot_id, symbol, direction.upper()))
+        return True
+
+    _write_with_retry(_w)
+
+
+def find_protective_owner_by_order_id(order_id: str) -> Dict[str, Any]:
+    """
+    给 WS fill 用：通过 orderId 找到属于哪个 bot/symbol/direction，以及是 SL 还是 TP
+    """
+    if not order_id:
+        return {}
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT * FROM protective_orders
+            WHERE (sl_order_id=? OR tp_order_id=?)
+              AND is_active=1
+            LIMIT 1
+        """, (str(order_id), str(order_id)))
+        row = cur.fetchone()
+        if not row:
+            return {}
+        d = dict(row)
+        kind = "SL" if d.get("sl_order_id") == str(order_id) else "TP"
+        d["kind"] = kind
+        return d
+    finally:
+        conn.close()
