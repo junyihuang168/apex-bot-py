@@ -29,7 +29,6 @@ from pnl_store import (
     clear_lock_level_pct,
     is_signal_processed,
     mark_signal_processed,
-    # ✅ protective orders
     set_protective_orders,
     get_protective_orders,
     clear_protective_orders,
@@ -41,36 +40,35 @@ app = Flask(__name__)
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "")
 
-# 退出互斥窗口（秒）：防止重复平仓
 EXIT_COOLDOWN_SEC = float(os.getenv("EXIT_COOLDOWN_SEC", "2.0"))
 
-# 远程兜底白名单：只有本地无 lots 且 symbol 在白名单，才允许 remote fallback
 REMOTE_FALLBACK_SYMBOLS = {
     s.strip().upper() for s in os.getenv("REMOTE_FALLBACK_SYMBOLS", "").split(",") if s.strip()
 }
 
-# ✅ 固定止损/止盈（百分比）
 FIXED_SL_PCT = Decimal(os.getenv("FIXED_SL_PCT", "0.5"))  # -0.5%
 FIXED_TP_PCT = Decimal(os.getenv("FIXED_TP_PCT", "1.0"))  # +1.0%
 
-# ✅ 保护单模式：MARKET（默认稳） or LIMIT
 PROTECTIVE_ORDER_MODE = str(os.getenv("PROTECTIVE_ORDER_MODE", "MARKET")).upper().strip()
-PROTECTIVE_SLIPPAGE_PCT = Decimal(os.getenv("PROTECTIVE_SLIPPAGE_PCT", "0.15"))  # LIMIT 模式滑点 0.15%
+PROTECTIVE_SLIPPAGE_PCT = Decimal(os.getenv("PROTECTIVE_SLIPPAGE_PCT", "0.15"))
 
-# ✅ TP/SL 订单有效期（秒时间戳），默认 30 天
 PROTECTIVE_EXPIRE_SEC = int(os.getenv("PROTECTIVE_EXPIRE_SEC", str(30 * 24 * 3600)))
 
-# 本地 cache（仅辅助）
+# ✅ 关键：是否在当前进程启用 WS（让 supervisord 的 web=0 worker=1 生效）
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name, str(default)).strip().lower()
+    return v in ("1", "true", "yes", "y", "on")
+
+ENABLE_WS = _env_bool("ENABLE_WS", True)  # supervisord: web=0 / worker=1
+
 BOT_POSITIONS: Dict[Tuple[str, str], dict] = {}
 
 _MONITOR_THREAD_STARTED = False
 _MONITOR_LOCK = threading.Lock()
 
-# ✅ 退出互斥：bot+symbol 粒度 cooldown
 _EXIT_LOCK = threading.Lock()
 _LAST_EXIT_TS: Dict[Tuple[str, str], float] = {}
 
-# ✅ WS fills 处理线程
 _FILLS_THREAD_STARTED = False
 _FILLS_LOCK = threading.Lock()
 
@@ -110,9 +108,7 @@ def _bot_num(bot_id: str) -> int:
         return 0
 
 
-# ----------------------------
 # ✅ BOT 分组（按你要求）
-# ----------------------------
 LONG_TPSL_BOTS = _parse_bot_list(os.getenv("LONG_TPSL_BOTS", ",".join([f"BOT_{i}" for i in range(1, 11)])))
 SHORT_TPSL_BOTS = _parse_bot_list(os.getenv("SHORT_TPSL_BOTS", ",".join([f"BOT_{i}" for i in range(11, 21)])))
 LONG_PNL_ONLY_BOTS = _parse_bot_list(os.getenv("LONG_PNL_ONLY_BOTS", ",".join([f"BOT_{i}" for i in range(21, 31)])))
@@ -144,81 +140,50 @@ def _exit_guard_allow(bot_id: str, symbol: str) -> bool:
         return True
 
 
-# ----------------------------
-# 预算提取
-# ----------------------------
 def _extract_budget_usdt(body: dict) -> Decimal:
-    size_field = (
-        body.get("position_size_usdt")
-        or body.get("size_usdt")
-        or body.get("size")
-    )
+    size_field = body.get("position_size_usdt") or body.get("size_usdt") or body.get("size")
     if size_field is None:
         raise ValueError("missing position_size_usdt / size_usdt / size")
-
     budget = Decimal(str(size_field))
     if budget <= 0:
         raise ValueError("size_usdt must be > 0")
     return budget
 
 
-# ----------------------------
-# 预算 -> snapped qty
-# ----------------------------
 def _compute_entry_qty(symbol: str, side: str, budget: Decimal) -> Decimal:
     rules = _get_symbol_rules(symbol)
     min_qty = rules["min_qty"]
-
     ref_price_dec = Decimal(get_market_price(symbol, side, str(min_qty)))
     theoretical_qty = budget / ref_price_dec
     snapped_qty = _snap_quantity(symbol, theoretical_qty)
-
     if snapped_qty <= 0:
         raise ValueError(f"snapped_qty <= 0, symbol={symbol}, budget={budget}")
-
     return snapped_qty
 
 
 def _order_status_and_reason(order: dict):
     data = (order or {}).get("data", {}) or {}
     status = str(data.get("status", "")).upper()
-    cancel_reason = str(
-        data.get("cancelReason")
-        or data.get("rejectReason")
-        or data.get("errorMessage")
-        or ""
-    )
+    cancel_reason = str(data.get("cancelReason") or data.get("rejectReason") or data.get("errorMessage") or "")
     return status, cancel_reason
 
 
-# ----------------------------
-# 幂等 Signal ID（webhook）
-# ----------------------------
 def _get_signal_id(body: dict, mode: str, bot_id: str, symbol: str) -> str:
     for k in ("signal_id", "alert_id", "id", "tv_id", "client_id"):
         v = body.get(k)
         if v:
             return f"{mode}:{bot_id}:{symbol}:{str(v)}"
-
     ts = body.get("ts") or body.get("time") or int(time.time())
     try:
         ts_int = int(float(str(ts)))
     except Exception:
         ts_int = int(time.time())
-
     sig = str(body.get("signal_type") or body.get("action") or "").lower().strip()
     side = str(body.get("side") or "").upper().strip()
-
     return f"{mode}:{bot_id}:{symbol}:{sig}:{side}:{ts_int}"
 
 
-# ----------------------------
-# ✅ 交易所 TP/SL（固定百分比）下单
-# ----------------------------
 def _compute_fixed_bracket_prices(direction: str, entry_price: Decimal) -> Tuple[Decimal, Decimal]:
-    """
-    return (sl_trigger, tp_trigger)
-    """
     if entry_price <= 0:
         return Decimal("0"), Decimal("0")
 
@@ -236,17 +201,8 @@ def _compute_fixed_bracket_prices(direction: str, entry_price: Decimal) -> Tuple
 
 
 def _apply_limit_slippage(direction: str, trigger: Decimal) -> Decimal:
-    """
-    LIMIT 模式：给“更差一点”的限价，提升成交概率。
-    LONG 平仓 SELL：更低一点
-    SHORT 平仓 BUY：更高一点
-    """
     slip = (PROTECTIVE_SLIPPAGE_PCT / Decimal("100"))
-    d = direction.upper()
-    if d == "LONG":
-        return trigger * (Decimal("1") - slip)
-    else:
-        return trigger * (Decimal("1") + slip)
+    return trigger * (Decimal("1") - slip) if direction.upper() == "LONG" else trigger * (Decimal("1") + slip)
 
 
 def _cancel_existing_brackets(bot_id: str, symbol: str, direction: str):
@@ -272,11 +228,6 @@ def _cancel_existing_brackets(bot_id: str, symbol: str, direction: str):
 
 
 def _place_fixed_brackets(bot_id: str, symbol: str, direction: str, qty: Decimal, entry_price: Decimal):
-    """
-    BOT_1-20 才会走这里：
-    - 下 SL & TP（reduceOnly=True）
-    - 记录到 DB protective_orders，供 WS fills 自动记账 + OCO
-    """
     bot_id = _canon_bot_id(bot_id)
     symbol = str(symbol).upper().strip()
     direction = direction.upper()
@@ -284,7 +235,6 @@ def _place_fixed_brackets(bot_id: str, symbol: str, direction: str, qty: Decimal
     if qty <= 0 or entry_price <= 0:
         return
 
-    # 先取消旧的（避免重复挂单）
     _cancel_existing_brackets(bot_id, symbol, direction)
 
     sl_trigger, tp_trigger = _compute_fixed_bracket_prices(direction, entry_price)
@@ -311,53 +261,35 @@ def _place_fixed_brackets(bot_id: str, symbol: str, direction: str, qty: Decimal
     tp_client = f"{bnum:03d}{ts}02"
 
     sl_res = create_trigger_order(
-        symbol=symbol,
-        side=exit_side,
-        order_type=sl_type,
-        size=str(qty),
-        trigger_price=str(sl_trigger),
+        symbol=symbol, side=exit_side, order_type=sl_type,
+        size=str(qty), trigger_price=str(sl_trigger),
         price=str(sl_price) if sl_price is not None else None,
-        reduce_only=True,
-        client_id=sl_client,
-        expiration_sec=expiration,
+        reduce_only=True, client_id=sl_client, expiration_sec=expiration,
     )
     tp_res = create_trigger_order(
-        symbol=symbol,
-        side=exit_side,
-        order_type=tp_type,
-        size=str(qty),
-        trigger_price=str(tp_trigger),
+        symbol=symbol, side=exit_side, order_type=tp_type,
+        size=str(qty), trigger_price=str(tp_trigger),
         price=str(tp_price) if tp_price is not None else None,
-        reduce_only=True,
-        client_id=tp_client,
-        expiration_sec=expiration,
+        reduce_only=True, client_id=tp_client, expiration_sec=expiration,
     )
 
     sl_oid = sl_res.get("order_id")
     tp_oid = tp_res.get("order_id")
 
     set_protective_orders(
-        bot_id=bot_id,
-        symbol=symbol,
-        direction=direction,
+        bot_id=bot_id, symbol=symbol, direction=direction,
         sl_order_id=str(sl_oid) if sl_oid else None,
         tp_order_id=str(tp_oid) if tp_oid else None,
         sl_client_id=sl_res.get("client_order_id") or sl_client,
         tp_client_id=tp_res.get("client_order_id") or tp_client,
-        sl_price=sl_trigger,
-        tp_price=tp_trigger,
+        sl_price=sl_trigger, tp_price=tp_trigger,
         is_active=True,
     )
 
-    print(
-        f"[BRACKET] set bot={bot_id} {direction} {symbol} qty={qty} entry={entry_price} "
-        f"SL({sl_type}) trigger={sl_trigger} oid={sl_oid} | TP({tp_type}) trigger={tp_trigger} oid={tp_oid}"
-    )
+    print(f"[BRACKET] set bot={bot_id} {direction} {symbol} qty={qty} entry={entry_price} "
+          f"SL({sl_type}) trigger={sl_trigger} oid={sl_oid} | TP({tp_type}) trigger={tp_trigger} oid={tp_oid}")
 
 
-# ----------------------------
-# ✅ WS fills -> 自动记账 + OCO
-# ----------------------------
 def _fills_loop():
     print("[WS-FILLS] loop started")
     while True:
@@ -396,12 +328,8 @@ def _fills_loop():
             entry_side = "BUY" if direction == "LONG" else "SELL"
 
             record_exit_fifo(
-                bot_id=bot_id,
-                symbol=symbol,
-                entry_side=entry_side,
-                exit_qty=dq,
-                exit_price=dp,
-                reason=f"exchange_{kind.lower()}_fill",
+                bot_id=bot_id, symbol=symbol, entry_side=entry_side,
+                exit_qty=dq, exit_price=dp, reason=f"exchange_{kind.lower()}_fill",
             )
 
             opens = get_bot_open_positions(bot_id)
@@ -435,10 +363,8 @@ def _fills_loop():
 
                 print(f"[WS-FILLS] position closed by {kind}. bot={bot_id} {direction} {symbol} now flat. OCO done.")
             else:
-                print(
-                    f"[WS-FILLS] partial {kind} fill bot={bot_id} {direction} {symbol} "
-                    f"fill_qty={dq} fill_px={dp} remaining={remaining}"
-                )
+                print(f"[WS-FILLS] partial {kind} fill bot={bot_id} {direction} {symbol} "
+                      f"fill_qty={dq} fill_px={dp} remaining={remaining}")
 
         except Exception as e:
             print("[WS-FILLS] error:", e)
@@ -463,11 +389,16 @@ def _ensure_monitor_thread():
 
         init_db()
 
-        start_private_ws()
-        _ensure_ws_fills_thread()
+        # ✅ 关键：只有 ENABLE_WS=1 的进程才启动 WS 与 fills loop
+        if ENABLE_WS:
+            print("[SYSTEM] ENABLE_WS=1 -> starting private WS + fills thread")
+            start_private_ws()
+            _ensure_ws_fills_thread()
+        else:
+            print("[SYSTEM] ENABLE_WS=0 -> WS disabled in this process (web only)")
 
         _MONITOR_THREAD_STARTED = True
-        print("[SYSTEM] monitor/ws threads ready")
+        print("[SYSTEM] monitor ready")
 
 
 @app.route("/", methods=["GET"])
@@ -513,10 +444,7 @@ def api_pnl():
             except Exception:
                 continue
 
-            if direction.upper() == "LONG":
-                unrealized += (px - wentry) * qty
-            else:
-                unrealized += (wentry - px) * qty
+            unrealized += (px - wentry) * qty if direction.upper() == "LONG" else (wentry - px) * qty
 
             open_rows.append({
                 "symbol": str(symbol).upper(),
@@ -526,10 +454,7 @@ def api_pnl():
                 "mark_price": str(px),
             })
 
-        base.update({
-            "unrealized": str(unrealized),
-            "open_positions": open_rows,
-        })
+        base.update({"unrealized": str(unrealized), "open_positions": open_rows})
         out.append(base)
 
     def _rt(x):
@@ -546,10 +471,7 @@ def api_pnl():
 def dashboard():
     if not _require_token():
         return Response("Forbidden", status=403)
-
     _ensure_monitor_thread()
-
-    # 这里保持你原来的 dashboard HTML（略），你可直接保留你贴的那份
     return Response("OK", mimetype="text/plain")
 
 
@@ -564,7 +486,6 @@ def tv_webhook():
         return "invalid json", 400
 
     print("[WEBHOOK] raw body:", body)
-
     if not isinstance(body, dict):
         return "bad payload", 400
 
@@ -603,9 +524,7 @@ def tv_webhook():
         return jsonify({"status": "dedup", "mode": mode, "bot_id": bot_id, "symbol": symbol, "signal_id": sig_id}), 200
     mark_signal_processed(bot_id, sig_id, kind=f"webhook_{mode}")
 
-    # -------------------------
     # ENTRY
-    # -------------------------
     if mode == "entry":
         expected = _bot_expected_entry_side(bot_id)
         if expected is not None:
@@ -640,11 +559,8 @@ def tv_webhook():
 
         try:
             order = create_market_order(
-                symbol=symbol,
-                side=side_raw,
-                size=size_str,
-                reduce_only=False,
-                client_id=tv_client_id,
+                symbol=symbol, side=side_raw, size=size_str,
+                reduce_only=False, client_id=tv_client_id,
             )
         except Exception as e:
             print("[ENTRY] create_market_order error:", e)
@@ -700,17 +616,13 @@ def tv_webhook():
         if entry_price_dec is not None and final_qty > 0:
             try:
                 record_entry(
-                    bot_id=bot_id,
-                    symbol=symbol,
-                    side=side_raw,
-                    qty=final_qty,
-                    price=entry_price_dec,
+                    bot_id=bot_id, symbol=symbol, side=side_raw,
+                    qty=final_qty, price=entry_price_dec,
                     reason="strategy_entry_fill" if order_id else "strategy_entry",
                 )
             except Exception as e:
                 print("[PNL] record_entry error:", e)
 
-        # ✅ BOT_1-20：挂交易所 TP/SL（reduceOnly=True）
         if _bot_has_exchange_brackets(bot_id) and entry_price_dec is not None and final_qty > 0:
             direction = "LONG" if side_raw == "BUY" else "SHORT"
             try:
@@ -733,9 +645,7 @@ def tv_webhook():
             "signal_id": sig_id,
         }), 200
 
-    # -------------------------
-    # EXIT（策略出场 / TV 出场）
-    # -------------------------
+    # EXIT
     if mode == "exit":
         if not _exit_guard_allow(bot_id, symbol):
             print(f"[EXIT] SKIP (cooldown) bot={bot_id} symbol={symbol} sig={sig_id}")
@@ -777,7 +687,6 @@ def tv_webhook():
             else:
                 return jsonify({"status": "no_position"}), 200
 
-        # ✅ 手动/TV exit：先取消交易所挂的 TP/SL
         try:
             _cancel_existing_brackets(bot_id, symbol, direction_to_close)
         except Exception:
@@ -788,11 +697,8 @@ def tv_webhook():
 
         try:
             order = create_market_order(
-                symbol=symbol,
-                side=exit_side,
-                size=str(qty_to_close),
-                reduce_only=True,
-                client_id=tv_client_id,
+                symbol=symbol, side=exit_side, size=str(qty_to_close),
+                reduce_only=True, client_id=tv_client_id,
             )
         except Exception as e:
             print("[EXIT] create_market_order error:", e)
@@ -824,12 +730,8 @@ def tv_webhook():
 
         try:
             record_exit_fifo(
-                bot_id=bot_id,
-                symbol=symbol,
-                entry_side=entry_side,
-                exit_qty=qty_to_close,
-                exit_price=exit_price,
-                reason="strategy_exit",
+                bot_id=bot_id, symbol=symbol, entry_side=entry_side,
+                exit_qty=qty_to_close, exit_price=exit_price, reason="strategy_exit",
             )
         except Exception as e:
             print("[PNL] record_exit_fifo error (strategy):", e)
