@@ -1,8 +1,8 @@
 import os
 import sqlite3
 import time
-from decimal import Decimal, ROUND_DOWN
-from typing import Dict, Tuple, Any, List, Optional, Callable
+from decimal import Decimal
+from typing import Dict, Tuple, Any, List, Callable, Optional
 
 # ✅ 修改：使用绝对路径，避免不同运行环境找不到文件
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -28,18 +28,14 @@ def _d(x) -> Decimal:
 
 
 def _connect():
-    # timeout + busy_timeout reduce "database is locked" under multi-thread writes
     conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=max(1, SQLITE_BUSY_TIMEOUT_MS // 1000))
     conn.row_factory = sqlite3.Row
-
-    # PRAGMAs for concurrency stability
     try:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
         conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS};")
     except Exception:
         pass
-
     return conn
 
 
@@ -68,6 +64,12 @@ def _write_with_retry(fn: Callable[[sqlite3.Connection], Any]) -> Any:
 
 
 def init_db():
+    """
+    ✅ 迁移策略：
+    - CREATE TABLE IF NOT EXISTS：补齐缺失表
+    - CREATE INDEX IF NOT EXISTS：补齐索引
+    - 不删除老表/不改老字段，确保“直接迁移覆盖”安全
+    """
     try:
         conn = _connect()
         cur = conn.cursor()
@@ -106,7 +108,7 @@ def init_db():
         )
         """)
 
-        # lock levels
+        # lock levels（保留旧逻辑兼容）
         cur.execute("""
         CREATE TABLE IF NOT EXISTS lock_levels (
             bot_id TEXT NOT NULL,
@@ -118,7 +120,7 @@ def init_db():
         )
         """)
 
-        # ✅ NEW: processed signals for idempotency
+        # processed_signals：幂等去重（你已有）
         cur.execute("""
         CREATE TABLE IF NOT EXISTS processed_signals (
             bot_id TEXT NOT NULL,
@@ -129,13 +131,33 @@ def init_db():
         )
         """)
 
+        # ✅ NEW：交易所挂 TP/SL 的保护单记录（用于 WS fills 自动记账 + OCO）
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS protective_orders (
+            bot_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            direction TEXT NOT NULL,              -- LONG / SHORT
+            sl_order_id TEXT,
+            tp_order_id TEXT,
+            sl_client_id TEXT,
+            tp_client_id TEXT,
+            sl_price TEXT,
+            tp_price TEXT,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            updated_ts INTEGER NOT NULL,
+            PRIMARY KEY (bot_id, symbol, direction)
+        )
+        """)
+
         cur.execute("CREATE INDEX IF NOT EXISTS idx_lots_bot_symbol ON lots(bot_id, symbol, direction, ts)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_exits_bot_ts ON exits(bot_id, ts)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_ps_bot_ts ON processed_signals(bot_id, ts)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_po_sl ON protective_orders(sl_order_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_po_tp ON protective_orders(tp_order_id)")
 
         conn.commit()
         conn.close()
-        print("[PNL] Database initialized successfully.")
+        print("[PNL] Database initialized/migrated successfully.")
     except Exception as e:
         print(f"[PNL] CRITICAL ERROR initializing database at {DB_PATH}: {e}")
 
@@ -180,6 +202,9 @@ def mark_signal_processed(bot_id: str, signal_id: str, kind: str = ""):
     _write_with_retry(_w)
 
 
+# ---------------------------
+# Core PnL
+# ---------------------------
 def record_entry(
     bot_id: str,
     symbol: str,
@@ -321,10 +346,7 @@ def get_bot_open_positions(bot_id: str) -> Dict[Tuple[str, str], Dict[str, Any]]
         qty_sum = _d(r["qty_sum"] or "0")
         notional_sum = _d(r["notional_sum"] or "0")
 
-        if qty_sum > 0:
-            weighted = (notional_sum / qty_sum)
-        else:
-            weighted = Decimal("0")
+        weighted = (notional_sum / qty_sum) if qty_sum > 0 else Decimal("0")
 
         out[(symbol, direction)] = {
             "qty": qty_sum,
@@ -388,7 +410,7 @@ def get_bot_summary(bot_id: str) -> Dict[str, Any]:
 
 
 # ---------------------------
-# Lock level persistence
+# Lock level persistence（保留兼容）
 # ---------------------------
 def get_lock_level_pct(bot_id: str, symbol: str, direction: str) -> Decimal:
     conn = _connect()
@@ -433,3 +455,108 @@ def clear_lock_level_pct(bot_id: str, symbol: str, direction: str):
         return True
 
     _write_with_retry(_w)
+
+
+# ---------------------------
+# ✅ Protective Orders (TP/SL) persistence
+# ---------------------------
+def set_protective_orders(
+    bot_id: str,
+    symbol: str,
+    direction: str,
+    sl_order_id: Optional[str],
+    tp_order_id: Optional[str],
+    sl_client_id: Optional[str],
+    tp_client_id: Optional[str],
+    sl_price: Optional[Decimal],
+    tp_price: Optional[Decimal],
+    is_active: bool = True,
+):
+    def _w(conn: sqlite3.Connection):
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO protective_orders (
+                bot_id, symbol, direction,
+                sl_order_id, tp_order_id, sl_client_id, tp_client_id,
+                sl_price, tp_price, is_active, updated_ts
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(bot_id, symbol, direction)
+            DO UPDATE SET
+                sl_order_id=excluded.sl_order_id,
+                tp_order_id=excluded.tp_order_id,
+                sl_client_id=excluded.sl_client_id,
+                tp_client_id=excluded.tp_client_id,
+                sl_price=excluded.sl_price,
+                tp_price=excluded.tp_price,
+                is_active=excluded.is_active,
+                updated_ts=excluded.updated_ts
+        """, (
+            bot_id, symbol, direction.upper(),
+            str(sl_order_id) if sl_order_id else None,
+            str(tp_order_id) if tp_order_id else None,
+            str(sl_client_id) if sl_client_id else None,
+            str(tp_client_id) if tp_client_id else None,
+            str(_d(sl_price)) if sl_price is not None else None,
+            str(_d(tp_price)) if tp_price is not None else None,
+            1 if is_active else 0,
+            _now(),
+        ))
+        return True
+
+    _write_with_retry(_w)
+
+
+def get_protective_orders(bot_id: str, symbol: str, direction: str) -> Dict[str, Any]:
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT * FROM protective_orders
+            WHERE bot_id=? AND symbol=? AND direction=?
+            LIMIT 1
+        """, (bot_id, symbol, direction.upper()))
+        row = cur.fetchone()
+        if not row:
+            return {}
+        return dict(row)
+    finally:
+        conn.close()
+
+
+def clear_protective_orders(bot_id: str, symbol: str, direction: str):
+    def _w(conn: sqlite3.Connection):
+        cur = conn.cursor()
+        cur.execute("""
+            DELETE FROM protective_orders
+            WHERE bot_id=? AND symbol=? AND direction=?
+        """, (bot_id, symbol, direction.upper()))
+        return True
+
+    _write_with_retry(_w)
+
+
+def find_protective_owner_by_order_id(order_id: str) -> Dict[str, Any]:
+    """
+    给 WS fill 用：通过 orderId 找到属于哪个 bot/symbol/direction，以及是 SL 还是 TP
+    """
+    if not order_id:
+        return {}
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT * FROM protective_orders
+            WHERE (sl_order_id=? OR tp_order_id=?)
+              AND is_active=1
+            LIMIT 1
+        """, (str(order_id), str(order_id)))
+        row = cur.fetchone()
+        if not row:
+            return {}
+        d = dict(row)
+        kind = "SL" if d.get("sl_order_id") == str(order_id) else "TP"
+        d["kind"] = kind
+        return d
+    finally:
+        conn.close()
