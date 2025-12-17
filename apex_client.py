@@ -505,13 +505,19 @@ def _extract_fill_like_from_message(message: Any, source: str) -> None:
 
 def start_private_ws():
     """
-    Start private WS listeners (idempotent).
+    Start ONE private WS connection (idempotent).
 
-    To maximize fill capture reliability, we subscribe to multiple private streams when available
-    (account / orders / trades / positions) and parse messages generically to extract fills.
+    Goal:
+      - Capture real fills reliably (avg fill, filled qty) for PnL + protective orders.
+      - Avoid subscribing to *public* market-data streams (depth/ticker/klines/trade) that require
+        symbol/limit/interval parameters and will spam errors like:
+          WebSocket.depth_stream() missing required positional arguments...
 
-    IMPORTANT:
-    Run WS in exactly ONE process (set ENABLE_WS=1 only in that process).
+    Approach:
+      - Create a single WebSocket client in ONE process (ENABLE_WS=1 only there).
+      - Discover and subscribe ONLY to private/account/order/fill/position streams whose signatures
+        can be called with either no args or a single callback arg.
+      - Parse every incoming message generically via _extract_fill_like_from_message().
     """
     global _WS_STARTED
     with _WS_LOCK:
@@ -530,72 +536,132 @@ def start_private_ws():
 
     api_creds = _get_api_credentials()
 
-    candidates = [
-        "account_info_stream_v3",
-        "account_stream_v3",
-        "fills_stream_v3",
-        "fill_stream_v3",
-        "execution_stream_v3",
-        "order_stream_v3",
-        "orders_stream_v3",
-        "order_update_stream_v3",
-        "order_updates_stream_v3",
-        "trade_stream_v3",
-        "trades_stream_v3",
-        "position_stream_v3",
-        "positions_stream_v3",
-    ]
+    def _handle_any(message: dict, source: str):
+        try:
+            _extract_fill_like_from_message(message, source=source)
+        except Exception as e:
+            print(f"[apex_client][WS] handler error source={source}: {e}")
 
-    # Discover additional *stream* methods (safe)
-    try:
-        tmp = WebSocket(endpoint=endpoint, api_key_credentials=api_creds)
-        for name in dir(tmp):
-            if "stream" in name and callable(getattr(tmp, name, None)):
-                if name not in candidates:
-                    candidates.append(name)
-    except Exception:
-        pass
+    def _discover_private_streams(ws_client) -> list:
+        names = []
+        good = ("account", "order", "fill", "position", "execution", "user")
+        bad = ("depth", "ticker", "kline", "klines", "orderbook", "public", "unsub", "sub_", "topic", "custom")
+        for name in dir(ws_client):
+            low = name.lower()
+            if "stream" not in low:
+                continue
+            fn = getattr(ws_client, name, None)
+            if not callable(fn):
+                continue
+            if any(k in low for k in bad):
+                continue
+            if not any(k in low for k in good):
+                continue
 
-    # Deduplicate while preserving order
-    seen = set()
-    candidates = [c for c in candidates if not (c in seen or seen.add(c))]
+            # Signature safety: we only call stream methods that can be invoked with:
+            #   - no args, OR
+            #   - one positional arg (the callback)
+            try:
+                sig = inspect.signature(fn)
+                params = [p for p in sig.parameters.values() if p.name != "self"]
+                required_pos = [
+                    p for p in params
+                    if p.default is p.empty and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+                ]
+                if len(required_pos) == 0:
+                    pass
+                elif len(required_pos) == 1:
+                    # Reject streams that require symbol/limit/etc even if only one param
+                    if required_pos[0].name in ("symbol", "limit", "interval", "arg", "wss_url"):
+                        continue
+                else:
+                    continue
+            except Exception:
+                continue
 
-    def _run_stream(stream_name: str):
+            names.append(name)
+
+        preferred = [
+            "account_info_stream_v3",
+            "fills_stream_v3",
+            "orders_stream_v3",
+            "order_stream_v3",
+            "positions_stream_v3",
+            "position_stream_v3",
+            "account_stream_v3",
+        ]
+        ordered = []
+        for p in preferred:
+            if p in names:
+                ordered.append(p)
+        for n in names:
+            if n not in ordered:
+                ordered.append(n)
+        return ordered
+
+    def _run_forever():
         backoff = 1.0
         while True:
             try:
                 ws_client = WebSocket(endpoint=endpoint, api_key_credentials=api_creds)
-                if not hasattr(ws_client, stream_name):
-                    return
-                fn = getattr(ws_client, stream_name)
 
-                def _cb(msg: dict, _src=stream_name):
+                streams = _discover_private_streams(ws_client)
+                if not streams and hasattr(ws_client, "account_info_stream_v3"):
+                    streams = ["account_info_stream_v3"]
+
+                print(f"[apex_client][WS] subscribing private streams: {streams}")
+
+                def _make_cb(src: str):
+                    def _cb(*args, **kwargs):
+                        msg = None
+                        # WS SDKs vary: callback(message) or callback(ws, message).
+                        for a in reversed(args):
+                            if isinstance(a, dict):
+                                msg = a
+                                break
+                        if msg is None and isinstance(kwargs.get('message'), dict):
+                            msg = kwargs.get('message')
+                        if msg is not None:
+                            _handle_any(msg, source=src)
+                    return _cb
+
+
+                for stream_name in streams:
+                    fn = getattr(ws_client, stream_name, None)
+                    if not callable(fn):
+                        continue
+
+                    cb = _make_cb(stream_name)
+
                     try:
-                        _extract_fill_like_from_message(msg, source=_src)
+                        sig = inspect.signature(fn)
+                        params = [p for p in sig.parameters.values() if p.name != "self"]
+                        required_pos = [
+                            p for p in params
+                            if p.default is p.empty and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+                        ]
+                        if len(required_pos) == 0:
+                            fn()
+                        else:
+                            fn(cb)
+
+                        print(f"[apex_client][WS] subscribed {stream_name}")
+                    except TypeError as te:
+                        # This is usually a signature mismatch (e.g., required symbol/limit). Skip quietly.
+                        print(f"[apex_client][WS] skip {stream_name} (signature mismatch): {te}")
                     except Exception as e:
-                        print(f"[apex_client][WS] callback error in {_src}: {e}")
+                        print(f"[apex_client][WS] subscribe {stream_name} failed: {e}")
 
-                fn(_cb)
-                print(f"[apex_client][WS] subscribed {stream_name}")
                 backoff = 1.0
-
                 while True:
-                    try:
-                        if hasattr(ws_client, "ping"):
-                            ws_client.ping()
-                    except Exception:
-                        raise
-                    time.sleep(15)
+                    time.sleep(10.0)
 
             except Exception as e:
-                print(f"[apex_client][WS] {stream_name} reconnect after error: {e} (sleep {backoff}s)")
+                print(f"[apex_client][WS] reconnect after error: {e} (sleep {backoff:.1f}s)")
                 time.sleep(backoff)
-                backoff = min(backoff * 2.0, 30.0)
+                backoff = min(backoff * 2, 30.0)
 
-    for name in candidates:
-        threading.Thread(target=_run_stream, args=(name,), daemon=True, name=f"apex-ws-{name}").start()
-
-    print(f"[apex_client][WS] started {len(candidates)} stream listener threads (candidate methods)")
+    threading.Thread(target=_run_forever, daemon=True).start()
 def pop_fill_event(timeout: float = 0.5) -> Optional[dict]:
     try:
         return _FILL_Q.get(timeout=timeout)
