@@ -373,11 +373,14 @@ def _extract_order_ids(raw_order: Any) -> Tuple[Optional[str], Optional[str]]:
 # ------------------------------------------------------------
 # ✅ Private WS: account_info_stream_v3 -> fills push
 # ------------------------------------------------------------
+
 def start_private_ws():
     """
-    启动一次即可：
-    - 订阅 account_info_stream_v3
-    - 将 fills 推入队列 _FILL_Q
+    Start ONE private WS connection (idempotent).
+
+    It subscribes to account_info_stream_v3 and captures fills into:
+      - _WS_FILL_AGG (orderId -> aggregated qty/notional/avg)
+      - _FILL_Q (raw fill events for app.py to consume)
     """
     global _WS_STARTED
     with _WS_LOCK:
@@ -398,9 +401,13 @@ def start_private_ws():
 
     def handle_account(message: dict):
         try:
-            contents = message.get("contents") if isinstance(message, dict) else None
+            if not isinstance(message, dict):
+                return
+
+            contents = message.get("contents")
             if not isinstance(contents, dict):
                 return
+
             fills = contents.get("fills")
             if not isinstance(fills, list) or not fills:
                 return
@@ -409,7 +416,7 @@ def start_private_ws():
                 if not isinstance(f, dict):
                     continue
 
-                order_id = str(f.get("orderId") or "")
+                order_id = str(f.get("orderId") or f.get("id") or "")
                 px = f.get("price")
                 sz = f.get("size")
 
@@ -419,22 +426,27 @@ def start_private_ws():
                 try:
                     dq = Decimal(str(sz))
                     dp = Decimal(str(px))
-                    if dq <= 0 or dp <= 0:
-                        continue
                 except Exception:
                     continue
 
-                # aggregate avg by order_id
-                agg = _WS_FILL_AGG.get(order_id) or {"qty": Decimal("0"), "notional": Decimal("0"), "avg": None, "ts": 0.0}
+                if dq <= 0 or dp <= 0:
+                    continue
+
+                agg = _WS_FILL_AGG.get(order_id) or {
+                    "qty": Decimal("0"),
+                    "notional": Decimal("0"),
+                    "avg": None,
+                    "ts": 0.0,
+                }
                 agg["qty"] = Decimal(str(agg["qty"])) + dq
-                agg["notional"] = Decimal(str(agg["notional"])) + dq * dp
+                agg["notional"] = Decimal(str(agg["notional"])) + (dq * dp)
                 agg["avg"] = (agg["notional"] / agg["qty"]) if agg["qty"] > 0 else None
                 agg["ts"] = time.time()
                 _WS_FILL_AGG[order_id] = agg
 
-                # also push raw fill event for consumers (e.g., protective orders)
+                # push a single normalized event (avoid double-enqueue)
                 try:
-                    _FILL_Q.put({
+                    _FILL_Q.put_nowait({
                         "type": "fill",
                         "order_id": order_id,
                         "price": str(dp),
@@ -445,45 +457,37 @@ def start_private_ws():
                 except Exception:
                     pass
 
-                # push event (non-blocking)
-                evt = dict(f)
-                evt["_ts_recv"] = time.time()
-                try:
-                    _FILL_Q.put_nowait(evt)
-                except Exception:
-                    pass
-
         except Exception as e:
             print("[apex_client][WS] handle_account error:", e)
 
-def _run():
-    # Keep a single WS connection alive and automatically reconnect on errors.
-    backoff = 1.0
-    while True:
-        try:
-            ws_client = WebSocket(
-                endpoint=endpoint,
-                api_key_credentials=api_creds,
-            )
-            ws_client.account_info_stream_v3(handle_account)
-            print("[apex_client][WS] subscribed account_info_stream_v3 (ws_zk_accounts_v3)")
+    def _run_forever():
+        backoff = 1.0
+        while True:
+            try:
+                ws_client = WebSocket(
+                    endpoint=endpoint,
+                    api_key_credentials=api_creds,
+                )
+                # This call is expected to register the callback and keep the socket running.
+                ws_client.account_info_stream_v3(handle_account)
+                print("[apex_client][WS] subscribed account_info_stream_v3")
 
-            backoff = 1.0
-            while True:
-                # Best-practice keepalive: ping every ~15s if the SDK exposes it.
-                try:
-                    if hasattr(ws_client, "ping"):
-                        ws_client.ping()
-                except Exception:
-                    # If ping fails, force reconnect.
-                    raise
-                time.sleep(15)
-        except Exception as e:
-            print(f"[apex_client][WS] reconnecting after error: {e} (sleep {backoff}s)")
-            time.sleep(backoff)
-            backoff = min(backoff * 2.0, 30.0)
+                backoff = 1.0
+                # Keepalive loop (ping if available; otherwise sleep).
+                while True:
+                    try:
+                        if hasattr(ws_client, "ping"):
+                            ws_client.ping()
+                    except Exception:
+                        raise
+                    time.sleep(15)
 
-    t = threading.Thread(target=_run, daemon=True)
+            except Exception as e:
+                print(f"[apex_client][WS] reconnecting after error: {e} (sleep {backoff}s)")
+                time.sleep(backoff)
+                backoff = min(backoff * 2.0, 30.0)
+
+    t = threading.Thread(target=_run_forever, daemon=True, name="apex-private-ws")
     t.start()
     print("[apex_client][WS] started account_info_stream_v3")
 
