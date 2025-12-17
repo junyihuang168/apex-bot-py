@@ -56,6 +56,8 @@ _WS_LOCK = threading.Lock()
 _WS_FILL_AGG: Dict[str, Dict[str, Any]] = {}
 # orderId -> clientOrderId
 _ORDER_ID_TO_CLIENT_ID: Dict[str, str] = {}
+# clientOrderId -> orderId
+_CLIENT_ID_TO_ORDER_ID: Dict[str, str] = {}
 
 
 def _get_symbol_rules(symbol: str) -> Dict[str, Any]:
@@ -371,16 +373,145 @@ def _extract_order_ids(raw_order: Any) -> Tuple[Optional[str], Optional[str]]:
 
 
 # ------------------------------------------------------------
-# ✅ Private WS: account_info_stream_v3 -> fills push
+# ✅ Private WS: subscribe streams -> fills/orders/trades/positions
 # ------------------------------------------------------------
+
+def _normalize_fill_event(fill: dict, source: str = "ws") -> Optional[dict]:
+    """Best-effort normalize various WS payload shapes into a fill-like event."""
+    if not isinstance(fill, dict):
+        return None
+
+    order_id = fill.get("orderId") or fill.get("order_id") or fill.get("id") or fill.get("orderID")
+    client_oid = fill.get("clientOrderId") or fill.get("clientId") or fill.get("client_order_id")
+    symbol = fill.get("symbol") or fill.get("market") or fill.get("instrument") or fill.get("pair")
+
+    price = fill.get("price") or fill.get("fillPrice") or fill.get("avgPrice") or fill.get("averagePrice")
+    size = fill.get("size") or fill.get("qty") or fill.get("filledSize") or fill.get("cumFilledSize") or fill.get("sizeFilled")
+
+    if order_id is None or price is None or size is None:
+        return None
+
+    try:
+        order_id = str(order_id)
+        dp = Decimal(str(price))
+        dq = Decimal(str(size))
+    except Exception:
+        return None
+
+    if not order_id or dq <= 0 or dp <= 0:
+        return None
+
+    fid = fill.get("fillId") or fill.get("tradeId") or fill.get("execId") or fill.get("id")
+    if fid is None:
+        fid = f"{order_id}:{str(dp)}:{str(dq)}:{int(time.time()*1000)}"
+
+    return {
+        "type": "fill",
+        "id": str(fid),
+        "orderId": order_id,
+        "clientOrderId": str(client_oid) if client_oid is not None else None,
+        "symbol": str(symbol).upper() if symbol else None,
+        "price": str(dp),
+        "size": str(dq),
+        "source": source,
+        "raw": fill,
+        "ts": time.time(),
+    }
+
+
+def _ingest_fill_evt(evt: dict):
+    """Update in-memory fill aggregation + enqueue event for app.py."""
+    if not evt:
+        return
+    order_id = str(evt.get("orderId") or "")
+    if not order_id:
+        return
+
+    client_oid = evt.get("clientOrderId")
+    if client_oid:
+        _ORDER_ID_TO_CLIENT_ID[order_id] = str(client_oid)
+        _CLIENT_ID_TO_ORDER_ID[str(client_oid)] = order_id
+
+    try:
+        dq = Decimal(str(evt.get("size")))
+        dp = Decimal(str(evt.get("price")))
+    except Exception:
+        return
+    if dq <= 0 or dp <= 0:
+        return
+
+    agg = _WS_FILL_AGG.get(order_id) or {
+        "qty": Decimal("0"),
+        "notional": Decimal("0"),
+        "avg": None,
+        "ts": 0.0,
+    }
+    agg["qty"] = Decimal(str(agg["qty"])) + dq
+    agg["notional"] = Decimal(str(agg["notional"])) + (dq * dp)
+    agg["avg"] = (agg["notional"] / agg["qty"]) if agg["qty"] > 0 else None
+    agg["ts"] = time.time()
+    _WS_FILL_AGG[order_id] = agg
+
+    try:
+        _FILL_Q.put_nowait(evt)
+    except Exception:
+        pass
+
+
+def _walk_dicts(obj):
+    """Yield nested dict objects (depth-first), best-effort."""
+    stack = [obj]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            yield cur
+            for v in cur.values():
+                if isinstance(v, (dict, list)):
+                    stack.append(v)
+        elif isinstance(cur, list):
+            for v in cur:
+                if isinstance(v, (dict, list)):
+                    stack.append(v)
+
+
+def _extract_fill_like_from_message(message: Any, source: str) -> None:
+    """Try to find fills/orders/trades embedded anywhere in a WS message."""
+    if not isinstance(message, (dict, list)):
+        return
+
+    for d in _walk_dicts(message):
+        fills = d.get("fills")
+        if isinstance(fills, list) and fills:
+            for f in fills:
+                evt = _normalize_fill_event(f, source=source)
+                if evt:
+                    _ingest_fill_evt(evt)
+
+        for k in ("trades", "executions", "fillEvents", "fillsV3"):
+            arr = d.get(k)
+            if isinstance(arr, list) and arr:
+                for f in arr:
+                    evt = _normalize_fill_event(f, source=source)
+                    if evt:
+                        _ingest_fill_evt(evt)
+
+        orders = d.get("orders")
+        if isinstance(orders, list) and orders:
+            for o in orders:
+                evt = _normalize_fill_event(o, source=source)
+                if evt:
+                    _ingest_fill_evt(evt)
+
 
 def start_private_ws():
     """
-    Start ONE private WS connection (idempotent).
+    Start private WS listeners (idempotent).
 
-    It subscribes to account_info_stream_v3 and captures fills into:
-      - _WS_FILL_AGG (orderId -> aggregated qty/notional/avg)
-      - _FILL_Q (raw fill events for app.py to consume)
+    To maximize fill capture reliability, we subscribe to multiple private streams when available
+    (account / orders / trades / positions) and parse messages generically to extract fills.
+
+    IMPORTANT:
+    Run WS in exactly ONE process (set ENABLE_WS=1 only in that process).
     """
     global _WS_STARTED
     with _WS_LOCK:
@@ -399,81 +530,55 @@ def start_private_ws():
 
     api_creds = _get_api_credentials()
 
-    def handle_account(message: dict):
-        try:
-            if not isinstance(message, dict):
-                return
+    candidates = [
+        "account_info_stream_v3",
+        "account_stream_v3",
+        "fills_stream_v3",
+        "fill_stream_v3",
+        "execution_stream_v3",
+        "order_stream_v3",
+        "orders_stream_v3",
+        "order_update_stream_v3",
+        "order_updates_stream_v3",
+        "trade_stream_v3",
+        "trades_stream_v3",
+        "position_stream_v3",
+        "positions_stream_v3",
+    ]
 
-            contents = message.get("contents")
-            if not isinstance(contents, dict):
-                return
+    # Discover additional *stream* methods (safe)
+    try:
+        tmp = WebSocket(endpoint=endpoint, api_key_credentials=api_creds)
+        for name in dir(tmp):
+            if "stream" in name and callable(getattr(tmp, name, None)):
+                if name not in candidates:
+                    candidates.append(name)
+    except Exception:
+        pass
 
-            fills = contents.get("fills")
-            if not isinstance(fills, list) or not fills:
-                return
+    # Deduplicate while preserving order
+    seen = set()
+    candidates = [c for c in candidates if not (c in seen or seen.add(c))]
 
-            for f in fills:
-                if not isinstance(f, dict):
-                    continue
-
-                order_id = str(f.get("orderId") or f.get("id") or "")
-                px = f.get("price")
-                sz = f.get("size")
-
-                if not order_id or px is None or sz is None:
-                    continue
-
-                try:
-                    dq = Decimal(str(sz))
-                    dp = Decimal(str(px))
-                except Exception:
-                    continue
-
-                if dq <= 0 or dp <= 0:
-                    continue
-
-                agg = _WS_FILL_AGG.get(order_id) or {
-                    "qty": Decimal("0"),
-                    "notional": Decimal("0"),
-                    "avg": None,
-                    "ts": 0.0,
-                }
-                agg["qty"] = Decimal(str(agg["qty"])) + dq
-                agg["notional"] = Decimal(str(agg["notional"])) + (dq * dp)
-                agg["avg"] = (agg["notional"] / agg["qty"]) if agg["qty"] > 0 else None
-                agg["ts"] = time.time()
-                _WS_FILL_AGG[order_id] = agg
-
-                # push a single normalized event (avoid double-enqueue)
-                try:
-                    _FILL_Q.put_nowait({
-                        "type": "fill",
-                        "order_id": order_id,
-                        "price": str(dp),
-                        "size": str(dq),
-                        "raw": f,
-                        "ts": time.time(),
-                    })
-                except Exception:
-                    pass
-
-        except Exception as e:
-            print("[apex_client][WS] handle_account error:", e)
-
-    def _run_forever():
+    def _run_stream(stream_name: str):
         backoff = 1.0
         while True:
             try:
-                ws_client = WebSocket(
-                    endpoint=endpoint,
-                    api_key_credentials=api_creds,
-                )
-                # This call is expected to register the callback and keep the socket running.
-                ws_client.account_info_stream_v3(handle_account)
-                print("[apex_client][WS] subscribed account_info_stream_v3")
+                ws_client = WebSocket(endpoint=endpoint, api_key_credentials=api_creds)
+                if not hasattr(ws_client, stream_name):
+                    return
+                fn = getattr(ws_client, stream_name)
 
+                def _cb(msg: dict, _src=stream_name):
+                    try:
+                        _extract_fill_like_from_message(msg, source=_src)
+                    except Exception as e:
+                        print(f"[apex_client][WS] callback error in {_src}: {e}")
+
+                fn(_cb)
+                print(f"[apex_client][WS] subscribed {stream_name}")
                 backoff = 1.0
-                # Keepalive loop (ping if available; otherwise sleep).
+
                 while True:
                     try:
                         if hasattr(ws_client, "ping"):
@@ -483,15 +588,14 @@ def start_private_ws():
                     time.sleep(15)
 
             except Exception as e:
-                print(f"[apex_client][WS] reconnecting after error: {e} (sleep {backoff}s)")
+                print(f"[apex_client][WS] {stream_name} reconnect after error: {e} (sleep {backoff}s)")
                 time.sleep(backoff)
                 backoff = min(backoff * 2.0, 30.0)
 
-    t = threading.Thread(target=_run_forever, daemon=True, name="apex-private-ws")
-    t.start()
-    print("[apex_client][WS] started account_info_stream_v3")
+    for name in candidates:
+        threading.Thread(target=_run_stream, args=(name,), daemon=True, name=f"apex-ws-{name}").start()
 
-
+    print(f"[apex_client][WS] started {len(candidates)} stream listener threads (candidate methods)")
 def pop_fill_event(timeout: float = 0.5) -> Optional[dict]:
     try:
         return _FILL_Q.get(timeout=timeout)
@@ -501,15 +605,23 @@ def pop_fill_event(timeout: float = 0.5) -> Optional[dict]:
 
 def _ws_fill_summary(order_id: Optional[str], client_order_id: Optional[str]) -> Optional[Dict[str, Any]]:
     now = time.time()
-    if order_id:
-        agg = _WS_FILL_AGG.get(str(order_id))
-        if agg and (now - float(agg.get("ts", 0.0)) <= float(os.getenv("WS_FILL_TTL_SEC", "10"))):
+
+    oid = str(order_id) if order_id else None
+    cid = str(client_order_id) if client_order_id else None
+    if not oid and cid:
+        oid = _CLIENT_ID_TO_ORDER_ID.get(cid)
+
+    ttl = float(os.getenv("WS_FILL_TTL_SEC", "60"))
+
+    if oid:
+        agg = _WS_FILL_AGG.get(oid)
+        if agg and (now - float(agg.get("ts", 0.0)) <= ttl):
             avg = agg.get("avg")
             qty = agg.get("qty")
             if avg and qty and Decimal(str(qty)) > 0:
                 return {
-                    "order_id": str(order_id),
-                    "client_order_id": client_order_id,
+                    "order_id": oid,
+                    "client_order_id": _ORDER_ID_TO_CLIENT_ID.get(oid) or cid,
                     "filled_qty": Decimal(str(qty)),
                     "avg_fill_price": Decimal(str(avg)),
                 }
