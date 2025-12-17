@@ -683,12 +683,14 @@ def create_market_order(
     else:
         print(f"[apex_client] apex_clientId={apex_client_id} (no tv_client_id)")
 
-    # Snap price as well (best-effort). Even for *_MARKET some gateways validate scale.
+
+    # Snap price as well (best-effort). Some gateways validate scale.
     try:
-        price_dec = snap_price_for_order(symbol, side, order_type, price)
-        price = str(price_dec)
+        px_dec = snap_price_for_order(symbol, side, "MARKET", price_str)
+        price_str = format(px_dec, f".{rules.get('price_decimals', 2)}f")
     except Exception:
-        price = str(price)
+        # If snapping fails for any reason, fall back to original price_str.
+        price_str = str(price_str)
 
     params = {
         "symbol": symbol,
