@@ -1010,14 +1010,36 @@ def tv_webhook():
                 symbol=symbol,
                 order_id=order_id,
                 client_order_id=client_order_id,
-                max_wait_sec=float(os.getenv("FILL_MAX_WAIT_SEC", "2.0")),
+                max_wait_sec=float(os.getenv("FILL_MAX_WAIT_SEC", "12.0")),
                 poll_interval=float(os.getenv("FILL_POLL_INTERVAL", "0.25")),
             )
             entry_price_dec = Decimal(str(fill["avg_fill_price"]))
             final_qty = Decimal(str(fill["filled_qty"]))
             print(f"[ENTRY] fill ok bot={bot_id} symbol={symbol} filled_qty={final_qty} avg_fill={entry_price_dec}")
-        except Exception as e:
-            print(f"[ENTRY] fill fallback bot={bot_id} symbol={symbol} err:", e)
+except Exception as e:
+    print(f"[ENTRY] fill fallback bot={bot_id} symbol={symbol} err:", e)
+    # Fallback A2: use position entryPrice snapshot if fills are delayed.
+    try:
+        pos_wait = float(os.getenv("POSITION_FALLBACK_WAIT_SEC", "8.0"))
+        pos_poll = float(os.getenv("POSITION_FALLBACK_POLL_INTERVAL", "0.5"))
+        deadline = time.time() + pos_wait
+        while time.time() < deadline and entry_price_dec is None:
+            pos = get_open_position_for_symbol(symbol)
+            if isinstance(pos, dict):
+                sz = pos.get("size")
+                ep = pos.get("entryPrice") or pos.get("entry_price") or pos.get("avgEntryPrice")
+                try:
+                    dsz = Decimal(str(sz)) if sz is not None else Decimal("0")
+                except Exception:
+                    dsz = Decimal("0")
+                if dsz > 0 and ep not in (None, "", "0", "0.0"):
+                    entry_price_dec = Decimal(str(ep))
+                    final_qty = dsz
+                    print(f"[ENTRY] position fallback bot={bot_id} symbol={symbol} size={final_qty} entryPrice={entry_price_dec}")
+                    break
+            time.sleep(pos_poll)
+    except Exception as e2:
+        print(f"[ENTRY] position fallback failed bot={bot_id} symbol={symbol} err:", e2)
             try:
                 if fallback_price_str is not None:
                     entry_price_dec = Decimal(str(fallback_price_str))
