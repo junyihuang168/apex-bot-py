@@ -4,7 +4,7 @@ import random
 import inspect
 import threading
 import queue
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import Dict, Any, Optional, Union, Tuple
 
 from apexomni.http_private_sign import HttpPrivateSign
@@ -32,6 +32,9 @@ DEFAULT_SYMBOL_RULES = {
     "min_qty": Decimal("0.01"),
     "step_size": Decimal("0.01"),
     "qty_decimals": 2,
+    # Price constraints (tick size / decimals). Used for triggerPrice & price snapping.
+    "tick_size": Decimal("0.01"),
+    "price_decimals": 2,
 }
 
 SYMBOL_RULES: Dict[str, Dict[str, Any]] = {
@@ -188,6 +191,8 @@ def get_client() -> HttpPrivateSign:
 
     try:
         cfg = _safe_call(client.configs_v3)
+        global _CONFIGS_V3
+        _CONFIGS_V3 = cfg
         print("[apex_client] configs_v3 ok:", cfg)
     except Exception as e:
         print("[apex_client] WARNING configs_v3 error:", e)
@@ -205,6 +210,105 @@ def get_client() -> HttpPrivateSign:
 def get_account():
     client = get_client()
     return _safe_call(client.get_account_v3)
+
+
+
+def _decimalize(x: Any) -> Decimal:
+    """Best-effort conversion to Decimal without float artifacts."""
+    if isinstance(x, Decimal):
+        return x
+    # ints are safe
+    if isinstance(x, int):
+        return Decimal(x)
+    # strings / others
+    try:
+        return Decimal(str(x))
+    except Exception as e:
+        raise ValueError(f"cannot convert to Decimal: {x!r}") from e
+
+
+def _infer_price_decimals_from_tick(tick: Decimal) -> int:
+    """Infer decimals from tick size (e.g., 0.01 -> 2)."""
+    t = tick.normalize()
+    # For tick like 1E-2, exponent is -2
+    exp = -t.as_tuple().exponent
+    return max(0, exp)
+
+
+def _get_tick_size(symbol: str) -> Tuple[Decimal, int]:
+    """Return (tick_size, price_decimals). Defaults to symbol rules; may be improved by configs_v3 if present."""
+    rules = _get_symbol_rules(symbol)
+    tick = rules.get("tick_size", DEFAULT_SYMBOL_RULES["tick_size"])
+    decs = rules.get("price_decimals", DEFAULT_SYMBOL_RULES["price_decimals"])
+
+    # If configs_v3 cache exists, try to infer tick size for this symbol (best effort)
+    global _CONFIGS_V3
+    cfg = _CONFIGS_V3
+    if cfg:
+        sym_variants = {symbol.upper(), symbol.replace("-", "").upper(), symbol.replace("-", "_").upper()}
+        try:
+            # Walk nested dict/list
+            stack = [cfg]
+            while stack:
+                cur = stack.pop()
+                if isinstance(cur, dict):
+                    # Match by common keys
+                    v_sym = cur.get("symbol") or cur.get("symbolName") or cur.get("symbolId") or cur.get("id")
+                    if isinstance(v_sym, str) and v_sym.upper() in sym_variants:
+                        tk = cur.get("tickSize") or cur.get("tick_size") or cur.get("priceTick") or cur.get("price_tick")
+                        if tk is not None:
+                            tick = _decimalize(tk)
+                            decs = _infer_price_decimals_from_tick(tick)
+                            break
+                    for v in cur.values():
+                        if isinstance(v, (dict, list)):
+                            stack.append(v)
+                elif isinstance(cur, list):
+                    for v in cur:
+                        if isinstance(v, (dict, list)):
+                            stack.append(v)
+        except Exception:
+            # Keep defaults if inference fails
+            pass
+
+    # Ensure sane
+    tick = _decimalize(tick)
+    if tick <= 0:
+        tick = DEFAULT_SYMBOL_RULES["tick_size"]
+    decs = int(decs) if decs is not None else _infer_price_decimals_from_tick(tick)
+    return tick, decs
+
+
+def _snap_price(symbol: str, price: Decimal, rounding) -> Decimal:
+    """Snap a price to symbol tick size using Decimal math."""
+    tick, decs = _get_tick_size(symbol)
+    # steps = price / tick, then round to integer steps
+    steps = (price / tick).to_integral_value(rounding=rounding)
+    snapped = steps * tick
+    quantum = Decimal("1").scaleb(-decs)
+    return snapped.quantize(quantum, rounding=rounding)
+
+
+def snap_price_for_order(symbol: str, side: str, order_type: str, px: Any) -> Decimal:
+    """
+    Snap triggerPrice/price to tick size with direction-safe rounding.
+    - STOP_*: SELL -> down, BUY -> up
+    - TAKE_PROFIT_*: SELL -> up, BUY -> down
+    """
+    side_u = str(side).upper()
+    typ_u = str(order_type).upper()
+
+    is_stop = "STOP" in typ_u and "TAKE_PROFIT" not in typ_u
+    is_tp = "TAKE_PROFIT" in typ_u
+
+    if is_stop:
+        rounding = ROUND_DOWN if side_u == "SELL" else ROUND_UP
+    elif is_tp:
+        rounding = ROUND_UP if side_u == "SELL" else ROUND_DOWN
+    else:
+        rounding = ROUND_DOWN if side_u == "SELL" else ROUND_UP
+
+    return _snap_price(symbol, _decimalize(px), rounding)
 
 
 def get_market_price(symbol: str, side: str, size: str) -> str:
@@ -579,6 +683,13 @@ def create_market_order(
     else:
         print(f"[apex_client] apex_clientId={apex_client_id} (no tv_client_id)")
 
+    # Snap price as well (best-effort). Even for *_MARKET some gateways validate scale.
+    try:
+        price_dec = snap_price_for_order(symbol, side, order_type, price)
+        price = str(price_dec)
+    except Exception:
+        price = str(price)
+
     params = {
         "symbol": symbol,
         "side": side,
@@ -636,7 +747,9 @@ def create_trigger_order(
     apex_client_id = client_id or _random_client_id()
 
     size_str = str(size)
-    trigger_str = str(trigger_price)
+    # Snap triggerPrice to tick size to satisfy exchange precision rules.
+    trigger_dec = snap_price_for_order(symbol, side, order_type, trigger_price)
+    trigger_str = str(trigger_dec)
 
     # price is required by some SDK/builds even for *_MARKET; fallback to worstPrice
     if price is None:
@@ -645,6 +758,13 @@ def create_trigger_order(
         except Exception:
             px = trigger_str
         price = px
+
+    # Snap price as well (best-effort). Even for *_MARKET some gateways validate scale.
+    try:
+        price_dec = snap_price_for_order(symbol, side, order_type, price)
+        price = str(price_dec)
+    except Exception:
+        price = str(price)
 
     params = {
         "symbol": symbol,
