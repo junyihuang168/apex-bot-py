@@ -16,6 +16,7 @@ from apex_client import (
     start_private_ws,
     pop_fill_event,
     create_trigger_order,
+    snap_price_for_order,
     cancel_order,
 )
 
@@ -307,6 +308,17 @@ def _place_fixed_brackets(bot_id: str, symbol: str, direction: str, qty: Decimal
         tp_type = "TAKE_PROFIT_MARKET"
         sl_price = None
         tp_price = None
+
+    # Snap trigger prices to tick size for clean logs and added safety (API also snaps as last-mile).
+    try:
+        sl_trigger = snap_price_for_order(symbol, exit_side, sl_type, sl_trigger)
+        tp_trigger = snap_price_for_order(symbol, exit_side, tp_type, tp_trigger)
+        if sl_price is not None:
+            sl_price = snap_price_for_order(symbol, exit_side, sl_type, sl_price)
+        if tp_price is not None:
+            tp_price = snap_price_for_order(symbol, exit_side, tp_type, tp_price)
+    except Exception as e:
+        print(f"[BRACKET] WARNING snap price failed: {e}")
 
     bnum = _bot_num(bot_id)
     ts = int(time.time())
