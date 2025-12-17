@@ -432,6 +432,19 @@ def start_private_ws():
                 agg["ts"] = time.time()
                 _WS_FILL_AGG[order_id] = agg
 
+                # also push raw fill event for consumers (e.g., protective orders)
+                try:
+                    _FILL_Q.put({
+                        "type": "fill",
+                        "order_id": order_id,
+                        "price": str(dp),
+                        "size": str(dq),
+                        "raw": f,
+                        "ts": time.time(),
+                    })
+                except Exception:
+                    pass
+
                 # push event (non-blocking)
                 evt = dict(f)
                 evt["_ts_recv"] = time.time()
@@ -443,17 +456,32 @@ def start_private_ws():
         except Exception as e:
             print("[apex_client][WS] handle_account error:", e)
 
-    def _run():
+def _run():
+    # Keep a single WS connection alive and automatically reconnect on errors.
+    backoff = 1.0
+    while True:
         try:
             ws_client = WebSocket(
                 endpoint=endpoint,
                 api_key_credentials=api_creds,
             )
             ws_client.account_info_stream_v3(handle_account)
+            print("[apex_client][WS] subscribed account_info_stream_v3 (ws_zk_accounts_v3)")
+
+            backoff = 1.0
             while True:
-                time.sleep(30)
+                # Best-practice keepalive: ping every ~15s if the SDK exposes it.
+                try:
+                    if hasattr(ws_client, "ping"):
+                        ws_client.ping()
+                except Exception:
+                    # If ping fails, force reconnect.
+                    raise
+                time.sleep(15)
         except Exception as e:
-            print("[apex_client][WS] thread crashed:", e)
+            print(f"[apex_client][WS] reconnecting after error: {e} (sleep {backoff}s)")
+            time.sleep(backoff)
+            backoff = min(backoff * 2.0, 30.0)
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
@@ -488,7 +516,7 @@ def get_fill_summary(
     symbol: str,
     order_id: Optional[str] = None,
     client_order_id: Optional[str] = None,
-    max_wait_sec: float = 2.0,
+    max_wait_sec: float = 12.0,
     poll_interval: float = 0.25,
 ) -> Dict[str, Any]:
     # 先尝试 WS
