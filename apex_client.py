@@ -46,18 +46,19 @@ _CLIENT: Optional[HttpPrivateSign] = None
 NumberLike = Union[str, float, int]
 
 # ----------------------------
-# ✅ WS fills cache + queue
+# ✅ WS order updates cache + queue (NO fills subscription logic)
 # ----------------------------
-_FILL_Q: "queue.Queue[dict]" = queue.Queue(maxsize=20000)
+# We consume ONLY order update messages from the private WS stream.
+# From cumulative fields (cumFilledSize/filledSize + avgPrice), we reconstruct delta fills.
+_ORDER_Q: "queue.Queue[dict]" = queue.Queue(maxsize=20000)
 _WS_STARTED = False
 _WS_LOCK = threading.Lock()
 
-# orderId -> {"qty": Decimal, "notional": Decimal, "avg": Decimal, "ts": float}
-_WS_FILL_AGG: Dict[str, Dict[str, Any]] = {}
-# orderId -> clientOrderId
+# orderId -> tracker: {"cum_qty": Decimal, "avg": Decimal, "notional": Decimal, "status": str, "ts": float, "client_order_id": str|None, "symbol": str|None}
+_WS_ORDER_STATE: Dict[str, Dict[str, Any]] = {}
+
+# orderId -> clientOrderId (best-effort cache)
 _ORDER_ID_TO_CLIENT_ID: Dict[str, str] = {}
-# clientOrderId -> orderId
-_CLIENT_ID_TO_ORDER_ID: Dict[str, str] = {}
 
 
 def _get_symbol_rules(symbol: str) -> Dict[str, Any]:
@@ -373,151 +374,26 @@ def _extract_order_ids(raw_order: Any) -> Tuple[Optional[str], Optional[str]]:
 
 
 # ------------------------------------------------------------
-# ✅ Private WS: subscribe streams -> fills/orders/trades/positions
+# ✅ Private WS: account_info_stream_v3 -> fills push
 # ------------------------------------------------------------
-
-def _normalize_fill_event(fill: dict, source: str = "ws") -> Optional[dict]:
-    """Best-effort normalize various WS payload shapes into a fill-like event."""
-    if not isinstance(fill, dict):
-        return None
-
-    order_id = fill.get("orderId") or fill.get("order_id") or fill.get("id") or fill.get("orderID")
-    client_oid = fill.get("clientOrderId") or fill.get("clientId") or fill.get("client_order_id")
-    symbol = fill.get("symbol") or fill.get("market") or fill.get("instrument") or fill.get("pair")
-
-    price = fill.get("price") or fill.get("fillPrice") or fill.get("avgPrice") or fill.get("averagePrice")
-    size = fill.get("size") or fill.get("qty") or fill.get("filledSize") or fill.get("cumFilledSize") or fill.get("sizeFilled")
-
-    if order_id is None or price is None or size is None:
-        return None
-
-    try:
-        order_id = str(order_id)
-        dp = Decimal(str(price))
-        dq = Decimal(str(size))
-    except Exception:
-        return None
-
-    if not order_id or dq <= 0 or dp <= 0:
-        return None
-
-    fid = fill.get("fillId") or fill.get("tradeId") or fill.get("execId") or fill.get("id")
-    if fid is None:
-        fid = f"{order_id}:{str(dp)}:{str(dq)}:{int(time.time()*1000)}"
-
-    return {
-        "type": "fill",
-        "id": str(fid),
-        "orderId": order_id,
-        "clientOrderId": str(client_oid) if client_oid is not None else None,
-        "symbol": str(symbol).upper() if symbol else None,
-        "price": str(dp),
-        "size": str(dq),
-        "source": source,
-        "raw": fill,
-        "ts": time.time(),
-    }
-
-
-def _ingest_fill_evt(evt: dict):
-    """Update in-memory fill aggregation + enqueue event for app.py."""
-    if not evt:
-        return
-    order_id = str(evt.get("orderId") or "")
-    if not order_id:
-        return
-
-    client_oid = evt.get("clientOrderId")
-    if client_oid:
-        _ORDER_ID_TO_CLIENT_ID[order_id] = str(client_oid)
-        _CLIENT_ID_TO_ORDER_ID[str(client_oid)] = order_id
-
-    try:
-        dq = Decimal(str(evt.get("size")))
-        dp = Decimal(str(evt.get("price")))
-    except Exception:
-        return
-    if dq <= 0 or dp <= 0:
-        return
-
-    agg = _WS_FILL_AGG.get(order_id) or {
-        "qty": Decimal("0"),
-        "notional": Decimal("0"),
-        "avg": None,
-        "ts": 0.0,
-    }
-    agg["qty"] = Decimal(str(agg["qty"])) + dq
-    agg["notional"] = Decimal(str(agg["notional"])) + (dq * dp)
-    agg["avg"] = (agg["notional"] / agg["qty"]) if agg["qty"] > 0 else None
-    agg["ts"] = time.time()
-    _WS_FILL_AGG[order_id] = agg
-
-    try:
-        _FILL_Q.put_nowait(evt)
-    except Exception:
-        pass
-
-
-def _walk_dicts(obj):
-    """Yield nested dict objects (depth-first), best-effort."""
-    stack = [obj]
-    while stack:
-        cur = stack.pop()
-        if isinstance(cur, dict):
-            yield cur
-            for v in cur.values():
-                if isinstance(v, (dict, list)):
-                    stack.append(v)
-        elif isinstance(cur, list):
-            for v in cur:
-                if isinstance(v, (dict, list)):
-                    stack.append(v)
-
-
-def _extract_fill_like_from_message(message: Any, source: str) -> None:
-    """Try to find fills/orders/trades embedded anywhere in a WS message."""
-    if not isinstance(message, (dict, list)):
-        return
-
-    for d in _walk_dicts(message):
-        fills = d.get("fills")
-        if isinstance(fills, list) and fills:
-            for f in fills:
-                evt = _normalize_fill_event(f, source=source)
-                if evt:
-                    _ingest_fill_evt(evt)
-
-        for k in ("trades", "executions", "fillEvents", "fillsV3"):
-            arr = d.get(k)
-            if isinstance(arr, list) and arr:
-                for f in arr:
-                    evt = _normalize_fill_event(f, source=source)
-                    if evt:
-                        _ingest_fill_evt(evt)
-
-        orders = d.get("orders")
-        if isinstance(orders, list) and orders:
-            for o in orders:
-                evt = _normalize_fill_event(o, source=source)
-                if evt:
-                    _ingest_fill_evt(evt)
-
 
 def start_private_ws():
     """
     Start ONE private WS connection (idempotent).
 
-    Goal:
-      - Capture real fills reliably (avg fill, filled qty) for PnL + protective orders.
-      - Avoid subscribing to *public* market-data streams (depth/ticker/klines/trade) that require
-        symbol/limit/interval parameters and will spam errors like:
-          WebSocket.depth_stream() missing required positional arguments...
+    We subscribe to account_info_stream_v3 and consume ONLY order updates (contents.orders).
+    We do NOT depend on fills push.
 
-    Approach:
-      - Create a single WebSocket client in ONE process (ENABLE_WS=1 only there).
-      - Discover and subscribe ONLY to private/account/order/fill/position streams whose signatures
-        can be called with either no args or a single callback arg.
-      - Parse every incoming message generically via _extract_fill_like_from_message().
+    For each order update, we maintain a per-order tracker:
+      - cumulative filled qty (cumFilledSize / filledSize)
+      - average fill price (avgPrice / fillAvgPrice / averagePrice)
+      - status
+
+    From cumulative (qty, avg), we reconstruct delta fills:
+      deltaQty = newCum - prevCum
+      deltaPx  = (newAvg*newCum - prevAvg*prevCum) / deltaQty
+
+    Delta events are pushed into _ORDER_Q for app.py to consume (protective OCO, etc.).
     """
     global _WS_STARTED
     with _WS_LOCK:
@@ -536,162 +412,206 @@ def start_private_ws():
 
     api_creds = _get_api_credentials()
 
-    def _handle_any(message: dict, source: str):
+    def _pick(d: dict, *keys):
+        for k in keys:
+            v = d.get(k)
+            if v is not None:
+                return v
+        return None
+
+    def _to_decimal(x) -> Optional[Decimal]:
+        if x is None:
+            return None
         try:
-            _extract_fill_like_from_message(message, source=source)
-        except Exception as e:
-            print(f"[apex_client][WS] handler error source={source}: {e}")
+            d = Decimal(str(x))
+            return d
+        except Exception:
+            return None
 
-    def _discover_private_streams(ws_client) -> list:
-        names = []
-        good = ("account", "order", "fill", "position", "execution", "user")
-        bad = ("depth", "ticker", "kline", "klines", "orderbook", "public", "unsub", "sub_", "topic", "custom")
-        for name in dir(ws_client):
-            low = name.lower()
-            if "stream" not in low:
-                continue
-            fn = getattr(ws_client, name, None)
-            if not callable(fn):
-                continue
-            if any(k in low for k in bad):
-                continue
-            if not any(k in low for k in good):
-                continue
+    def handle_account(message: dict):
+        try:
+            if not isinstance(message, dict):
+                return
 
-            # Signature safety: we only call stream methods that can be invoked with:
-            #   - no args, OR
-            #   - one positional arg (the callback)
-            try:
-                sig = inspect.signature(fn)
-                params = [p for p in sig.parameters.values() if p.name != "self"]
-                required_pos = [
-                    p for p in params
-                    if p.default is p.empty and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
-                ]
-                if len(required_pos) == 0:
-                    pass
-                elif len(required_pos) == 1:
-                    # Reject streams that require symbol/limit/etc even if only one param
-                    if required_pos[0].name in ("symbol", "limit", "interval", "arg", "wss_url"):
-                        continue
-                else:
+            contents = message.get("contents")
+            if not isinstance(contents, dict):
+                return
+
+            # Prefer orders updates. SDKs differ: orders / order / orderUpdates.
+            orders = (
+                contents.get("orders")
+                or contents.get("order")
+                or contents.get("orderUpdates")
+                or contents.get("ordersV3")
+            )
+
+            if isinstance(orders, dict):
+                orders = [orders]
+
+            if not isinstance(orders, list) or not orders:
+                return
+
+            for o in orders:
+                if not isinstance(o, dict):
                     continue
-            except Exception:
-                continue
 
-            names.append(name)
+                # Normalize order payload
+                data = o.get("data") if isinstance(o.get("data"), dict) else o
+                if not isinstance(data, dict):
+                    continue
 
-        preferred = [
-            "account_info_stream_v3",
-            "fills_stream_v3",
-            "orders_stream_v3",
-            "order_stream_v3",
-            "positions_stream_v3",
-            "position_stream_v3",
-            "account_stream_v3",
-        ]
-        ordered = []
-        for p in preferred:
-            if p in names:
-                ordered.append(p)
-        for n in names:
-            if n not in ordered:
-                ordered.append(n)
-        return ordered
+                order_id = _pick(data, "orderId", "id")
+                if not order_id:
+                    continue
+                order_id = str(order_id)
+
+                client_oid = _pick(data, "clientOrderId", "clientId", "client_id")
+                if client_oid is not None:
+                    client_oid = str(client_oid)
+                    _ORDER_ID_TO_CLIENT_ID[order_id] = client_oid
+
+                symbol = _pick(data, "symbol")
+                if symbol is not None:
+                    symbol = str(symbol).upper().strip()
+
+                status = _pick(data, "status", "orderStatus", "state")
+                status = str(status).upper().strip() if status is not None else ""
+
+                cum_qty = _to_decimal(_pick(data, "cumFilledSize", "filledSize", "sizeFilled", "cumFilled", "executedQty"))
+                avg_px = _to_decimal(_pick(data, "avgPrice", "fillAvgPrice", "averagePrice", "avgFillPrice"))
+
+                # Update tracker even if only status changes.
+                prev = _WS_ORDER_STATE.get(order_id) or {
+                    "cum_qty": Decimal("0"),
+                    "avg": None,
+                    "notional": Decimal("0"),
+                    "status": "",
+                    "ts": 0.0,
+                    "client_order_id": client_oid,
+                    "symbol": symbol,
+                }
+
+                prev_cum = Decimal(str(prev.get("cum_qty") or "0"))
+                prev_avg = prev.get("avg")
+                prev_notional = Decimal(str(prev.get("notional") or "0"))
+
+                # If cum/avg absent, only refresh status/timestamps.
+                delta_qty = Decimal("0")
+                delta_px: Optional[Decimal] = None
+
+                if cum_qty is not None and cum_qty >= 0:
+                    # notional reconstruction requires avg
+                    if avg_px is not None and cum_qty > 0:
+                        new_notional = (avg_px * cum_qty)
+                        if prev_avg is not None and prev_cum > 0:
+                            prev_notional = (Decimal(str(prev_avg)) * prev_cum)
+                        else:
+                            prev_notional = Decimal(str(prev_notional or "0"))
+
+                        if cum_qty > prev_cum:
+                            delta_qty = (cum_qty - prev_cum)
+                            delta_notional = (new_notional - prev_notional)
+                            if delta_qty > 0:
+                                try:
+                                    delta_px = (delta_notional / delta_qty)
+                                except Exception:
+                                    delta_px = None
+
+                        prev["cum_qty"] = cum_qty
+                        prev["avg"] = avg_px
+                        prev["notional"] = new_notional
+                    else:
+                        # If avg is missing, still store cum_qty so we can later reconcile once avg arrives.
+                        prev["cum_qty"] = cum_qty
+
+                if status:
+                    prev["status"] = status
+                if client_oid:
+                    prev["client_order_id"] = client_oid
+                if symbol:
+                    prev["symbol"] = symbol
+
+                prev["ts"] = time.time()
+                _WS_ORDER_STATE[order_id] = prev
+
+                # Emit delta event only when we can compute a delta price.
+                if delta_qty > 0 and delta_px is not None and (symbol or prev.get("symbol")):
+                    evt = {
+                        "type": "order_delta",
+                        "order_id": order_id,
+                        "client_order_id": client_oid or prev.get("client_order_id"),
+                        "symbol": (symbol or prev.get("symbol")),
+                        "status": prev.get("status"),
+                        "cum_filled_qty": str(prev.get("cum_qty")),
+                        "avg_fill_price": str(prev.get("avg")) if prev.get("avg") is not None else None,
+                        "delta_qty": str(delta_qty),
+                        "delta_price": str(delta_px),
+                        "raw": data,
+                        "ts": time.time(),
+                    }
+                    try:
+                        _ORDER_Q.put_nowait(evt)
+                    except Exception:
+                        pass
+
+        except Exception as e:
+            print("[apex_client][WS] handle_account error:", e)
 
     def _run_forever():
         backoff = 1.0
         while True:
             try:
-                ws_client = WebSocket(endpoint=endpoint, api_key_credentials=api_creds)
-
-                streams = _discover_private_streams(ws_client)
-                if not streams and hasattr(ws_client, "account_info_stream_v3"):
-                    streams = ["account_info_stream_v3"]
-
-                print(f"[apex_client][WS] subscribing private streams: {streams}")
-
-                def _make_cb(src: str):
-                    def _cb(*args, **kwargs):
-                        msg = None
-                        # WS SDKs vary: callback(message) or callback(ws, message).
-                        for a in reversed(args):
-                            if isinstance(a, dict):
-                                msg = a
-                                break
-                        if msg is None and isinstance(kwargs.get('message'), dict):
-                            msg = kwargs.get('message')
-                        if msg is not None:
-                            _handle_any(msg, source=src)
-                    return _cb
-
-
-                for stream_name in streams:
-                    fn = getattr(ws_client, stream_name, None)
-                    if not callable(fn):
-                        continue
-
-                    cb = _make_cb(stream_name)
-
-                    try:
-                        sig = inspect.signature(fn)
-                        params = [p for p in sig.parameters.values() if p.name != "self"]
-                        required_pos = [
-                            p for p in params
-                            if p.default is p.empty and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
-                        ]
-                        if len(required_pos) == 0:
-                            fn()
-                        else:
-                            fn(cb)
-
-                        print(f"[apex_client][WS] subscribed {stream_name}")
-                    except TypeError as te:
-                        # This is usually a signature mismatch (e.g., required symbol/limit). Skip quietly.
-                        print(f"[apex_client][WS] skip {stream_name} (signature mismatch): {te}")
-                    except Exception as e:
-                        print(f"[apex_client][WS] subscribe {stream_name} failed: {e}")
+                ws_client = WebSocket(
+                    endpoint=endpoint,
+                    api_key_credentials=api_creds,
+                )
+                ws_client.account_info_stream_v3(handle_account)
+                print("[apex_client][WS] subscribed account_info_stream_v3 (orders)")
 
                 backoff = 1.0
                 while True:
-                    time.sleep(10.0)
+                    try:
+                        if hasattr(ws_client, "ping"):
+                            ws_client.ping()
+                    except Exception:
+                        raise
+                    time.sleep(15)
 
             except Exception as e:
-                print(f"[apex_client][WS] reconnect after error: {e} (sleep {backoff:.1f}s)")
+                print(f"[apex_client][WS] reconnecting after error: {e} (sleep {backoff}s)")
                 time.sleep(backoff)
-                backoff = min(backoff * 2, 30.0)
+                backoff = min(backoff * 2.0, 30.0)
 
-    threading.Thread(target=_run_forever, daemon=True).start()
-def pop_fill_event(timeout: float = 0.5) -> Optional[dict]:
+    t = threading.Thread(target=_run_forever, daemon=True, name="apex-private-ws")
+    t.start()
+    print("[apex_client][WS] started account_info_stream_v3 (orders)")
+
+
+def pop_order_event(timeout: float = 0.5) -> Optional[dict]:
     try:
-        return _FILL_Q.get(timeout=timeout)
+        return _ORDER_Q.get(timeout=timeout)
     except Exception:
         return None
 
 
-def _ws_fill_summary(order_id: Optional[str], client_order_id: Optional[str]) -> Optional[Dict[str, Any]]:
+def _ws_order_summary(order_id: Optional[str], client_order_id: Optional[str]) -> Optional[Dict[str, Any]]:
     now = time.time()
-
-    oid = str(order_id) if order_id else None
-    cid = str(client_order_id) if client_order_id else None
-    if not oid and cid:
-        oid = _CLIENT_ID_TO_ORDER_ID.get(cid)
-
-    ttl = float(os.getenv("WS_FILL_TTL_SEC", "60"))
-
-    if oid:
-        agg = _WS_FILL_AGG.get(oid)
-        if agg and (now - float(agg.get("ts", 0.0)) <= ttl):
-            avg = agg.get("avg")
-            qty = agg.get("qty")
-            if avg and qty and Decimal(str(qty)) > 0:
+    ttl = float(os.getenv("WS_ORDER_TTL_SEC", "30"))
+    if order_id:
+        st = _WS_ORDER_STATE.get(str(order_id))
+        if st and (now - float(st.get("ts", 0.0)) <= ttl):
+            cum = st.get("cum_qty")
+            avg = st.get("avg")
+            if cum is not None and avg is not None and Decimal(str(cum)) > 0 and Decimal(str(avg)) > 0:
                 return {
-                    "order_id": oid,
-                    "client_order_id": _ORDER_ID_TO_CLIENT_ID.get(oid) or cid,
-                    "filled_qty": Decimal(str(qty)),
+                    "order_id": str(order_id),
+                    "client_order_id": client_order_id or st.get("client_order_id"),
+                    "filled_qty": Decimal(str(cum)),
                     "avg_fill_price": Decimal(str(avg)),
+                    "status": str(st.get("status") or ""),
                 }
     return None
+
 
 
 def get_fill_summary(
@@ -701,8 +621,17 @@ def get_fill_summary(
     max_wait_sec: float = 12.0,
     poll_interval: float = 0.25,
 ) -> Dict[str, Any]:
-    # 先尝试 WS
-    ws_hit = _ws_fill_summary(order_id, client_order_id)
+    """
+    ✅ Order-based fill summary (NO fills subscription).
+
+    Priority:
+      1) Private WS order tracker (_WS_ORDER_STATE) derived from order updates.
+      2) REST order detail (filledSize/cumFilledSize + avgPrice) as fallback.
+
+    This function NEVER uses market quote / worstPrice as execution price.
+    """
+    # 1) WS order summary
+    ws_hit = _ws_order_summary(order_id, client_order_id)
     if ws_hit:
         return {
             "symbol": symbol,
@@ -710,24 +639,24 @@ def get_fill_summary(
             "client_order_id": client_order_id,
             "filled_qty": ws_hit["filled_qty"],
             "avg_fill_price": ws_hit["avg_fill_price"],
+            "order_status": ws_hit.get("status") or "",
             "raw_order": None,
-            "raw_fills": {"source": "ws"},
+            "raw_source": "ws_order",
         }
 
     client = get_client()
     start = time.time()
+    last_err: Optional[Exception] = None
 
     while True:
-        last_err = None
-
+        # 2) REST order detail fallback (no fills endpoint)
+        order_obj = None
         candidates = [
             "get_order_v3",
             "get_order_detail_v3",
             "get_order_by_id_v3",
             "get_order_v3_by_id",
         ]
-
-        order_obj = None
         for name in candidates:
             if hasattr(client, name) and order_id:
                 try:
@@ -740,81 +669,12 @@ def get_fill_summary(
                 except Exception as e:
                     last_err = e
 
-        fills_obj = None
-        fill_candidates = [
-            "get_fills_v3",
-            "get_order_fills_v3",
-            "get_trade_fills_v3",
-        ]
-        for name in fill_candidates:
-            if hasattr(client, name):
-                try:
-                    fn = getattr(client, name)
-                    if order_id:
-                        try:
-                            fills_obj = fn(orderId=order_id)
-                        except Exception:
-                            fills_obj = fn(order_id)
-                    elif client_order_id:
-                        try:
-                            fills_obj = fn(clientId=client_order_id)
-                        except Exception:
-                            fills_obj = fn(client_order_id)
-                    else:
-                        continue
-                    break
-                except Exception as e:
-                    last_err = e
-
-        def _as_list(x):
-            if x is None:
-                return []
-            if isinstance(x, list):
-                return x
-            if isinstance(x, dict):
-                data = x.get("data")
-                if isinstance(data, list):
-                    return data
-                if isinstance(data, dict) and "fills" in data and isinstance(data["fills"], list):
-                    return data["fills"]
-            return []
-
-        fills_list = _as_list(fills_obj)
-
-        total_qty = Decimal("0")
-        total_notional = Decimal("0")
-
-        for f in fills_list:
-            if not isinstance(f, dict):
-                continue
-            q = f.get("size") or f.get("qty") or f.get("filledSize") or f.get("fillSize")
-            p = f.get("price") or f.get("fillPrice")
-            if q is None or p is None:
-                continue
-            dq = Decimal(str(q))
-            dp = Decimal(str(p))
-            if dq <= 0 or dp <= 0:
-                continue
-            total_qty += dq
-            total_notional += dq * dp
-
-        if total_qty > 0:
-            avg = (total_notional / total_qty)
-            return {
-                "symbol": symbol,
-                "order_id": order_id,
-                "client_order_id": client_order_id,
-                "filled_qty": total_qty,
-                "avg_fill_price": avg,
-                "raw_order": order_obj,
-                "raw_fills": fills_obj,
-            }
-
         if isinstance(order_obj, dict):
             data = order_obj.get("data") if isinstance(order_obj.get("data"), dict) else order_obj
             if isinstance(data, dict):
                 fq = data.get("filledSize") or data.get("cumFilledSize") or data.get("sizeFilled")
                 ap = data.get("avgPrice") or data.get("averagePrice") or data.get("fillAvgPrice")
+                st = data.get("status") or data.get("orderStatus") or data.get("state") or ""
                 try:
                     if fq and ap:
                         dq = Decimal(str(fq))
@@ -826,14 +686,29 @@ def get_fill_summary(
                                 "client_order_id": client_order_id,
                                 "filled_qty": dq,
                                 "avg_fill_price": dp,
+                                "order_status": str(st).upper(),
                                 "raw_order": order_obj,
-                                "raw_fills": fills_obj,
+                                "raw_source": "rest_order",
                             }
                 except Exception as e:
                     last_err = e
 
         if time.time() - start >= max_wait_sec:
-            raise RuntimeError(f"fill summary unavailable, last_err={last_err!r}")
+            raise RuntimeError(f"order fill summary unavailable, last_err={last_err!r}")
+
+        # Re-check WS each loop in case WS arrives after first miss.
+        ws_hit = _ws_order_summary(order_id, client_order_id)
+        if ws_hit:
+            return {
+                "symbol": symbol,
+                "order_id": order_id,
+                "client_order_id": client_order_id,
+                "filled_qty": ws_hit["filled_qty"],
+                "avg_fill_price": ws_hit["avg_fill_price"],
+                "order_status": ws_hit.get("status") or "",
+                "raw_order": None,
+                "raw_source": "ws_order",
+            }
 
         time.sleep(poll_interval)
 
@@ -886,12 +761,9 @@ def create_market_order(
         )
 
     ts = int(time.time())
-    apex_client_id = _random_client_id()
+    apex_client_id = str(client_id) if client_id else _random_client_id()
 
-    if client_id:
-        print(f"[apex_client] tv_client_id={client_id} -> apex_clientId={apex_client_id}")
-    else:
-        print(f"[apex_client] apex_clientId={apex_client_id} (no tv_client_id)")
+    print(f"[apex_client] clientId={apex_client_id} (provided={bool(client_id)})")
 
 
     # Snap price as well (best-effort). Some gateways validate scale.
