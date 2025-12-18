@@ -1224,13 +1224,11 @@ def create_trigger_order(
     trigger_dec = snap_price_for_order(symbol, side, order_type, trigger_price)
     trigger_str = str(trigger_dec)
 
-    # price is required by some SDK/builds even for *_MARKET; fallback to worstPrice
+    # price is required by some SDK/builds even for *_MARKET.
+    # IMPORTANT: Do NOT use marketQuote/worstPrice as execution price; exchange ignores `price` for *_MARKET trigger orders.
+    # Use trigger_str as a safe placeholder to satisfy gateway validations.
     if price is None:
-        try:
-            px = get_market_price(symbol, side, size_str)
-        except Exception:
-            px = trigger_str
-        price = px
+        price = trigger_str
 
     # Snap price as well (best-effort). Even for *_MARKET some gateways validate scale.
     try:
