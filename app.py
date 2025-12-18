@@ -14,6 +14,7 @@ from apex_client import (
     _get_symbol_rules,
     _snap_quantity,
     start_private_ws,
+    start_order_rest_poller,
     pop_order_event,
     create_trigger_order,
     snap_price_for_order,
@@ -493,6 +494,15 @@ def _ensure_monitor_thread():
         if ENABLE_WS:
             start_private_ws()
             _ensure_ws_orders_thread()
+
+            # ✅ Backup path: REST poll orders every N seconds (main path still WS)
+            if str(os.getenv("ENABLE_REST_POLL", "1")).strip() == "1":
+                try:
+                    start_order_rest_poller(poll_interval=float(os.getenv("REST_ORDER_POLL_INTERVAL", "5.0")))
+                    print("[SYSTEM] REST order poller enabled (backup path)")
+                except Exception as e:
+                    print("[SYSTEM] REST order poller failed to start:", e)
+
             print("[SYSTEM] WS enabled in this process (ENABLE_WS=1)")
         else:
             print("[SYSTEM] WS disabled in this process (ENABLE_WS=0)")
@@ -1005,6 +1015,21 @@ def tv_webhook():
         ts_now = int(time.time())
         entry_client_id = f"{bnum:03d}{ts_now}01"
 
+
+        # Snapshot current position size BEFORE placing the order.
+        # This makes position-fallback safer when multiple bots can trade the same symbol.
+        pre_pos_size = Decimal("0")
+        try:
+            pre = get_open_position_for_symbol(symbol)
+            if isinstance(pre, dict) and pre.get("size") is not None:
+                if side_raw == "BUY" and str(pre.get("side", "")).upper() == "LONG":
+                    pre_pos_size = Decimal(str(pre["size"]))
+                elif side_raw == "SELL" and str(pre.get("side", "")).upper() == "SHORT":
+                    pre_pos_size = Decimal(str(pre["size"]))
+        except Exception:
+            pre_pos_size = Decimal("0")
+
+
         try:
             order = create_market_order(
                 symbol=symbol,
@@ -1045,7 +1070,7 @@ def tv_webhook():
                 symbol=symbol,
                 order_id=order_id,
                 client_order_id=client_order_id,
-                max_wait_sec=float(os.getenv("FILL_MAX_WAIT_SEC", "12.0")),
+                max_wait_sec=float(os.getenv("FILL_MAX_WAIT_SEC", "20.0")),
                 poll_interval=float(os.getenv("FILL_POLL_INTERVAL", "0.25")),
             )
             entry_price_dec = Decimal(str(fill["avg_fill_price"]))
@@ -1072,8 +1097,17 @@ def tv_webhook():
 
                         if dsz > 0 and ep not in (None, "", "0", "0.0"):
                             entry_price_dec = Decimal(str(ep))
-                            final_qty = dsz
-                            print(f"[ENTRY] position fallback bot={bot_id} symbol={symbol} size={final_qty} entryPrice={entry_price_dec}")
+                            # Use delta vs pre-order position size, capped at requested qty.
+                            try:
+                                delta_sz = (dsz - pre_pos_size)
+                            except Exception:
+                                delta_sz = dsz
+                            if delta_sz <= 0:
+                                final_qty = snapped_qty
+                            else:
+                                final_qty = min(snapped_qty, delta_sz)
+
+                            print(f"[ENTRY] position fallback bot={bot_id} symbol={symbol} posSize={dsz} prePos={pre_pos_size} delta={delta_sz} final_qty={final_qty} entryPrice={entry_price_dec}")
                             break
 
                     time.sleep(pos_poll)
@@ -1216,7 +1250,7 @@ def tv_webhook():
                 symbol=symbol,
                 order_id=order.get("order_id"),
                 client_order_id=order.get("client_order_id"),
-                max_wait_sec=float(os.getenv("FILL_MAX_WAIT_SEC", "12.0")),
+                max_wait_sec=float(os.getenv("FILL_MAX_WAIT_SEC", "20.0")),
                 poll_interval=float(os.getenv("FILL_POLL_INTERVAL", "0.25")),
             )
             exit_price = Decimal(str(fill["avg_fill_price"]))
