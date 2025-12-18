@@ -328,6 +328,36 @@ def get_bot_open_positions(bot_id: str) -> Dict[Tuple[str, str], Dict[str, Any]]
     conn = _connect()
     cur = conn.cursor()
 
+def get_symbol_open_directions(symbol: str) -> Set[str]:
+    """Return a set of open directions {"LONG","SHORT"} for the given symbol across ALL bots."""
+    symbol = str(symbol).upper().strip()
+    if not symbol:
+        return set()
+
+    con = _connect()
+    try:
+        cur = con.cursor()
+        rows = cur.execute(
+            """
+            SELECT side
+            FROM lots
+            WHERE symbol=? AND remaining_qty > 0
+            """,
+            (symbol,),
+        ).fetchall()
+
+        dirs: Set[str] = set()
+        for (side,) in rows:
+            s2 = str(side or "").upper()
+            if s2 == "BUY":
+                dirs.add("LONG")
+            elif s2 == "SELL":
+                dirs.add("SHORT")
+        return dirs
+    finally:
+        con.close()
+
+
     cur.execute("""
         SELECT symbol, direction,
                SUM(CAST(remaining_qty AS REAL)) AS qty_sum,
