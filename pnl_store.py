@@ -2,7 +2,7 @@ import os
 import sqlite3
 import time
 from decimal import Decimal
-from typing import Dict, Tuple, Any, List, Callable, Optional
+from typing import Dict, Tuple, Any, List, Callable, Optional, Set
 
 # ✅ 修改：使用绝对路径，避免不同运行环境找不到文件
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -326,68 +326,68 @@ def get_bot_open_positions(bot_id: str) -> Dict[Tuple[str, str], Dict[str, Any]]
     }
     """
     conn = _connect()
-    cur = conn.cursor()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT symbol, direction,
+                   SUM(CAST(remaining_qty AS REAL)) AS qty_sum,
+                   SUM(CAST(remaining_qty AS REAL) * CAST(entry_price AS REAL)) AS notional_sum
+            FROM lots
+            WHERE bot_id=? AND CAST(remaining_qty AS REAL) > 0
+            GROUP BY symbol, direction
+        """, (bot_id,))
+
+        out: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        rows = cur.fetchall()
+
+        for r in rows:
+            symbol = r["symbol"]
+            direction = r["direction"]
+            qty_sum = _d(r["qty_sum"] or "0")
+            notional_sum = _d(r["notional_sum"] or "0")
+
+            weighted = (notional_sum / qty_sum) if qty_sum > 0 else Decimal("0")
+
+            out[(symbol, direction)] = {
+                "qty": qty_sum,
+                "weighted_entry": weighted
+            }
+
+        return out
+    finally:
+        conn.close()
+
 
 def get_symbol_open_directions(symbol: str) -> Set[str]:
-    """Return a set of open directions {"LONG","SHORT"} for the given symbol across ALL bots."""
+    """Return a set of open directions {'LONG','SHORT'} for the given symbol across ALL bots."""
     symbol = str(symbol).upper().strip()
     if not symbol:
         return set()
 
-    con = _connect()
+    conn = _connect()
     try:
-        cur = con.cursor()
+        cur = conn.cursor()
         rows = cur.execute(
             """
-            SELECT side
+            SELECT DISTINCT direction
             FROM lots
-            WHERE symbol=? AND remaining_qty > 0
+            WHERE symbol=? AND CAST(remaining_qty AS REAL) > 0
             """,
             (symbol,),
         ).fetchall()
 
         dirs: Set[str] = set()
-        for (side,) in rows:
-            s2 = str(side or "").upper()
-            if s2 == "BUY":
-                dirs.add("LONG")
-            elif s2 == "SELL":
-                dirs.add("SHORT")
+        for (direction,) in rows:
+            d = str(direction or "").upper().strip()
+            if d in ("LONG", "SHORT"):
+                dirs.add(d)
         return dirs
     finally:
-        con.close()
-
-
-    cur.execute("""
-        SELECT symbol, direction,
-               SUM(CAST(remaining_qty AS REAL)) AS qty_sum,
-               SUM(CAST(remaining_qty AS REAL) * CAST(entry_price AS REAL)) AS notional_sum
-        FROM lots
-        WHERE bot_id=? AND CAST(remaining_qty AS REAL) > 0
-        GROUP BY symbol, direction
-    """, (bot_id,))
-
-    out: Dict[Tuple[str, str], Dict[str, Any]] = {}
-    rows = cur.fetchall()
-
-    for r in rows:
-        symbol = r["symbol"]
-        direction = r["direction"]
-        qty_sum = _d(r["qty_sum"] or "0")
-        notional_sum = _d(r["notional_sum"] or "0")
-
-        weighted = (notional_sum / qty_sum) if qty_sum > 0 else Decimal("0")
-
-        out[(symbol, direction)] = {
-            "qty": qty_sum,
-            "weighted_entry": weighted
-        }
-
-    conn.close()
-    return out
+        conn.close()
 
 
 def list_bots_with_activity() -> List[str]:
+
     conn = _connect()
     cur = conn.cursor()
 
