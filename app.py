@@ -29,6 +29,8 @@ from pnl_store import (
     get_bot_summary,
     get_bot_open_positions,
     get_symbol_open_directions,
+    get_lock_level_pct,
+    set_lock_level_pct,
     clear_lock_level_pct,
     is_signal_processed,
     mark_signal_processed,
@@ -57,7 +59,16 @@ REMOTE_FALLBACK_SYMBOLS = {
 
 # ✅ 固定止损/止盈（百分比）
 FIXED_SL_PCT = Decimal(os.getenv("FIXED_SL_PCT", "0.5"))  # -0.5%
-FIXED_TP_PCT = Decimal(os.getenv("FIXED_TP_PCT", "1.0"))  # +1.0%
+FIXED_TP_PCT = Decimal(os.getenv("FIXED_TP_PCT", "2.5"))  # +2.5%
+
+# ✅ 阶梯式追踪止损（百分比，基于真实 entryPrice；只更新 SL，不动固定 TP）
+TRAIL_START_PROFIT_PCT = Decimal(os.getenv("TRAIL_START_PROFIT_PCT", "0.15"))  # 利润 >= 0.15%: SL 抬到 +0.10%
+TRAIL_START_LOCK_PCT   = Decimal(os.getenv("TRAIL_START_LOCK_PCT", "0.10"))
+TRAIL_BASE_PROFIT_PCT  = Decimal(os.getenv("TRAIL_BASE_PROFIT_PCT", "0.35"))    # 之后每 +0.20% 台阶一次
+TRAIL_BASE_LOCK_PCT    = Decimal(os.getenv("TRAIL_BASE_LOCK_PCT", "0.15"))
+TRAIL_STEP_PCT         = Decimal(os.getenv("TRAIL_STEP_PCT", "0.20"))
+TRAIL_POLL_INTERVAL    = float(os.getenv("TRAIL_POLL_INTERVAL", "1.0"))
+
 
 # ✅ 保护单模式：MARKET（默认稳） or LIMIT
 PROTECTIVE_ORDER_MODE = str(os.getenv("PROTECTIVE_ORDER_MODE", "MARKET")).upper().strip()
@@ -119,8 +130,8 @@ def _bot_num(bot_id: str) -> int:
 # ----------------------------
 # ✅ BOT 分组（按你要求）
 # ----------------------------
-LONG_TPSL_BOTS = _parse_bot_list(os.getenv("LONG_TPSL_BOTS", ",".join([f"BOT_{i}" for i in range(1, 11)])))
-SHORT_TPSL_BOTS = _parse_bot_list(os.getenv("SHORT_TPSL_BOTS", ",".join([f"BOT_{i}" for i in range(11, 21)])))
+LONG_TPSL_BOTS = _parse_bot_list(os.getenv("LONG_TPSL_BOTS", ",".join([f"BOT_{i}" for i in range(1, 6)])))
+SHORT_TPSL_BOTS = _parse_bot_list(os.getenv("SHORT_TPSL_BOTS", ",".join([f"BOT_{i}" for i in range(11, 16)])))
 LONG_PNL_ONLY_BOTS = _parse_bot_list(os.getenv("LONG_PNL_ONLY_BOTS", ",".join([f"BOT_{i}" for i in range(21, 31)])))
 SHORT_PNL_ONLY_BOTS = _parse_bot_list(os.getenv("SHORT_PNL_ONLY_BOTS", ",".join([f"BOT_{i}" for i in range(31, 41)])))
 
@@ -219,26 +230,53 @@ def _get_signal_id(body: dict, mode: str, bot_id: str, symbol: str) -> str:
 
 
 # ----------------------------
-# ✅ 交易所 TP/SL（固定百分比）下单
+# ✅ 交易所 TP/SL：固定 TP + 阶梯式追踪 SL（reduceOnly=True）
 # ----------------------------
-def _compute_fixed_bracket_prices(direction: str, entry_price: Decimal) -> Tuple[Decimal, Decimal]:
-    """
-    return (sl_trigger, tp_trigger)
-    """
+
+def _compute_tp_trigger_price(direction: str, entry_price: Decimal) -> Decimal:
     if entry_price <= 0:
-        return Decimal("0"), Decimal("0")
-
-    sl_pct = FIXED_SL_PCT / Decimal("100")
+        return Decimal("0")
     tp_pct = FIXED_TP_PCT / Decimal("100")
-
     if direction.upper() == "LONG":
-        sl = entry_price * (Decimal("1") - sl_pct)
-        tp = entry_price * (Decimal("1") + tp_pct)
-    else:
-        sl = entry_price * (Decimal("1") + sl_pct)
-        tp = entry_price * (Decimal("1") - tp_pct)
+        return entry_price * (Decimal("1") + tp_pct)
+    return entry_price * (Decimal("1") - tp_pct)
 
-    return sl, tp
+
+def _profit_pct(direction: str, entry_price: Decimal, mark_price: Decimal) -> Decimal:
+    if entry_price <= 0 or mark_price <= 0:
+        return Decimal("0")
+    if direction.upper() == "LONG":
+        return (mark_price - entry_price) / entry_price * Decimal("100")
+    return (entry_price - mark_price) / entry_price * Decimal("100")
+
+
+def _desired_lock_pct_from_profit(profit_pct: Decimal) -> Decimal:
+    # Base SL: -0.5%
+    base_sl = -FIXED_SL_PCT
+
+    if profit_pct < TRAIL_START_PROFIT_PCT:
+        return base_sl
+
+    # First raise: profit >= 0.125% -> lock +0.10%
+    if profit_pct < TRAIL_BASE_PROFIT_PCT:
+        return TRAIL_START_LOCK_PCT
+
+    # From 0.35% onwards: every +0.20% profit, lock raises by +0.20%
+    # Mapping example: 0.35->0.15, 0.55->0.35, 0.75->0.55, 0.95->0.75 ...
+    try:
+        n = int((profit_pct - TRAIL_BASE_PROFIT_PCT) // TRAIL_STEP_PCT)
+    except Exception:
+        n = 0
+    return TRAIL_BASE_LOCK_PCT + (TRAIL_STEP_PCT * Decimal(n))
+
+
+def _sl_trigger_from_lock(direction: str, entry_price: Decimal, lock_pct: Decimal) -> Decimal:
+    if entry_price <= 0:
+        return Decimal("0")
+    lp = lock_pct / Decimal("100")
+    if direction.upper() == "LONG":
+        return entry_price * (Decimal("1") + lp)
+    return entry_price * (Decimal("1") - lp)
 
 
 def _apply_limit_slippage(direction: str, trigger: Decimal) -> Decimal:
@@ -255,90 +293,57 @@ def _apply_limit_slippage(direction: str, trigger: Decimal) -> Decimal:
         return trigger * (Decimal("1") + slip)
 
 
-def _cancel_existing_brackets(bot_id: str, symbol: str, direction: str):
+def _cancel_existing_brackets(bot_id: str, symbol: str, direction: str, *, cancel_tp: bool = True, cancel_sl: bool = True):
     po = get_protective_orders(bot_id, symbol, direction)
     if not po:
         return
     sl_oid = po.get("sl_order_id")
     tp_oid = po.get("tp_order_id")
-    if sl_oid:
+
+    if cancel_sl and sl_oid:
         try:
             cancel_order(str(sl_oid))
         except Exception:
             pass
-    if tp_oid:
+    if cancel_tp and tp_oid:
         try:
             cancel_order(str(tp_oid))
         except Exception:
             pass
+
     try:
         clear_protective_orders(bot_id, symbol, direction)
     except Exception:
         pass
 
 
-def _place_fixed_brackets(bot_id: str, symbol: str, direction: str, qty: Decimal, entry_price: Decimal):
-    """
-    BOT_1-20 才会走这里：
-    - 下 SL & TP（reduceOnly=True）
-    - 记录到 DB protective_orders，供 WS fills 自动记账 + OCO
-    """
+def _place_tp_order(bot_id: str, symbol: str, direction: str, qty: Decimal, tp_trigger: Decimal) -> dict:
     bot_id = _canon_bot_id(bot_id)
     symbol = str(symbol).upper().strip()
     direction = direction.upper()
-
-    if qty <= 0 or entry_price <= 0:
-        return
-
-    # 先取消旧的（避免重复挂单）
-    _cancel_existing_brackets(bot_id, symbol, direction)
-
-    sl_trigger, tp_trigger = _compute_fixed_bracket_prices(direction, entry_price)
-    if sl_trigger <= 0 or tp_trigger <= 0:
-        return
 
     expiration = int(time.time()) + int(PROTECTIVE_EXPIRE_SEC)
     exit_side = "SELL" if direction == "LONG" else "BUY"
 
     if PROTECTIVE_ORDER_MODE == "LIMIT":
-        sl_type = "STOP_LIMIT"
         tp_type = "TAKE_PROFIT_LIMIT"
-        sl_price = _apply_limit_slippage(direction, sl_trigger)
         tp_price = _apply_limit_slippage(direction, tp_trigger)
     else:
-        sl_type = "STOP_MARKET"
         tp_type = "TAKE_PROFIT_MARKET"
-        sl_price = None
         tp_price = None
 
-    # Snap trigger prices to tick size for clean logs and added safety (API also snaps as last-mile).
     try:
-        sl_trigger = snap_price_for_order(symbol, exit_side, sl_type, sl_trigger)
         tp_trigger = snap_price_for_order(symbol, exit_side, tp_type, tp_trigger)
-        if sl_price is not None:
-            sl_price = snap_price_for_order(symbol, exit_side, sl_type, sl_price)
         if tp_price is not None:
             tp_price = snap_price_for_order(symbol, exit_side, tp_type, tp_price)
     except Exception as e:
-        print(f"[BRACKET] WARNING snap price failed: {e}")
+        print(f"[TP] WARNING snap price failed: {e}")
 
     bnum = _bot_num(bot_id)
     ts = int(time.time())
-    sl_client = f"{bnum:03d}{ts}01"
     tp_client = f"{bnum:03d}{ts}02"
 
-    sl_res = create_trigger_order(
-        symbol=symbol,
-        side=exit_side,
-        order_type=sl_type,
-        size=str(qty),
-        trigger_price=str(sl_trigger),
-        price=str(sl_price) if sl_price is not None else None,
-        reduce_only=True,
-        client_id=sl_client,
-        expiration_sec=expiration,
-    )
-    tp_res = create_trigger_order(
+    res = create_trigger_order(
         symbol=symbol,
         side=exit_side,
         order_type=tp_type,
@@ -349,9 +354,92 @@ def _place_fixed_brackets(bot_id: str, symbol: str, direction: str, qty: Decimal
         client_id=tp_client,
         expiration_sec=expiration,
     )
+    return {
+        "order_id": res.get("order_id"),
+        "client_order_id": res.get("client_order_id") or tp_client,
+        "trigger": tp_trigger,
+        "raw": res,
+    }
 
-    sl_oid = sl_res.get("order_id")
-    tp_oid = tp_res.get("order_id")
+
+def _place_sl_order(bot_id: str, symbol: str, direction: str, qty: Decimal, sl_trigger: Decimal) -> dict:
+    bot_id = _canon_bot_id(bot_id)
+    symbol = str(symbol).upper().strip()
+    direction = direction.upper()
+
+    expiration = int(time.time()) + int(PROTECTIVE_EXPIRE_SEC)
+    exit_side = "SELL" if direction == "LONG" else "BUY"
+
+    if PROTECTIVE_ORDER_MODE == "LIMIT":
+        sl_type = "STOP_LIMIT"
+        sl_price = _apply_limit_slippage(direction, sl_trigger)
+    else:
+        sl_type = "STOP_MARKET"
+        sl_price = None
+
+    try:
+        sl_trigger = snap_price_for_order(symbol, exit_side, sl_type, sl_trigger)
+        if sl_price is not None:
+            sl_price = snap_price_for_order(symbol, exit_side, sl_type, sl_price)
+    except Exception as e:
+        print(f"[SL] WARNING snap price failed: {e}")
+
+    bnum = _bot_num(bot_id)
+    ts = int(time.time())
+    sl_client = f"{bnum:03d}{ts}01"
+
+    res = create_trigger_order(
+        symbol=symbol,
+        side=exit_side,
+        order_type=sl_type,
+        size=str(qty),
+        trigger_price=str(sl_trigger),
+        price=str(sl_price) if sl_price is not None else None,
+        reduce_only=True,
+        client_id=sl_client,
+        expiration_sec=expiration,
+    )
+    return {
+        "order_id": res.get("order_id"),
+        "client_order_id": res.get("client_order_id") or sl_client,
+        "trigger": sl_trigger,
+        "raw": res,
+    }
+
+
+def _set_or_update_brackets(bot_id: str, symbol: str, direction: str, qty: Decimal, entry_price: Decimal, lock_pct: Decimal, *, replace_tp: bool, replace_sl: bool):
+    bot_id = _canon_bot_id(bot_id)
+    symbol = str(symbol).upper().strip()
+    direction = direction.upper()
+
+    if qty <= 0 or entry_price <= 0:
+        return
+
+    po = get_protective_orders(bot_id, symbol, direction) or {}
+    sl_oid_old = po.get("sl_order_id")
+    tp_oid_old = po.get("tp_order_id")
+
+    if replace_sl and sl_oid_old:
+        try:
+            cancel_order(str(sl_oid_old))
+        except Exception:
+            pass
+    if replace_tp and tp_oid_old:
+        try:
+            cancel_order(str(tp_oid_old))
+        except Exception:
+            pass
+
+    tp_trigger = _compute_tp_trigger_price(direction, entry_price)
+    sl_trigger = _sl_trigger_from_lock(direction, entry_price, lock_pct)
+
+    sl_res = _place_sl_order(bot_id, symbol, direction, qty, sl_trigger) if replace_sl else None
+    tp_res = _place_tp_order(bot_id, symbol, direction, qty, tp_trigger) if replace_tp else None
+
+    sl_oid = (sl_res or {}).get("order_id") or sl_oid_old
+    tp_oid = (tp_res or {}).get("order_id") or tp_oid_old
+    sl_client_id = (sl_res or {}).get("client_order_id") or po.get("sl_client_id")
+    tp_client_id = (tp_res or {}).get("client_order_id") or po.get("tp_client_id")
 
     set_protective_orders(
         bot_id=bot_id,
@@ -359,19 +447,83 @@ def _place_fixed_brackets(bot_id: str, symbol: str, direction: str, qty: Decimal
         direction=direction,
         sl_order_id=str(sl_oid) if sl_oid else None,
         tp_order_id=str(tp_oid) if tp_oid else None,
-        sl_client_id=sl_res.get("client_order_id") or sl_client,
-        tp_client_id=tp_res.get("client_order_id") or tp_client,
+        sl_client_id=sl_client_id,
+        tp_client_id=tp_client_id,
         sl_price=sl_trigger,
         tp_price=tp_trigger,
         is_active=True,
     )
+    set_lock_level_pct(bot_id, symbol, direction, lock_pct)
 
-    print(
-        f"[BRACKET] set bot={bot_id} {direction} {symbol} qty={qty} entry={entry_price} "
-        f"SL({sl_type}) trigger={sl_trigger} oid={sl_oid} | TP({tp_type}) trigger={tp_trigger} oid={tp_oid}"
-    )
+    if replace_tp and replace_sl:
+        print(f"[BRACKET] init bot={bot_id} {direction} {symbol} qty={qty} entry={entry_price} SL(lock={lock_pct}%)={sl_trigger} TP={tp_trigger}")
+    elif replace_sl and not replace_tp:
+        print(f"[BRACKET] trail bot={bot_id} {direction} {symbol} qty={qty} entry={entry_price} lock={lock_pct}% SL={sl_trigger} (TP kept)")
 
 
+def _place_initial_brackets(bot_id: str, symbol: str, direction: str, qty: Decimal, entry_price: Decimal):
+    lock_pct = -FIXED_SL_PCT
+    _set_or_update_brackets(bot_id, symbol, direction, qty, entry_price, lock_pct, replace_tp=True, replace_sl=True)
+
+
+def _trail_update_sl_if_needed(bot_id: str, symbol: str, direction: str, qty: Decimal, entry_price: Decimal):
+    try:
+        rules = _get_symbol_rules(symbol)
+        min_qty = rules["min_qty"]
+        exit_side = "SELL" if direction.upper() == "LONG" else "BUY"
+        px = Decimal(str(get_market_price(symbol, exit_side, str(min_qty))))
+    except Exception:
+        return
+
+    p = _profit_pct(direction, entry_price, px)
+    desired_lock = _desired_lock_pct_from_profit(p)
+
+    try:
+        current_lock = Decimal(str(get_lock_level_pct(bot_id, symbol, direction) or "0"))
+    except Exception:
+        current_lock = Decimal("0")
+
+    if desired_lock <= current_lock:
+        return
+
+    _set_or_update_brackets(bot_id, symbol, direction, qty, entry_price, desired_lock, replace_tp=False, replace_sl=True)
+
+
+_TRAIL_THREAD_STARTED = False
+_TRAIL_LOCK = threading.Lock()
+
+
+def _trailing_loop():
+    print("[TRAIL] loop started")
+    while True:
+        try:
+            bots = sorted(list(LONG_TPSL_BOTS | SHORT_TPSL_BOTS))
+            for bot_id in bots:
+                bot_id = _canon_bot_id(bot_id)
+                if not _bot_has_exchange_brackets(bot_id):
+                    continue
+                opens = get_bot_open_positions(bot_id)
+                for (symbol, direction), v in opens.items():
+                    qty = v.get("qty", Decimal("0"))
+                    entry_price = v.get("weighted_entry", Decimal("0"))
+                    if qty <= 0 or entry_price <= 0:
+                        continue
+                    _trail_update_sl_if_needed(bot_id, symbol, direction, qty, entry_price)
+        except Exception as e:
+            print("[TRAIL] error:", e)
+
+        time.sleep(TRAIL_POLL_INTERVAL)
+
+
+def _ensure_trailing_thread():
+    global _TRAIL_THREAD_STARTED
+    with _TRAIL_LOCK:
+        if _TRAIL_THREAD_STARTED:
+            return
+        t = threading.Thread(target=_trailing_loop, daemon=True)
+        t.start()
+        _TRAIL_THREAD_STARTED = True
+        print("[TRAIL] thread created")
 # ----------------------------
 # ✅ WS orders -> 自动记账 + OCO（NO fills subscription）
 # ----------------------------
@@ -494,6 +646,7 @@ def _ensure_monitor_thread():
         if ENABLE_WS:
             start_private_ws()
             _ensure_ws_orders_thread()
+            _ensure_trailing_thread()
 
             # ✅ Backup path: REST poll orders every N seconds (main path still WS)
             if str(os.getenv("ENABLE_REST_POLL", "1")).strip() == "1":
@@ -1135,7 +1288,7 @@ def tv_webhook():
         if _bot_has_exchange_brackets(bot_id) and entry_price_dec is not None and final_qty > 0:
             direction = "LONG" if side_raw == "BUY" else "SHORT"
             try:
-                _place_fixed_brackets(bot_id, symbol, direction, final_qty, entry_price_dec)
+                _place_initial_brackets(bot_id, symbol, direction, final_qty, entry_price_dec)
             except Exception as e:
                 print("[BRACKET] place error:", e)
 
