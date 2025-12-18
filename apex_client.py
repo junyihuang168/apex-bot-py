@@ -61,6 +61,350 @@ _WS_ORDER_STATE: Dict[str, Dict[str, Any]] = {}
 _ORDER_ID_TO_CLIENT_ID: Dict[str, str] = {}
 
 
+# ----------------------------
+# ✅ REST polling fallback (orders)
+# ----------------------------
+_REST_POLL_STARTED = False
+_REST_POLL_LOCK = threading.Lock()
+
+_TERMINAL_STATUSES = {"FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED", "FAIL"}
+
+def _status_is_terminal(status: str) -> bool:
+    s = str(status or "").upper().strip()
+    return s in _TERMINAL_STATUSES
+
+
+def _pick(d: dict, *keys):
+    for k in keys:
+        v = d.get(k)
+        if v is not None:
+            return v
+    return None
+
+
+def _to_decimal_opt(x) -> Optional[Decimal]:
+    if x is None:
+        return None
+    # Treat empty string as None
+    if isinstance(x, str) and x.strip() == "":
+        return None
+    try:
+        return Decimal(str(x))
+    except Exception:
+        return None
+
+
+def _parse_order_fill_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract (cum_qty, avg_px, notional, status, symbol, client_order_id) from an order-like dict.
+
+    Works across SDK/field variations:
+    - qty keys: cumFilledSize / filledSize / cumSuccessFillSize / cumMatchFillSize / executedQty ...
+    - avg keys: avgPrice / averagePrice / fillAvgPrice ...
+    - value keys: cumSuccessFillValue / cumMatchFillValue / cumFilledValue ...
+      If avg is missing but value exists, compute avg = value / qty.
+    """
+    d = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    if not isinstance(d, dict):
+        return {}
+
+    order_id = _pick(d, "orderId", "id")
+    client_oid = _pick(d, "clientOrderId", "clientId", "client_id")
+    symbol = _pick(d, "symbol", "market", "instrumentId")
+    status = _pick(d, "status", "orderStatus", "state") or ""
+
+    cum_qty = _to_decimal_opt(_pick(
+        d,
+        "cumFilledSize", "filledSize", "sizeFilled", "cumFilled", "executedQty",
+        "cumSuccessFillSize", "cumMatchFillSize", "cumMatchFillSize", "cumSuccessFillSize"
+    ))
+
+    avg_px = _to_decimal_opt(_pick(d, "avgPrice", "fillAvgPrice", "averagePrice", "avgFillPrice", "avg"))
+
+    cum_val = _to_decimal_opt(_pick(
+        d,
+        "cumSuccessFillValue", "cumMatchFillValue", "cumFilledValue", "filledValue",
+        "cumSuccessFillValue", "cumSuccessFillValue"
+    ))
+
+    # Some payloads may provide last fill fields
+    last_fill_qty = _to_decimal_opt(_pick(d, "latestMatchFillSize", "lastMatchFillSize", "lastFillQty", "latestFillSize"))
+    last_fill_px = _to_decimal_opt(_pick(d, "latestMatchFillPrice", "lastMatchFillPrice", "lastFillPrice", "latestFillPrice"))
+
+    notional = None
+    if cum_qty is not None and cum_qty > 0:
+        if avg_px is not None and avg_px > 0:
+            notional = (avg_px * cum_qty)
+        elif cum_val is not None and cum_val > 0:
+            notional = cum_val
+            try:
+                avg_px = (cum_val / cum_qty)
+            except Exception:
+                avg_px = None
+
+    return {
+        "order_id": str(order_id) if order_id is not None else None,
+        "client_order_id": str(client_oid) if client_oid is not None else None,
+        "symbol": str(symbol).upper().strip() if symbol is not None else None,
+        "status": str(status).upper().strip(),
+        "cum_qty": cum_qty,
+        "avg_px": avg_px,
+        "notional": notional,
+        "last_fill_qty": last_fill_qty,
+        "last_fill_px": last_fill_px,
+        "raw": d,
+    }
+
+
+def register_order_for_tracking(order_id: Optional[str], client_order_id: Optional[str] = None, symbol: Optional[str] = None, status: str = "PENDING"):
+    """Ensure an orderId exists in the local tracker so REST poller can pick it up even if WS misses."""
+    if not order_id:
+        return
+    oid = str(order_id)
+    prev = _WS_ORDER_STATE.get(oid)
+    if prev is None:
+        _WS_ORDER_STATE[oid] = {
+            "cum_qty": Decimal("0"),
+            "avg": None,
+            "notional": Decimal("0"),
+            "status": str(status or "").upper().strip(),
+            "ts": time.time(),
+            "client_order_id": client_order_id,
+            "symbol": symbol.upper().strip() if isinstance(symbol, str) else symbol,
+        }
+    else:
+        # refresh identifiers
+        if client_order_id:
+            prev["client_order_id"] = client_order_id
+        if symbol:
+            prev["symbol"] = symbol.upper().strip()
+        if status:
+            prev["status"] = str(status).upper().strip()
+        prev["ts"] = time.time()
+
+
+def _rest_fetch_order_detail(order_id: str) -> Optional[Dict[str, Any]]:
+    """Best-effort REST order lookup across SDK versions."""
+    client = get_client()
+    if not order_id:
+        return None
+
+    direct_methods = [
+        "get_order_v3",
+        "get_order_detail_v3",
+        "get_order_by_id_v3",
+        "get_order_v3_by_id",
+        "getOrderV3",
+        "getOrderDetailV3",
+        "getOrderByIdV3",
+    ]
+    last_err = None
+    for name in direct_methods:
+        if not hasattr(client, name):
+            continue
+        fn = getattr(client, name)
+        try:
+            try:
+                res = fn(orderId=str(order_id))
+            except Exception:
+                try:
+                    res = fn(id=str(order_id))
+                except Exception:
+                    res = fn(str(order_id))
+            if res is not None:
+                return res if isinstance(res, dict) else {"data": res}
+        except Exception as e:
+            last_err = e
+
+    # List-based methods (fallback)
+    list_methods = [
+        "get_open_orders_v3",
+        "open_orders_v3",
+        "get_orders_v3",
+        "orders_v3",
+        "get_order_history_v3",
+        "order_history_v3",
+        "get_orders_history_v3",
+    ]
+    for name in list_methods:
+        if not hasattr(client, name):
+            continue
+        fn = getattr(client, name)
+        try:
+            res = _safe_call(fn)
+            data = None
+            if isinstance(res, dict):
+                data = res.get("data") if res.get("data") is not None else (res.get("orders") or res.get("list"))
+            elif isinstance(res, list):
+                data = res
+
+            if isinstance(data, dict) and "orders" in data:
+                data = data.get("orders")
+            if isinstance(data, dict) and "list" in data:
+                data = data.get("list")
+
+            if isinstance(data, list):
+                for it in data:
+                    if not isinstance(it, dict):
+                        continue
+                    oid = it.get("orderId") or it.get("id")
+                    if oid is not None and str(oid) == str(order_id):
+                        return {"data": it, "raw_list": res, "raw_source": name}
+        except Exception as e:
+            last_err = e
+
+    return None
+
+
+def start_order_rest_poller(poll_interval: float = 5.0):
+    """Start a background REST poller to advance order trackers when WS misses or fields are delayed."""
+    global _REST_POLL_STARTED
+    with _REST_POLL_LOCK:
+        if _REST_POLL_STARTED:
+            return
+        _REST_POLL_STARTED = True
+
+    poll_interval = float(poll_interval or 5.0)
+
+    def _poll_loop():
+        while True:
+            try:
+                now = time.time()
+
+                # prune old terminal orders to keep memory bounded
+                try:
+                    prune_after = float(os.getenv("ORDER_TRACKER_PRUNE_SEC", "120"))
+                except Exception:
+                    prune_after = 120.0
+                to_del = []
+                for oid, st in list(_WS_ORDER_STATE.items()):
+                    try:
+                        if _status_is_terminal(str(st.get("status") or "")) and (now - float(st.get("ts", 0.0)) > prune_after):
+                            to_del.append(oid)
+                    except Exception:
+                        continue
+                for oid in to_del:
+                    _WS_ORDER_STATE.pop(oid, None)
+
+                # poll non-terminal orders (best-effort; bounded per cycle)
+                try:
+                    max_per_cycle = int(os.getenv("REST_ORDER_POLL_MAX_PER_CYCLE", "50"))
+                except Exception:
+                    max_per_cycle = 50
+
+                cands = []
+                for oid, st in list(_WS_ORDER_STATE.items()):
+                    status = str(st.get("status") or "")
+                    if _status_is_terminal(status):
+                        continue
+                    cands.append((oid, st))
+                # prioritize stale ones
+                cands.sort(key=lambda x: float(x[1].get("ts", 0.0)))
+
+                for oid, st in cands[:max_per_cycle]:
+                    order_obj = _rest_fetch_order_detail(oid)
+                    if not isinstance(order_obj, dict):
+                        continue
+
+                    parsed = _parse_order_fill_fields(order_obj)
+                    if not parsed:
+                        continue
+
+                    cum_qty = parsed.get("cum_qty")
+                    avg_px = parsed.get("avg_px")
+                    notional = parsed.get("notional")
+                    status = parsed.get("status") or ""
+                    symbol = parsed.get("symbol") or st.get("symbol")
+                    client_oid = parsed.get("client_order_id") or st.get("client_order_id")
+
+                    prev_cum = Decimal(str(st.get("cum_qty") or "0"))
+                    prev_avg = st.get("avg")
+                    prev_notional = Decimal(str(st.get("notional") or "0"))
+
+                    delta_qty = Decimal("0")
+                    delta_px = None
+
+                    # update tracker & compute delta
+                    if cum_qty is not None and cum_qty > prev_cum:
+                        delta_qty = (cum_qty - prev_cum)
+
+                        # derive notional
+                        if notional is not None:
+                            new_notional = Decimal(str(notional))
+                        elif avg_px is not None and cum_qty > 0:
+                            new_notional = (Decimal(str(avg_px)) * cum_qty)
+                        else:
+                            new_notional = None
+
+                        if new_notional is not None:
+                            # compute delta price via notional difference
+                            if prev_avg is not None and prev_cum > 0:
+                                prev_notional = (Decimal(str(prev_avg)) * prev_cum)
+                            delta_notional = (new_notional - prev_notional)
+                            if delta_qty > 0:
+                                try:
+                                    delta_px = (delta_notional / delta_qty)
+                                except Exception:
+                                    delta_px = None
+
+                            st["notional"] = new_notional
+                            if avg_px is not None and Decimal(str(avg_px)) > 0:
+                                st["avg"] = Decimal(str(avg_px))
+                            elif cum_qty > 0:
+                                try:
+                                    st["avg"] = (new_notional / cum_qty)
+                                except Exception:
+                                    pass
+                        else:
+                            # try last-fill fields as fallback
+                            lf_qty = parsed.get("last_fill_qty")
+                            lf_px = parsed.get("last_fill_px")
+                            if lf_qty is not None and lf_px is not None and Decimal(str(lf_qty)) > 0 and Decimal(str(lf_px)) > 0:
+                                delta_px = Decimal(str(lf_px))
+
+                        st["cum_qty"] = Decimal(str(cum_qty))
+
+                    if status:
+                        st["status"] = str(status).upper().strip()
+                    if symbol:
+                        st["symbol"] = str(symbol).upper().strip()
+                    if client_oid:
+                        st["client_order_id"] = str(client_oid)
+                        _ORDER_ID_TO_CLIENT_ID[str(oid)] = str(client_oid)
+
+                    st["ts"] = time.time()
+                    _WS_ORDER_STATE[str(oid)] = st
+
+                    if delta_qty > 0 and delta_px is not None and (symbol or st.get("symbol")):
+                        evt = {
+                            "type": "order_delta",
+                            "order_id": str(oid),
+                            "client_order_id": client_oid or st.get("client_order_id"),
+                            "symbol": (symbol or st.get("symbol")),
+                            "status": st.get("status"),
+                            "cum_filled_qty": str(st.get("cum_qty")),
+                            "avg_fill_price": str(st.get("avg")) if st.get("avg") is not None else None,
+                            "delta_qty": str(delta_qty),
+                            "delta_price": str(delta_px),
+                            "raw": parsed.get("raw"),
+                            "ts": time.time(),
+                            "source": "rest_poll",
+                        }
+                        try:
+                            _ORDER_Q.put_nowait(evt)
+                        except Exception:
+                            pass
+
+            except Exception as e:
+                print("[apex_client][REST-POLL] error:", e)
+
+            time.sleep(poll_interval)
+
+    t = threading.Thread(target=_poll_loop, daemon=True, name="apex-order-rest-poller")
+    t.start()
+    print(f"[apex_client][REST-POLL] started (interval={poll_interval}s)")
+
+
+
 def _get_symbol_rules(symbol: str) -> Dict[str, Any]:
     s = symbol.upper()
     rules = SYMBOL_RULES.get(s, {})
@@ -437,50 +781,62 @@ def start_private_ws():
             if not isinstance(contents, dict):
                 return
 
-            # Prefer orders updates. SDKs differ: orders / order / orderUpdates.
-            orders = (
+            found = []
+
+            def _walk(x):
+                if isinstance(x, dict):
+                    # Heuristic: order-like dict if it has any common order fields
+                    if any(k in x for k in (
+                        "orderId", "id", "clientOrderId", "clientId",
+                        "status", "orderStatus", "state",
+                        "cumFilledSize", "filledSize", "cumSuccessFillSize", "cumMatchFillSize",
+                        "avgPrice", "averagePrice", "fillAvgPrice",
+                        "cumSuccessFillValue", "cumMatchFillValue",
+                    )):
+                        found.append(x)
+                    for v in x.values():
+                        if isinstance(v, (dict, list)):
+                            _walk(v)
+                elif isinstance(x, list):
+                    for v in x:
+                        if isinstance(v, (dict, list)):
+                            _walk(v)
+
+            cand = (
                 contents.get("orders")
                 or contents.get("order")
                 or contents.get("orderUpdates")
                 or contents.get("ordersV3")
             )
+            if cand is not None:
+                _walk(cand)
+            else:
+                _walk(contents)
 
-            if isinstance(orders, dict):
-                orders = [orders]
-
-            if not isinstance(orders, list) or not orders:
+            if not found:
                 return
 
-            for o in orders:
-                if not isinstance(o, dict):
+            for raw in found:
+                parsed = _parse_order_fill_fields(raw)
+                if not parsed:
                     continue
 
-                # Normalize order payload
-                data = o.get("data") if isinstance(o.get("data"), dict) else o
-                if not isinstance(data, dict):
-                    continue
-
-                order_id = _pick(data, "orderId", "id")
+                order_id = parsed.get("order_id")
                 if not order_id:
                     continue
                 order_id = str(order_id)
 
-                client_oid = _pick(data, "clientOrderId", "clientId", "client_id")
-                if client_oid is not None:
-                    client_oid = str(client_oid)
-                    _ORDER_ID_TO_CLIENT_ID[order_id] = client_oid
+                client_oid = parsed.get("client_order_id")
+                if client_oid:
+                    _ORDER_ID_TO_CLIENT_ID[order_id] = str(client_oid)
 
-                symbol = _pick(data, "symbol")
-                if symbol is not None:
-                    symbol = str(symbol).upper().strip()
+                symbol = parsed.get("symbol")
+                status = parsed.get("status") or ""
 
-                status = _pick(data, "status", "orderStatus", "state")
-                status = str(status).upper().strip() if status is not None else ""
+                cum_qty = parsed.get("cum_qty")
+                avg_px = parsed.get("avg_px")
+                notional = parsed.get("notional")
 
-                cum_qty = _to_decimal(_pick(data, "cumFilledSize", "filledSize", "sizeFilled", "cumFilled", "executedQty"))
-                avg_px = _to_decimal(_pick(data, "avgPrice", "fillAvgPrice", "averagePrice", "avgFillPrice"))
-
-                # Update tracker even if only status changes.
                 prev = _WS_ORDER_STATE.get(order_id) or {
                     "cum_qty": Decimal("0"),
                     "avg": None,
@@ -495,46 +851,67 @@ def start_private_ws():
                 prev_avg = prev.get("avg")
                 prev_notional = Decimal(str(prev.get("notional") or "0"))
 
-                # If cum/avg absent, only refresh status/timestamps.
                 delta_qty = Decimal("0")
                 delta_px: Optional[Decimal] = None
 
-                if cum_qty is not None and cum_qty >= 0:
-                    # notional reconstruction requires avg
-                    if avg_px is not None and cum_qty > 0:
-                        new_notional = (avg_px * cum_qty)
+                if cum_qty is not None and cum_qty > prev_cum:
+                    delta_qty = (cum_qty - prev_cum)
+
+                    # Determine new notional if possible (prefer explicit notional/value)
+                    new_notional = None
+                    if notional is not None:
+                        new_notional = Decimal(str(notional))
+                    elif avg_px is not None and cum_qty > 0:
+                        new_notional = (Decimal(str(avg_px)) * cum_qty)
+
+                    if new_notional is not None:
                         if prev_avg is not None and prev_cum > 0:
                             prev_notional = (Decimal(str(prev_avg)) * prev_cum)
-                        else:
-                            prev_notional = Decimal(str(prev_notional or "0"))
+                        delta_notional = (new_notional - prev_notional)
+                        if delta_qty > 0:
+                            try:
+                                delta_px = (delta_notional / delta_qty)
+                            except Exception:
+                                delta_px = None
 
-                        if cum_qty > prev_cum:
-                            delta_qty = (cum_qty - prev_cum)
-                            delta_notional = (new_notional - prev_notional)
-                            if delta_qty > 0:
-                                try:
-                                    delta_px = (delta_notional / delta_qty)
-                                except Exception:
-                                    delta_px = None
-
-                        prev["cum_qty"] = cum_qty
-                        prev["avg"] = avg_px
+                        prev["cum_qty"] = Decimal(str(cum_qty))
                         prev["notional"] = new_notional
+
+                        if avg_px is not None and Decimal(str(avg_px)) > 0:
+                            prev["avg"] = Decimal(str(avg_px))
+                        else:
+                            # compute avg from notional
+                            try:
+                                prev["avg"] = (new_notional / Decimal(str(cum_qty)))
+                            except Exception:
+                                pass
                     else:
-                        # If avg is missing, still store cum_qty so we can later reconcile once avg arrives.
-                        prev["cum_qty"] = cum_qty
+                        # As a last resort, use last fill price for delta (still better than quote)
+                        lf_qty = parsed.get("last_fill_qty")
+                        lf_px = parsed.get("last_fill_px")
+                        if lf_qty is not None and lf_px is not None and Decimal(str(lf_qty)) > 0 and Decimal(str(lf_px)) > 0:
+                            prev["cum_qty"] = Decimal(str(cum_qty))
+                            delta_px = Decimal(str(lf_px))
+
+                else:
+                    # Still update cum_qty if present (even if unchanged) for later reconciliation
+                    if cum_qty is not None and cum_qty >= 0:
+                        prev["cum_qty"] = Decimal(str(cum_qty))
+                    # If avg is newly available, update it
+                    if avg_px is not None and cum_qty is not None and cum_qty > 0 and Decimal(str(avg_px)) > 0:
+                        prev["avg"] = Decimal(str(avg_px))
+                        prev["notional"] = (Decimal(str(avg_px)) * Decimal(str(cum_qty)))
 
                 if status:
-                    prev["status"] = status
+                    prev["status"] = str(status).upper().strip()
                 if client_oid:
-                    prev["client_order_id"] = client_oid
+                    prev["client_order_id"] = str(client_oid)
                 if symbol:
-                    prev["symbol"] = symbol
+                    prev["symbol"] = str(symbol).upper().strip()
 
                 prev["ts"] = time.time()
                 _WS_ORDER_STATE[order_id] = prev
 
-                # Emit delta event only when we can compute a delta price.
                 if delta_qty > 0 and delta_px is not None and (symbol or prev.get("symbol")):
                     evt = {
                         "type": "order_delta",
@@ -546,7 +923,7 @@ def start_private_ws():
                         "avg_fill_price": str(prev.get("avg")) if prev.get("avg") is not None else None,
                         "delta_qty": str(delta_qty),
                         "delta_price": str(delta_px),
-                        "raw": data,
+                        "raw": parsed.get("raw"),
                         "ts": time.time(),
                     }
                     try:
@@ -556,7 +933,6 @@ def start_private_ws():
 
         except Exception as e:
             print("[apex_client][WS] handle_account error:", e)
-
     def _run_forever():
         backoff = 1.0
         while True:
@@ -594,23 +970,40 @@ def pop_order_event(timeout: float = 0.5) -> Optional[dict]:
         return None
 
 
+
 def _ws_order_summary(order_id: Optional[str], client_order_id: Optional[str]) -> Optional[Dict[str, Any]]:
     now = time.time()
     ttl = float(os.getenv("WS_ORDER_TTL_SEC", "30"))
     if order_id:
         st = _WS_ORDER_STATE.get(str(order_id))
         if st and (now - float(st.get("ts", 0.0)) <= ttl):
-            cum = st.get("cum_qty")
+            try:
+                cum = Decimal(str(st.get("cum_qty") or "0"))
+            except Exception:
+                cum = Decimal("0")
+
             avg = st.get("avg")
-            if cum is not None and avg is not None and Decimal(str(cum)) > 0 and Decimal(str(avg)) > 0:
-                return {
-                    "order_id": str(order_id),
-                    "client_order_id": client_order_id or st.get("client_order_id"),
-                    "filled_qty": Decimal(str(cum)),
-                    "avg_fill_price": Decimal(str(avg)),
-                    "status": str(st.get("status") or ""),
-                }
+            notional = st.get("notional")
+
+            if cum > 0:
+                # If avg is missing but notional exists, compute avg.
+                try:
+                    if (avg is None) or (Decimal(str(avg)) <= 0):
+                        if notional is not None and Decimal(str(notional)) > 0:
+                            avg = (Decimal(str(notional)) / cum)
+                except Exception:
+                    pass
+
+                if avg is not None and Decimal(str(avg)) > 0:
+                    return {
+                        "order_id": str(order_id),
+                        "client_order_id": client_order_id or st.get("client_order_id"),
+                        "filled_qty": cum,
+                        "avg_fill_price": Decimal(str(avg)),
+                        "status": str(st.get("status") or ""),
+                    }
     return None
+
 
 
 
@@ -621,12 +1014,12 @@ def get_fill_summary(
     max_wait_sec: float = 12.0,
     poll_interval: float = 0.25,
 ) -> Dict[str, Any]:
-    """
-    ✅ Order-based fill summary (NO fills subscription).
+    """✅ Order-based fill summary (NO fills subscription).
 
     Priority:
-      1) Private WS order tracker (_WS_ORDER_STATE) derived from order updates.
-      2) REST order detail (filledSize/cumFilledSize + avgPrice) as fallback.
+      1) WS order tracker (_WS_ORDER_STATE), derived from private WS *order* updates.
+      2) REST order detail (orderId) as fallback.
+         - Supports cases where avgPrice/averagePrice is missing by computing avg from (cumFillValue / cumFillSize).
 
     This function NEVER uses market quote / worstPrice as execution price.
     """
@@ -644,57 +1037,39 @@ def get_fill_summary(
             "raw_source": "ws_order",
         }
 
-    client = get_client()
+    if not order_id:
+        raise RuntimeError("order_id is required for order-based fill summary")
+
     start = time.time()
     last_err: Optional[Exception] = None
 
     while True:
-        # 2) REST order detail fallback (no fills endpoint)
-        order_obj = None
-        candidates = [
-            "get_order_v3",
-            "get_order_detail_v3",
-            "get_order_by_id_v3",
-            "get_order_v3_by_id",
-        ]
-        for name in candidates:
-            if hasattr(client, name) and order_id:
-                try:
-                    fn = getattr(client, name)
-                    try:
-                        order_obj = fn(orderId=order_id)
-                    except Exception:
-                        order_obj = fn(order_id)
-                    break
-                except Exception as e:
-                    last_err = e
+        # 2) REST order detail fallback
+        try:
+            order_obj = _rest_fetch_order_detail(str(order_id))
+        except Exception as e:
+            order_obj = None
+            last_err = e
 
         if isinstance(order_obj, dict):
-            data = order_obj.get("data") if isinstance(order_obj.get("data"), dict) else order_obj
-            if isinstance(data, dict):
-                fq = data.get("filledSize") or data.get("cumFilledSize") or data.get("sizeFilled")
-                ap = data.get("avgPrice") or data.get("averagePrice") or data.get("fillAvgPrice")
-                st = data.get("status") or data.get("orderStatus") or data.get("state") or ""
-                try:
-                    if fq and ap:
-                        dq = Decimal(str(fq))
-                        dp = Decimal(str(ap))
-                        if dq > 0 and dp > 0:
-                            return {
-                                "symbol": symbol,
-                                "order_id": order_id,
-                                "client_order_id": client_order_id,
-                                "filled_qty": dq,
-                                "avg_fill_price": dp,
-                                "order_status": str(st).upper(),
-                                "raw_order": order_obj,
-                                "raw_source": "rest_order",
-                            }
-                except Exception as e:
-                    last_err = e
-
-        if time.time() - start >= max_wait_sec:
-            raise RuntimeError(f"order fill summary unavailable, last_err={last_err!r}")
+            parsed = _parse_order_fill_fields(order_obj)
+            try:
+                dq = parsed.get("cum_qty")
+                dp = parsed.get("avg_px")
+                st = parsed.get("status") or ""
+                if dq is not None and dp is not None and Decimal(str(dq)) > 0 and Decimal(str(dp)) > 0:
+                    return {
+                        "symbol": symbol,
+                        "order_id": order_id,
+                        "client_order_id": client_order_id or parsed.get("client_order_id"),
+                        "filled_qty": Decimal(str(dq)),
+                        "avg_fill_price": Decimal(str(dp)),
+                        "order_status": str(st).upper(),
+                        "raw_order": order_obj,
+                        "raw_source": "rest_order",
+                    }
+            except Exception as e:
+                last_err = e
 
         # Re-check WS each loop in case WS arrives after first miss.
         ws_hit = _ws_order_summary(order_id, client_order_id)
@@ -710,7 +1085,11 @@ def get_fill_summary(
                 "raw_source": "ws_order",
             }
 
+        if time.time() - start >= max_wait_sec:
+            raise RuntimeError(f"order fill summary unavailable, last_err={last_err!r}")
+
         time.sleep(poll_interval)
+
 
 
 def create_market_order(
@@ -792,6 +1171,16 @@ def create_market_order(
 
     data = raw_order["data"] if isinstance(raw_order, dict) and "data" in raw_order else raw_order
     order_id, client_order_id = _extract_order_ids(raw_order)
+    # Ensure tracker contains this order for WS/REST reconciliation
+    try:
+        od = raw_order.get("data") if isinstance(raw_order, dict) else None
+        st = ""
+        if isinstance(od, dict):
+            st = str(od.get("status") or od.get("orderStatus") or od.get("state") or "")
+        register_order_for_tracking(order_id=order_id, client_order_id=client_order_id, symbol=symbol, status=st or "PENDING")
+    except Exception:
+        pass
+
 
     if order_id and client_order_id:
         _ORDER_ID_TO_CLIENT_ID[str(order_id)] = str(client_order_id)
