@@ -14,7 +14,7 @@ from apex_client import (
     _get_symbol_rules,
     _snap_quantity,
     start_private_ws,
-    pop_fill_event,
+    pop_order_event,
     create_trigger_order,
     snap_price_for_order,
     cancel_order,
@@ -27,6 +27,7 @@ from pnl_store import (
     list_bots_with_activity,
     get_bot_summary,
     get_bot_open_positions,
+    get_symbol_open_directions,
     clear_lock_level_pct,
     is_signal_processed,
     mark_signal_processed,
@@ -371,23 +372,33 @@ def _place_fixed_brackets(bot_id: str, symbol: str, direction: str, qty: Decimal
 
 
 # ----------------------------
-# ✅ WS fills -> 自动记账 + OCO
+# ✅ WS orders -> 自动记账 + OCO（NO fills subscription）
 # ----------------------------
-def _fills_loop():
-    print("[WS-FILLS] loop started")
+def _orders_loop():
+    print("[WS-ORDERS] loop started")
     while True:
-        evt = pop_fill_event(timeout=0.5)
+        evt = pop_order_event(timeout=0.5)
         if not evt:
             continue
 
         try:
-            fill_id = str(evt.get("id") or "")
-            order_id = str(evt.get("orderId") or "")
-            symbol = str(evt.get("symbol") or "").upper().strip()
-            px = evt.get("price")
-            sz = evt.get("size")
+            if str(evt.get("type") or "") != "order_delta":
+                continue
 
-            if not fill_id or not order_id or not symbol or px is None or sz is None:
+            order_id = str(evt.get("order_id") or "")
+            symbol = str(evt.get("symbol") or "").upper().strip()
+            status = str(evt.get("status") or "").upper().strip()
+
+            delta_qty = evt.get("delta_qty")
+            delta_px = evt.get("delta_price")
+            cum_qty = evt.get("cum_filled_qty")
+
+            if not order_id or not symbol or delta_qty is None or delta_px is None or cum_qty is None:
+                continue
+
+            dq = Decimal(str(delta_qty))
+            dp = Decimal(str(delta_px))
+            if dq <= 0 or dp <= 0:
                 continue
 
             owner = find_protective_owner_by_order_id(order_id)
@@ -398,15 +409,11 @@ def _fills_loop():
             direction = str(owner["direction"]).upper()
             kind = str(owner.get("kind") or "").upper()  # SL / TP
 
-            sig_id = f"fill:{fill_id}"
+            # Idempotency: per (order_id, cum_qty)
+            sig_id = f"orderfill:{order_id}:{cum_qty}"
             if is_signal_processed(bot_id, sig_id):
                 continue
-            mark_signal_processed(bot_id, sig_id, kind=f"ws_{kind.lower()}_fill")
-
-            dq = Decimal(str(sz))
-            dp = Decimal(str(px))
-            if dq <= 0 or dp <= 0:
-                continue
+            mark_signal_processed(bot_id, sig_id, kind=f"ws_order_{kind.lower()}_delta")
 
             entry_side = "BUY" if direction == "LONG" else "SELL"
 
@@ -416,7 +423,7 @@ def _fills_loop():
                 entry_side=entry_side,
                 exit_qty=dq,
                 exit_price=dp,
-                reason=f"exchange_{kind.lower()}_fill",
+                reason=f"exchange_{kind.lower()}_order_delta",
             )
 
             opens = get_bot_open_positions(bot_id)
@@ -448,33 +455,33 @@ def _fills_loop():
                     BOT_POSITIONS[key_local]["qty"] = Decimal("0")
                     BOT_POSITIONS[key_local]["entry_price"] = None
 
-                print(f"[WS-FILLS] position closed by {kind}. bot={bot_id} {direction} {symbol} now flat. OCO done.")
+                print(f"[WS-ORDERS] position closed by {kind}. bot={bot_id} {direction} {symbol} now flat. OCO done.")
             else:
                 print(
-                    f"[WS-FILLS] partial {kind} fill bot={bot_id} {direction} {symbol} "
-                    f"fill_qty={dq} fill_px={dp} remaining={remaining}"
+                    f"[WS-ORDERS] {kind} delta bot={bot_id} {direction} {symbol} "
+                    f"delta_qty={dq} delta_px={dp} remaining={remaining} status={status}"
                 )
 
         except Exception as e:
-            print("[WS-FILLS] error:", e)
+            print("[WS-ORDERS] error:", e)
 
 
-def _ensure_ws_fills_thread():
+def _ensure_ws_orders_thread():
     global _FILLS_THREAD_STARTED
     with _FILLS_LOCK:
         if _FILLS_THREAD_STARTED:
             return
-        t = threading.Thread(target=_fills_loop, daemon=True)
+        t = threading.Thread(target=_orders_loop, daemon=True)
         t.start()
         _FILLS_THREAD_STARTED = True
-        print("[WS-FILLS] thread created")
+        print("[WS-ORDERS] thread created")
 
 
 def _ensure_monitor_thread():
     """
-    ✅ 关键：只在 ENABLE_WS=1 的进程里启动 WS + fills 线程
+    ✅ 关键：只在 ENABLE_WS=1 的进程里启动 WS + orders 线程
     web(gunicorn) 进程只 init_db，不开 WS
-    worker 进程 init_db + 开 WS + 开 fills
+    worker 进程 init_db + 开 WS + 开 orders
     """
     global _MONITOR_THREAD_STARTED
     with _MONITOR_LOCK:
@@ -485,7 +492,7 @@ def _ensure_monitor_thread():
 
         if ENABLE_WS:
             start_private_ws()
-            _ensure_ws_fills_thread()
+            _ensure_ws_orders_thread()
             print("[SYSTEM] WS enabled in this process (ENABLE_WS=1)")
         else:
             print("[SYSTEM] WS disabled in this process (ENABLE_WS=0)")
@@ -953,6 +960,31 @@ def tv_webhook():
         if side_raw not in ("BUY", "SELL"):
             return "missing or invalid side", 400
 
+        # ✅ Constraint A: global same-symbol same-direction (across all bots)
+        desired_dir = "LONG" if side_raw == "BUY" else "SHORT"
+        open_dirs = get_symbol_open_directions(symbol)
+        if len(open_dirs) > 1:
+            # This should not happen; fail-closed to avoid netting issues.
+            return jsonify({
+                "status": "reject_direction_conflict",
+                "mode": "entry",
+                "bot_id": bot_id,
+                "symbol": symbol,
+                "desired_direction": desired_dir,
+                "open_directions": sorted(list(open_dirs)),
+                "signal_id": sig_id,
+            }), 200
+        if len(open_dirs) == 1 and desired_dir not in open_dirs:
+            return jsonify({
+                "status": "reject_opposite_direction_locked",
+                "mode": "entry",
+                "bot_id": bot_id,
+                "symbol": symbol,
+                "desired_direction": desired_dir,
+                "locked_direction": list(open_dirs)[0],
+                "signal_id": sig_id,
+            }), 200
+
         try:
             budget = _extract_budget_usdt(body)
         except Exception as e:
@@ -968,13 +1000,18 @@ def tv_webhook():
         size_str = str(snapped_qty)
         print(f"[ENTRY] bot={bot_id} symbol={symbol} side={side_raw} budget={budget} -> qty={size_str} sig={sig_id}")
 
+        # Deterministic numeric clientId for attribution: BBB + ts + 01 (ENTRY)
+        bnum = _bot_num(bot_id)
+        ts_now = int(time.time())
+        entry_client_id = f"{bnum:03d}{ts_now}01"
+
         try:
             order = create_market_order(
                 symbol=symbol,
                 side=side_raw,
                 size=size_str,
                 reduce_only=False,
-                client_id=tv_client_id,
+                client_id=entry_client_id,
             )
         except Exception as e:
             print("[ENTRY] create_market_order error:", e)
@@ -996,15 +1033,13 @@ def tv_webhook():
                 "signal_id": sig_id,
             }), 200
 
-        computed = (order or {}).get("computed") or {}
-        fallback_price_str = computed.get("price")
-
         order_id = order.get("order_id")
         client_order_id = order.get("client_order_id")
 
         entry_price_dec: Optional[Decimal] = None
         final_qty = snapped_qty
 
+        # ✅ Primary: order-based fill summary (from WS order channel)
         try:
             fill = get_fill_summary(
                 symbol=symbol,
@@ -1016,11 +1051,10 @@ def tv_webhook():
             entry_price_dec = Decimal(str(fill["avg_fill_price"]))
             final_qty = Decimal(str(fill["filled_qty"]))
             print(f"[ENTRY] fill ok bot={bot_id} symbol={symbol} filled_qty={final_qty} avg_fill={entry_price_dec}")
-
         except Exception as e:
             print(f"[ENTRY] fill fallback bot={bot_id} symbol={symbol} err:", e)
 
-            # Fallback A2: use position entryPrice snapshot if fills are delayed.
+            # Fallback: use position entryPrice snapshot if order detail is delayed.
             try:
                 pos_wait = float(os.getenv("POSITION_FALLBACK_WAIT_SEC", "8.0"))
                 pos_poll = float(os.getenv("POSITION_FALLBACK_POLL_INTERVAL", "0.5"))
@@ -1047,14 +1081,6 @@ def tv_webhook():
             except Exception as e2:
                 print(f"[ENTRY] position fallback failed bot={bot_id} symbol={symbol} err:", e2)
 
-            # Fallback A3: use worstPrice returned by create_market_order (last resort).
-            if entry_price_dec is None:
-                try:
-                    if fallback_price_str is not None:
-                        entry_price_dec = Decimal(str(fallback_price_str))
-                except Exception:
-                    entry_price_dec = None
-
         key = (bot_id, symbol)
         BOT_POSITIONS[key] = {"side": side_raw, "qty": final_qty, "entry_price": entry_price_dec}
 
@@ -1066,7 +1092,7 @@ def tv_webhook():
                     side=side_raw,
                     qty=final_qty,
                     price=entry_price_dec,
-                    reason="strategy_entry_fill" if order_id else "strategy_entry",
+                    reason="strategy_entry_fill",
                 )
             except Exception as e:
                 print("[PNL] record_entry error:", e)
@@ -1091,8 +1117,10 @@ def tv_webhook():
             "order_status": status,
             "cancel_reason": cancel_reason,
             "order_id": order_id,
+            "client_order_id": client_order_id,
             "signal_id": sig_id,
         }), 200
+
 
     # -------------------------
     # EXIT（策略出场 / TV 出场）
@@ -1147,13 +1175,18 @@ def tv_webhook():
         entry_side = "BUY" if direction_to_close == "LONG" else "SELL"
         exit_side = "SELL" if direction_to_close == "LONG" else "BUY"
 
+        # Deterministic numeric clientId for attribution: BBB + ts + 02 (EXIT)
+        bnum = _bot_num(bot_id)
+        ts_now = int(time.time())
+        exit_client_id = f"{bnum:03d}{ts_now}02"
+
         try:
             order = create_market_order(
                 symbol=symbol,
                 side=exit_side,
                 size=str(qty_to_close),
                 reduce_only=True,
-                client_id=tv_client_id,
+                client_id=exit_client_id,
             )
         except Exception as e:
             print("[EXIT] create_market_order error:", e)
@@ -1175,20 +1208,37 @@ def tv_webhook():
                 "signal_id": sig_id,
             }), 200
 
+        exit_price = None
+        filled_qty = qty_to_close
+
         try:
-            rules = _get_symbol_rules(symbol)
-            min_qty = rules["min_qty"]
-            px_str = get_market_price(symbol, exit_side, str(min_qty))
-            exit_price = Decimal(str(px_str))
-        except Exception:
-            exit_price = Decimal("0.00000001")
+            fill = get_fill_summary(
+                symbol=symbol,
+                order_id=order.get("order_id"),
+                client_order_id=order.get("client_order_id"),
+                max_wait_sec=float(os.getenv("FILL_MAX_WAIT_SEC", "12.0")),
+                poll_interval=float(os.getenv("FILL_POLL_INTERVAL", "0.25")),
+            )
+            exit_price = Decimal(str(fill["avg_fill_price"]))
+            filled_qty = Decimal(str(fill["filled_qty"]))
+            print(f"[EXIT] fill ok bot={bot_id} symbol={symbol} filled_qty={filled_qty} avg_fill={exit_price}")
+        except Exception as e:
+            print(f"[EXIT] fill wait failed bot={bot_id} symbol={symbol} err:", e)
+            # Last resort: mark price for bookkeeping ONLY if absolutely necessary
+            try:
+                rules = _get_symbol_rules(symbol)
+                min_qty = rules["min_qty"]
+                px_str = get_market_price(symbol, exit_side, str(min_qty))
+                exit_price = Decimal(str(px_str))
+            except Exception:
+                exit_price = Decimal("0.00000001")
 
         try:
             record_exit_fifo(
                 bot_id=bot_id,
                 symbol=symbol,
                 entry_side=entry_side,
-                exit_qty=qty_to_close,
+                exit_qty=filled_qty,
                 exit_price=exit_price,
                 reason="strategy_exit",
             )
@@ -1200,9 +1250,17 @@ def tv_webhook():
         except Exception:
             pass
 
+        # Refresh local cache based on DB remaining
+        try:
+            opens2 = get_bot_open_positions(bot_id)
+            rem = opens2.get((symbol, direction_to_close), {}).get("qty", Decimal("0"))
+        except Exception:
+            rem = Decimal("0")
+
         if key_local in BOT_POSITIONS:
-            BOT_POSITIONS[key_local]["qty"] = Decimal("0")
-            BOT_POSITIONS[key_local]["entry_price"] = None
+            BOT_POSITIONS[key_local]["qty"] = rem
+            if rem <= 0:
+                BOT_POSITIONS[key_local]["entry_price"] = None
 
         return jsonify({
             "status": "ok",
