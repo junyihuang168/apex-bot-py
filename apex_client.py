@@ -1201,6 +1201,83 @@ def create_market_order(
     }
 
 
+def create_limit_order(
+    symbol: str,
+    side: str,
+    size: NumberLike,
+    price: NumberLike,
+    reduce_only: bool = False,
+    client_id: Optional[str] = None,
+    time_in_force: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create a LIMIT order (optionally reduceOnly).
+
+    Notes:
+    - This is used for maker-style take-profit: you place a resting LIMIT on the book.
+    - We DO NOT try to force maker via unknown postOnly flags here; if your venue supports
+      postOnly/makerOnly, we can wire it once confirmed by the SDK.
+    """
+
+    client = get_client()
+    side = str(side).upper()
+
+    rules = _get_symbol_rules(symbol)
+    qty_decimals = int(rules.get("qty_decimals", 2))
+    px_decimals = int(rules.get("price_decimals", 2))
+
+    qty_dec = _snap_quantity(symbol, Decimal(str(size)))
+    if qty_dec <= 0:
+        raise ValueError(f"size must be > 0 after snap, got={size}")
+
+    px_dec = _snap_price(symbol, Decimal(str(price)), ROUND_UP if side == "BUY" else ROUND_DOWN)
+    if px_dec <= 0:
+        raise ValueError(f"price must be > 0 after snap, got={price}")
+
+    size_str = format(qty_dec, f".{qty_decimals}f")
+    price_str = format(px_dec, f".{px_decimals}f")
+
+    ts = int(time.time())
+    apex_client_id = str(client_id) if client_id else _random_client_id()
+
+    params: Dict[str, Any] = {
+        "symbol": symbol,
+        "side": side,
+        "type": "LIMIT",
+        "size": size_str,
+        "price": price_str,
+        "timestampSeconds": ts,
+        "reduceOnly": reduce_only,
+        "clientId": apex_client_id,
+    }
+    if time_in_force:
+        params["timeInForce"] = str(time_in_force)
+
+    print("[apex_client] create_limit_order params:", params)
+
+    raw_order = _safe_call(client.create_order_v3, **params)
+    print("[apex_client] limit order response:", raw_order)
+
+    order_id, client_order_id = _extract_order_ids(raw_order)
+    try:
+        od = raw_order.get("data") if isinstance(raw_order, dict) else None
+        st = ""
+        if isinstance(od, dict):
+            st = str(od.get("status") or od.get("orderStatus") or od.get("state") or "")
+        register_order_for_tracking(order_id=order_id, client_order_id=client_order_id, symbol=symbol, status=st or "PENDING")
+    except Exception:
+        pass
+
+    if order_id and client_order_id:
+        _ORDER_ID_TO_CLIENT_ID[str(order_id)] = str(client_order_id)
+
+    return {
+        "raw_order": raw_order,
+        "order_id": order_id,
+        "client_order_id": client_order_id,
+        "sent": params,
+    }
+
+
 def create_trigger_order(
     symbol: str,
     side: str,
@@ -1225,8 +1302,8 @@ def create_trigger_order(
     trigger_str = str(trigger_dec)
 
     # price is required by some SDK/builds even for *_MARKET.
-    # IMPORTANT: Do NOT use marketQuote/worstPrice as execution price; exchange ignores `price` for *_MARKET trigger orders.
-    # Use trigger_str as a safe placeholder to satisfy gateway validations.
+    # IMPORTANT: Do NOT call worstPrice/marketQuote here. That value is NOT an execution price.
+    # For *_MARKET trigger orders, the gateway ignores `price` on execution. Use triggerPrice as a safe placeholder.
     if price is None:
         price = trigger_str
 
@@ -1267,8 +1344,6 @@ def create_trigger_order(
         "client_order_id": client_order_id,
         "sent": params,
     }
-
-
 def cancel_order(order_id: str) -> Dict[str, Any]:
     client = get_client()
     if not order_id:
