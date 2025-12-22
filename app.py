@@ -8,6 +8,7 @@ from flask import Flask, request, jsonify, Response
 
 from apex_client import (
     create_market_order,
+    create_limit_order,
     get_market_price,
     get_fill_summary,
     get_open_position_for_symbol,
@@ -134,24 +135,40 @@ def _bot_num(bot_id: str) -> int:
 # ----------------------------
 # ✅ BOT 分组（按你要求）
 # ----------------------------
-LONG_TPSL_BOTS = _parse_bot_list(os.getenv("LONG_TPSL_BOTS", ",".join([f"BOT_{i}" for i in range(1, 11)])))
-SHORT_TPSL_BOTS = _parse_bot_list(os.getenv("SHORT_TPSL_BOTS", ",".join([f"BOT_{i}" for i in range(11, 21)])))
-LONG_PNL_ONLY_BOTS = _parse_bot_list(os.getenv("LONG_PNL_ONLY_BOTS", ",".join([f"BOT_{i}" for i in range(21, 31)])))
+# Profile A (Ladder SL + optional fixed TP): BOT_1–5 (LONG), BOT_11–15 (SHORT)
+LADDER_LONG_BOTS  = _parse_bot_list(os.getenv("LADDER_LONG_BOTS",  ",".join([f"BOT_{i}" for i in range(1, 6)])))
+LADDER_SHORT_BOTS = _parse_bot_list(os.getenv("LADDER_SHORT_BOTS", ",".join([f"BOT_{i}" for i in range(11, 16)])))
+
+# Profile B (Fixed maker TP + fixed SL): BOT_6–10 (LONG), BOT_16–20 (SHORT)
+FIXED_LONG_BOTS   = _parse_bot_list(os.getenv("FIXED_LONG_BOTS",   ",".join([f"BOT_{i}" for i in range(6, 11)])))
+FIXED_SHORT_BOTS  = _parse_bot_list(os.getenv("FIXED_SHORT_BOTS",  ",".join([f"BOT_{i}" for i in range(16, 21)])))
+
+# PnL-only bots (no protective orders): default BOT_21–40 (override via env if needed)
+LONG_PNL_ONLY_BOTS  = _parse_bot_list(os.getenv("LONG_PNL_ONLY_BOTS",  ",".join([f"BOT_{i}" for i in range(21, 31)])))
 SHORT_PNL_ONLY_BOTS = _parse_bot_list(os.getenv("SHORT_PNL_ONLY_BOTS", ",".join([f"BOT_{i}" for i in range(31, 41)])))
+
+def _bot_profile(bot_id: str) -> str:
+    b = _canon_bot_id(bot_id)
+    if b in LADDER_LONG_BOTS or b in LADDER_SHORT_BOTS:
+        return "LADDER"
+    if b in FIXED_LONG_BOTS or b in FIXED_SHORT_BOTS:
+        return "FIXED"
+    return "NONE"
 
 
 def _bot_expected_entry_side(bot_id: str) -> Optional[str]:
     b = _canon_bot_id(bot_id)
-    if b in LONG_TPSL_BOTS or b in LONG_PNL_ONLY_BOTS:
+    if b in LADDER_LONG_BOTS or b in FIXED_LONG_BOTS or b in LONG_PNL_ONLY_BOTS:
         return "BUY"
-    if b in SHORT_TPSL_BOTS or b in SHORT_PNL_ONLY_BOTS:
+    if b in LADDER_SHORT_BOTS or b in FIXED_SHORT_BOTS or b in SHORT_PNL_ONLY_BOTS:
         return "SELL"
     return None
 
 
 def _bot_has_exchange_brackets(bot_id: str) -> bool:
     b = _canon_bot_id(bot_id)
-    return (b in LONG_TPSL_BOTS) or (b in SHORT_TPSL_BOTS)
+    return (b in LADDER_LONG_BOTS) or (b in LADDER_SHORT_BOTS) or (b in FIXED_LONG_BOTS) or (b in FIXED_SHORT_BOTS)
+
 
 
 def _exit_guard_allow(bot_id: str, symbol: str) -> bool:
@@ -395,128 +412,164 @@ def _next_lock_target(current_lock_pct: Decimal) -> tuple[Decimal, Decimal]:
     return (next_profit, next_lock)
 
 
-def _place_fixed_brackets(bot_id: str, symbol: str, direction: str, qty: Decimal, entry_price: Decimal):
-    """
-    RESTORE (BOT_1–5 LONG, BOT_11–15 SHORT):
-      - SL: STOP_MARKET (or STOP_LIMIT when PROTECTIVE_ORDER_MODE=LIMIT)
-          initial trigger at -0.5% (FIXED_SL_PCT)
-          then raised by ladder via _trail_loop
-      - TP: TAKE_PROFIT_MARKET (or TAKE_PROFIT_LIMIT when PROTECTIVE_ORDER_MODE=LIMIT)
-          fixed at +2.5% (FIXED_TP_PCT)
-    """
-    bot_id = _canon_bot_id(bot_id)
-    symbol = str(symbol).upper().strip()
-    direction = str(direction).upper().strip()
-    qty = Decimal(qty)
-    entry_price = Decimal(entry_price)
+def _place_fixed_brackets(bot_id: str, symbol: str, direction: str, entry_price: Decimal, qty: Decimal):
+    """Place exchange-side protective orders after we have a real entry price.
 
-    if qty <= 0 or entry_price <= 0:
+    Profiles:
+      - FIXED  (BOT_6–10 LONG, BOT_16–20 SHORT): maker TP +0.2% (LIMIT) + SL -0.3% (STOP_LIMIT)
+      - LADDER (BOT_1–5 LONG, BOT_11–15 SHORT): TP +2.5% (TAKE_PROFIT_MARKET) + SL -0.5% (STOP_MARKET) + ladder trail handled separately
+      - NONE   : no protective orders
+    """
+    b = _canon_bot_id(bot_id)
+    direction = str(direction or "").upper()
+    if direction not in ("LONG", "SHORT"):
         return
 
-    if not _bot_has_exchange_brackets(bot_id):
+    prof = _bot_profile(b)
+    if prof == "NONE":
         return
 
-    entry_side = "BUY" if direction == "LONG" else "SELL"
+    qty = _to_decimal(qty)
+    entry_price = _to_decimal(entry_price)
+    if qty is None or entry_price is None or qty <= 0 or entry_price <= 0:
+        return
+
     exit_side = "SELL" if direction == "LONG" else "BUY"
 
-    # Initial lock level: -0.5%
-    init_lock = -Decimal(FIXED_SL_PCT)
-
-    # Compute triggers
-    sl_trigger = _sl_trigger_from_lock(entry_price, direction, init_lock)
-    tp_trigger = _tp_trigger_from_entry(entry_price, direction)
-
-    # Types
-    if PROTECTIVE_ORDER_MODE == "LIMIT":
-        sl_type = "STOP_LIMIT"
-        tp_type = "TAKE_PROFIT_LIMIT"
-        # For LIMIT-type triggers we provide a price (best-effort): slightly worse to improve fill,
-        # but we will NOT treat it as "fill price" anywhere.
-        if direction == "LONG":
-            sl_price = sl_trigger * (Decimal("1") - (PROTECTIVE_SLIPPAGE_PCT / Decimal("100")))
-            tp_price = tp_trigger * (Decimal("1") - (PROTECTIVE_SLIPPAGE_PCT / Decimal("100")))
-        else:
-            sl_price = sl_trigger * (Decimal("1") + (PROTECTIVE_SLIPPAGE_PCT / Decimal("100")))
-            tp_price = tp_trigger * (Decimal("1") + (PROTECTIVE_SLIPPAGE_PCT / Decimal("100")))
-    else:
-        sl_type = "STOP_MARKET"
-        tp_type = "TAKE_PROFIT_MARKET"
-        sl_price = None
-        tp_price = None
-
-    # Snap prices
+    # Always clear stale records first (in case of restart/crash).
     try:
-        sl_trigger = _snap_price_tick(symbol, sl_trigger)
-        if sl_price is not None:
-            sl_price = _snap_price_tick(symbol, sl_price)
-        tp_trigger = _snap_price_tick(symbol, tp_trigger)
-        if tp_price is not None:
-            tp_price = _snap_price_tick(symbol, tp_price)
-    except Exception as e:
-        print(f"[BRACKET] WARNING snap price failed: {e}")
-
-    # Cancel old protective orders (if any) to keep it clean
-    try:
-        _cancel_existing_protective_orders(bot_id, symbol, direction)
+        clear_protective_orders(b, symbol, direction)
     except Exception:
         pass
 
-    # Place SL
-    sl = create_trigger_order(
-        symbol=symbol,
-        side=exit_side,
-        order_type=sl_type,
-        size=qty,
-        trigger_price=sl_trigger,
-        price=sl_price,
-        reduce_only=True,
-        client_id=None,
-    )
-    sl_oid = str((sl or {}).get("id") or "")
-    sl_cid = str((sl or {}).get("clientId") or (sl or {}).get("clientOrderId") or "")
+    # ----------------------------
+    # Profile B: FIXED maker TP + fixed SL
+    # ----------------------------
+    if prof == "FIXED":
+        tp_pct = _to_decimal(os.getenv("FIXED_MAKER_TP_PCT", "0.2")) or Decimal("0.2")
+        sl_pct = _to_decimal(os.getenv("FIXED_SL_PCT", "0.3")) or Decimal("0.3")
+        buf_pct = _to_decimal(os.getenv("STOP_LIMIT_BUFFER_PCT", "0.05")) or Decimal("0.05")  # 0.05% price buffer
 
-    # Place TP
-    tp = create_trigger_order(
-        symbol=symbol,
-        side=exit_side,
-        order_type=tp_type,
-        size=qty,
-        trigger_price=tp_trigger,
-        price=tp_price,
-        reduce_only=True,
-        client_id=None,
-    )
-    tp_oid = str((tp or {}).get("id") or "")
-    tp_cid = str((tp or {}).get("clientId") or (tp or {}).get("clientOrderId") or "")
+        # TP LIMIT price
+        if direction == "LONG":
+            tp_px = entry_price * (Decimal("1") + (tp_pct / Decimal("100")))
+        else:
+            tp_px = entry_price * (Decimal("1") - (tp_pct / Decimal("100")))
+        tp_px = snap_price_for_order(symbol, exit_side, "LIMIT", tp_px)
 
-    # Persist
-    try:
+        # SL STOP_LIMIT
+        if direction == "LONG":
+            sl_trigger = entry_price * (Decimal("1") - (sl_pct / Decimal("100")))
+            sl_limit = sl_trigger * (Decimal("1") - (buf_pct / Decimal("100")))  # lower limit for SELL
+        else:
+            sl_trigger = entry_price * (Decimal("1") + (sl_pct / Decimal("100")))
+            sl_limit = sl_trigger * (Decimal("1") + (buf_pct / Decimal("100")))  # higher limit for BUY
+
+        sl_trigger = snap_price_for_order(symbol, exit_side, "STOP_LIMIT", sl_trigger)
+        sl_limit = snap_price_for_order(symbol, exit_side, "STOP_LIMIT", sl_limit)
+
+        tp_order = None
+        sl_order = None
+
+        try:
+            tp_order = create_limit_order(
+                symbol=symbol,
+                side=exit_side,
+                size=str(qty),
+                price=str(tp_px),
+                reduce_only=True,
+                time_in_force=os.getenv("TP_TIME_IN_FORCE") or None,
+            )
+        except Exception as e:
+            print(f"[PROTECT][FIXED] TP limit create failed bot={b} {direction} {symbol}: {e}")
+
+        try:
+            sl_order = create_trigger_order(
+                symbol=symbol,
+                side=exit_side,
+                order_type="STOP_LIMIT",
+                size=str(qty),
+                trigger_price=str(sl_trigger),
+                price=str(sl_limit),
+                reduce_only=True,
+            )
+        except Exception as e:
+            print(f"[PROTECT][FIXED] SL stop-limit create failed bot={b} {direction} {symbol}: {e}")
+
+        tp_oid = (tp_order or {}).get("order_id") or (tp_order or {}).get("id")
+        sl_oid = (sl_order or {}).get("order_id") or (sl_order or {}).get("id")
+
         set_protective_orders(
-            bot_id=bot_id,
+            bot_id=b,
             symbol=symbol,
             direction=direction,
-            sl_order_id=sl_oid,
-            tp_order_id=tp_oid,
-            sl_client_id=sl_cid,
-            tp_client_id=tp_cid,
-            sl_price=str(sl_trigger),
-            tp_price=str(tp_trigger),
+            sl_order_id=str(sl_oid) if sl_oid else None,
+            tp_order_id=str(tp_oid) if tp_oid else None,
+            sl_price=sl_trigger,
+            tp_price=tp_px,
         )
-        set_lock_level_pct(bot_id, symbol, direction, str(init_lock))
-    except Exception as e:
-        print("[BRACKET] persist error:", e)
 
-    print(
-        f"[BRACKET] restored bot={bot_id} {direction} {symbol} qty={qty} entry={entry_price} "
-        f"SL({sl_type}) trigger={sl_trigger} oid={sl_oid} | TP({tp_type}) trigger={tp_trigger} oid={tp_oid}"
+        print(f"[PROTECT][FIXED] bot={b} {direction} {symbol} qty={qty} entry={entry_price} TP={tp_px} SL_trigger={sl_trigger} SL_limit={sl_limit}")
+        return
+
+    # ----------------------------
+    # Profile A: LADDER base brackets (trail loop will later raise SL)
+    # ----------------------------
+    tp_pct = _to_decimal(os.getenv("FIXED_TP_PCT", "2.5")) or Decimal("2.5")
+    sl_pct = _to_decimal(os.getenv("BASE_SL_PCT", "-0.5")) or Decimal("-0.5")  # negative
+
+    if direction == "LONG":
+        tp_trigger = entry_price * (Decimal("1") + (tp_pct / Decimal("100")))
+        sl_trigger = entry_price * (Decimal("1") + (sl_pct / Decimal("100")))  # e.g. 1 - 0.5%
+    else:
+        tp_trigger = entry_price * (Decimal("1") - (tp_pct / Decimal("100")))
+        sl_trigger = entry_price * (Decimal("1") - (sl_pct / Decimal("100")))  # for SHORT, sl_pct is negative so becomes +0.5%
+
+    tp_trigger = snap_price_for_order(symbol, exit_side, "TAKE_PROFIT_MARKET", tp_trigger)
+    sl_trigger = snap_price_for_order(symbol, exit_side, "STOP_MARKET", sl_trigger)
+
+    tp_order = None
+    sl_order = None
+
+    # Keep default behavior as MARKET triggers for ladder bots (more reliable execution).
+    try:
+        tp_order = create_trigger_order(
+            symbol=symbol,
+            side=exit_side,
+            order_type="TAKE_PROFIT_MARKET",
+            size=str(qty),
+            trigger_price=str(tp_trigger),
+            reduce_only=True,
+        )
+    except Exception as e:
+        print(f"[PROTECT][LADDER] TP create failed bot={b} {direction} {symbol}: {e}")
+
+    try:
+        sl_order = create_trigger_order(
+            symbol=symbol,
+            side=exit_side,
+            order_type="STOP_MARKET",
+            size=str(qty),
+            trigger_price=str(sl_trigger),
+            reduce_only=True,
+        )
+    except Exception as e:
+        print(f"[PROTECT][LADDER] SL create failed bot={b} {direction} {symbol}: {e}")
+
+    tp_oid = (tp_order or {}).get("order_id") or (tp_order or {}).get("id")
+    sl_oid = (sl_order or {}).get("order_id") or (sl_order or {}).get("id")
+
+    set_protective_orders(
+        bot_id=b,
+        symbol=symbol,
+        direction=direction,
+        sl_order_id=str(sl_oid) if sl_oid else None,
+        tp_order_id=str(tp_oid) if tp_oid else None,
+        sl_price=sl_trigger,
+        tp_price=tp_trigger,
     )
 
-    # Ensure trailing loop is running
-    _ensure_trailing_thread()
-
-
-_TRAIL_THREAD_STARTED = False
-_TRAIL_LOCK = threading.Lock()
+    print(f"[PROTECT][LADDER] bot={b} {direction} {symbol} qty={qty} entry={entry_price} TP_trigger={tp_trigger} SL_trigger={sl_trigger}")
 
 
 def _ensure_trailing_thread():
@@ -607,7 +660,7 @@ def _trail_loop():
     while True:
         try:
             # Iterate over bots with exchange brackets only
-            bots = sorted(set(list(LONG_TPSL_BOTS) + list(SHORT_TPSL_BOTS)))
+            bots = sorted(set(list(LADDER_LONG_BOTS) + list(LADDER_SHORT_BOTS)))
             for bot_id in bots:
                 opens = get_bot_open_positions(bot_id)
                 if not opens:
@@ -619,7 +672,11 @@ def _trail_loop():
                         if qty <= 0 or entry_price <= 0:
                             continue
                         # mark price (not used as fill price)
-                        mp = get_market_price(symbol)
+                        # worstPrice is used only as a conservative mark/exit estimate (NOT as fill price)
+                        rules = _get_symbol_rules(symbol)
+                        min_qty = str(rules.get("min_qty") or "0.01")
+                        exit_side = "SELL" if direction == "LONG" else "BUY"
+                        mp = get_market_price(symbol, exit_side, min_qty)
                         mp = Decimal(str(mp))
                         p = _profit_pct(entry_price, mp, direction)
 
@@ -635,6 +692,96 @@ def _trail_loop():
         except Exception as e:
             print("[TRAIL] loop error:", e)
             time.sleep(2.0)
+
+def _orders_loop():
+    """Background consumer for WS/REST order delta events.
+
+    We subscribe to the private WS order stream (main path) and also run a REST poller (backup path).
+    Whenever we receive an order delta fill, we map it back to (bot_id, symbol, direction, kind)
+    via pnl_store.protective_orders and then record_exit_fifo() using the real delta fill price.
+
+    This avoids using market quote / worstPrice as execution price.
+    """
+    print("[WS-ORDERS] loop started (consume order_delta events)")
+    while True:
+        try:
+            evt = pop_order_event(timeout=1.0)
+            if not evt:
+                continue
+
+            if str(evt.get("type") or "") != "order_delta":
+                continue
+
+            order_id = str(evt.get("order_id") or "").strip()
+            if not order_id:
+                continue
+
+            delta_qty = _to_decimal(evt.get("delta_qty"))
+            delta_px = _to_decimal(evt.get("delta_price"))
+            if delta_qty is None or delta_px is None:
+                continue
+            if delta_qty <= 0 or delta_px <= 0:
+                continue
+
+            owner = find_protective_owner_by_order_id(order_id)
+            if not owner:
+                # Not a tracked protective order (could be entry/exit market order); ignore
+                continue
+
+            bot_id = str(owner.get("bot_id") or "")
+            symbol = str(owner.get("symbol") or "")
+            direction = str(owner.get("direction") or "").upper()
+            kind = str(owner.get("kind") or "").upper()
+
+            if not bot_id or not symbol or direction not in ("LONG", "SHORT"):
+                continue
+
+            entry_side = "BUY" if direction == "LONG" else "SELL"
+
+            record_exit_fifo(
+                bot_id=bot_id,
+                symbol=symbol,
+                entry_side=entry_side,
+                qty=delta_qty,
+                exit_price=delta_px,
+                reason=f"protective_{kind or 'order'}",
+            )
+            print(f"[P&L] exit recorded from protective order bot={bot_id} {direction} {symbol} qty={delta_qty} px={delta_px} kind={kind}")
+
+            # If position is flat after this fill, clean up protective orders + lock levels.
+            try:
+                open_pos = get_bot_open_positions(bot_id)
+                key = f"{symbol}:{direction}"
+                remain = open_pos.get(key, {}).get("qty", Decimal("0"))
+                if isinstance(remain, str):
+                    remain = Decimal(remain)
+                if remain is None:
+                    remain = Decimal("0")
+
+                if remain <= 0:
+                    # cancel the other leg (if still live)
+                    other_oid = None
+                    if kind == "SL":
+                        other_oid = owner.get("tp_order_id")
+                    elif kind == "TP":
+                        other_oid = owner.get("sl_order_id")
+                    if other_oid:
+                        try:
+                            cancel_order(str(other_oid))
+                        except Exception:
+                            pass
+
+                    clear_protective_orders(bot_id, symbol, direction)
+                    clear_lock_level_pct(bot_id, symbol, direction)
+                    print(f"[P&L] cleared protective/lock bot={bot_id} {direction} {symbol} (position flat)")
+            except Exception:
+                pass
+
+        except Exception as e:
+            print("[WS-ORDERS] loop error:", e)
+            time.sleep(0.5)
+
+
 def _ensure_ws_orders_thread():
     global _FILLS_THREAD_STARTED
     with _FILLS_LOCK:
