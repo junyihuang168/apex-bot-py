@@ -590,3 +590,56 @@ def find_protective_owner_by_order_id(order_id: str) -> Dict[str, Any]:
         return d
     finally:
         conn.close()
+
+def list_recent_trades(bot_id: Optional[str] = None, limit: int = 200) -> list:
+    """
+    Recent realized trades (from exits table), newest first.
+    Used by /dashboard and /api/trades.
+    """
+    try:
+        limit_i = int(limit)
+        if limit_i < 1:
+            limit_i = 200
+        limit_i = min(limit_i, 500)
+    except Exception:
+        limit_i = 200
+
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        if bot_id:
+            cur.execute("""
+                SELECT ts, bot_id, symbol, direction, entry_side, exit_qty, entry_price, exit_price,
+                       realized_pnl, reason
+                FROM exits
+                WHERE bot_id=?
+                ORDER BY ts DESC
+                LIMIT ?
+            """, (str(bot_id), limit_i))
+        else:
+            cur.execute("""
+                SELECT ts, bot_id, symbol, direction, entry_side, exit_qty, entry_price, exit_price,
+                       realized_pnl, reason
+                FROM exits
+                ORDER BY ts DESC
+                LIMIT ?
+            """, (limit_i,))
+        rows = cur.fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            out.append({
+                "ts": int(d.get("ts") or 0),
+                "bot_id": d.get("bot_id"),
+                "symbol": d.get("symbol"),
+                "direction": d.get("direction"),
+                "entry_side": d.get("entry_side"),
+                "exit_qty": str(d.get("exit_qty") or ""),
+                "entry_price": str(d.get("entry_price") or ""),
+                "exit_price": str(d.get("exit_price") or ""),
+                "realized_pnl": str(d.get("realized_pnl") or "0"),
+                "reason": d.get("reason") or "",
+            })
+        return out
+    finally:
+        conn.close()
