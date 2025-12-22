@@ -42,8 +42,7 @@ SYMBOL_RULES: Dict[str, Dict[str, Any]] = {
 }
 
 _CLIENT: Optional[HttpPrivateSign] = None
-
-# ✅ configs cache (avoid NameError)
+# configs_v3 cache (best-effort)
 _CONFIGS_V3: Optional[dict] = None
 
 NumberLike = Union[str, float, int]
@@ -72,7 +71,6 @@ _REST_POLL_LOCK = threading.Lock()
 
 _TERMINAL_STATUSES = {"FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED", "FAIL"}
 
-
 def _status_is_terminal(status: str) -> bool:
     s = str(status or "").upper().strip()
     return s in _TERMINAL_STATUSES
@@ -89,6 +87,7 @@ def _pick(d: dict, *keys):
 def _to_decimal_opt(x) -> Optional[Decimal]:
     if x is None:
         return None
+    # Treat empty string as None
     if isinstance(x, str) and x.strip() == "":
         return None
     try:
@@ -98,8 +97,7 @@ def _to_decimal_opt(x) -> Optional[Decimal]:
 
 
 def _parse_order_fill_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Extract (cum_qty, avg_px, notional, status, symbol, client_order_id) from an order-like dict.
+    """Extract (cum_qty, avg_px, notional, status, symbol, client_order_id) from an order-like dict.
 
     Works across SDK/field variations:
     - qty keys: cumFilledSize / filledSize / cumSuccessFillSize / cumMatchFillSize / executedQty ...
@@ -119,7 +117,7 @@ def _parse_order_fill_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
     cum_qty = _to_decimal_opt(_pick(
         d,
         "cumFilledSize", "filledSize", "sizeFilled", "cumFilled", "executedQty",
-        "cumSuccessFillSize", "cumMatchFillSize",
+        "cumSuccessFillSize", "cumMatchFillSize", "cumMatchFillSize", "cumSuccessFillSize"
     ))
 
     avg_px = _to_decimal_opt(_pick(d, "avgPrice", "fillAvgPrice", "averagePrice", "avgFillPrice", "avg"))
@@ -127,6 +125,7 @@ def _parse_order_fill_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
     cum_val = _to_decimal_opt(_pick(
         d,
         "cumSuccessFillValue", "cumMatchFillValue", "cumFilledValue", "filledValue",
+        "cumSuccessFillValue", "cumSuccessFillValue"
     ))
 
     # Some payloads may provide last fill fields
@@ -158,12 +157,7 @@ def _parse_order_fill_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def register_order_for_tracking(
-    order_id: Optional[str],
-    client_order_id: Optional[str] = None,
-    symbol: Optional[str] = None,
-    status: str = "PENDING"
-):
+def register_order_for_tracking(order_id: Optional[str], client_order_id: Optional[str] = None, symbol: Optional[str] = None, status: str = "PENDING"):
     """Ensure an orderId exists in the local tracker so REST poller can pick it up even if WS misses."""
     if not order_id:
         return
@@ -180,6 +174,7 @@ def register_order_for_tracking(
             "symbol": symbol.upper().strip() if isinstance(symbol, str) else symbol,
         }
     else:
+        # refresh identifiers
         if client_order_id:
             prev["client_order_id"] = client_order_id
         if symbol:
@@ -222,6 +217,7 @@ def _rest_fetch_order_detail(order_id: str) -> Optional[Dict[str, Any]]:
         except Exception as e:
             last_err = e
 
+    # List-based methods (fallback)
     list_methods = [
         "get_open_orders_v3",
         "open_orders_v3",
@@ -303,6 +299,7 @@ def start_order_rest_poller(poll_interval: float = 5.0):
                     if _status_is_terminal(status):
                         continue
                     cands.append((oid, st))
+                # prioritize stale ones
                 cands.sort(key=lambda x: float(x[1].get("ts", 0.0)))
 
                 for oid, st in cands[:max_per_cycle]:
@@ -328,9 +325,11 @@ def start_order_rest_poller(poll_interval: float = 5.0):
                     delta_qty = Decimal("0")
                     delta_px = None
 
+                    # update tracker & compute delta
                     if cum_qty is not None and cum_qty > prev_cum:
                         delta_qty = (cum_qty - prev_cum)
 
+                        # derive notional
                         if notional is not None:
                             new_notional = Decimal(str(notional))
                         elif avg_px is not None and cum_qty > 0:
@@ -339,6 +338,7 @@ def start_order_rest_poller(poll_interval: float = 5.0):
                             new_notional = None
 
                         if new_notional is not None:
+                            # compute delta price via notional difference
                             if prev_avg is not None and prev_cum > 0:
                                 prev_notional = (Decimal(str(prev_avg)) * prev_cum)
                             delta_notional = (new_notional - prev_notional)
@@ -357,6 +357,7 @@ def start_order_rest_poller(poll_interval: float = 5.0):
                                 except Exception:
                                     pass
                         else:
+                            # try last-fill fields as fallback
                             lf_qty = parsed.get("last_fill_qty")
                             lf_px = parsed.get("last_fill_px")
                             if lf_qty is not None and lf_px is not None and Decimal(str(lf_qty)) > 0 and Decimal(str(lf_px)) > 0:
@@ -403,6 +404,7 @@ def start_order_rest_poller(poll_interval: float = 5.0):
     t = threading.Thread(target=_poll_loop, daemon=True, name="apex-order-rest-poller")
     t.start()
     print(f"[apex_client][REST-POLL] started (interval={poll_interval}s)")
+
 
 
 def _get_symbol_rules(symbol: str) -> Dict[str, Any]:
@@ -472,7 +474,9 @@ def _random_client_id() -> str:
 
 
 def _safe_call(fn, **kwargs):
-    """Call function with only supported kwargs (robust across SDK versions)."""
+    """
+    Call function with only supported kwargs (robust across SDK versions).
+    """
     try:
         sig = inspect.signature(fn)
         allowed = set(sig.parameters.keys())
@@ -483,7 +487,10 @@ def _safe_call(fn, **kwargs):
 
 
 def _install_compat_shims(client: HttpPrivateSign):
-    """Only add alias methods for SDK version differences."""
+    """
+    DO NOT change business logic.
+    Only add alias methods for SDK version differences.
+    """
     if not hasattr(client, "get_account_v3") and hasattr(client, "accountV3"):
         client.get_account_v3 = getattr(client, "accountV3")  # type: ignore
     if not hasattr(client, "accountV3") and hasattr(client, "get_account_v3"):
@@ -511,7 +518,7 @@ def _install_compat_shims(client: HttpPrivateSign):
 
 
 def get_client() -> HttpPrivateSign:
-    global _CLIENT, _CONFIGS_V3
+    global _CLIENT
     if _CLIENT is not None:
         return _CLIENT
 
@@ -533,7 +540,8 @@ def get_client() -> HttpPrivateSign:
 
     try:
         cfg = _safe_call(client.configs_v3)
-        _CONFIGS_V3 = cfg if isinstance(cfg, dict) else {"data": cfg}
+        global _CONFIGS_V3
+        _CONFIGS_V3 = cfg
         print("[apex_client] configs_v3 ok:", cfg)
     except Exception as e:
         print("[apex_client] WARNING configs_v3 error:", e)
@@ -553,12 +561,15 @@ def get_account():
     return _safe_call(client.get_account_v3)
 
 
+
 def _decimalize(x: Any) -> Decimal:
     """Best-effort conversion to Decimal without float artifacts."""
     if isinstance(x, Decimal):
         return x
+    # ints are safe
     if isinstance(x, int):
         return Decimal(x)
+    # strings / others
     try:
         return Decimal(str(x))
     except Exception as e:
@@ -568,6 +579,7 @@ def _decimalize(x: Any) -> Decimal:
 def _infer_price_decimals_from_tick(tick: Decimal) -> int:
     """Infer decimals from tick size (e.g., 0.01 -> 2)."""
     t = tick.normalize()
+    # For tick like 1E-2, exponent is -2
     exp = -t.as_tuple().exponent
     return max(0, exp)
 
@@ -578,14 +590,18 @@ def _get_tick_size(symbol: str) -> Tuple[Decimal, int]:
     tick = rules.get("tick_size", DEFAULT_SYMBOL_RULES["tick_size"])
     decs = rules.get("price_decimals", DEFAULT_SYMBOL_RULES["price_decimals"])
 
+    # If configs_v3 cache exists, try to infer tick size for this symbol (best effort)
+    global _CONFIGS_V3
     cfg = _CONFIGS_V3
     if cfg:
         sym_variants = {symbol.upper(), symbol.replace("-", "").upper(), symbol.replace("-", "_").upper()}
         try:
+            # Walk nested dict/list
             stack = [cfg]
             while stack:
                 cur = stack.pop()
                 if isinstance(cur, dict):
+                    # Match by common keys
                     v_sym = cur.get("symbol") or cur.get("symbolName") or cur.get("symbolId") or cur.get("id")
                     if isinstance(v_sym, str) and v_sym.upper() in sym_variants:
                         tk = cur.get("tickSize") or cur.get("tick_size") or cur.get("priceTick") or cur.get("price_tick")
@@ -601,8 +617,10 @@ def _get_tick_size(symbol: str) -> Tuple[Decimal, int]:
                         if isinstance(v, (dict, list)):
                             stack.append(v)
         except Exception:
+            # Keep defaults if inference fails
             pass
 
+    # Ensure sane
     tick = _decimalize(tick)
     if tick <= 0:
         tick = DEFAULT_SYMBOL_RULES["tick_size"]
@@ -613,6 +631,7 @@ def _get_tick_size(symbol: str) -> Tuple[Decimal, int]:
 def _snap_price(symbol: str, price: Decimal, rounding) -> Decimal:
     """Snap a price to symbol tick size using Decimal math."""
     tick, decs = _get_tick_size(symbol)
+    # steps = price / tick, then round to integer steps
     steps = (price / tick).to_integral_value(rounding=rounding)
     snapped = steps * tick
     quantum = Decimal("1").scaleb(-decs)
@@ -670,7 +689,7 @@ def get_market_price(symbol: str, side: str, size: str) -> str:
             price = res["data"]["worstPrice"]
 
     if price is None:
-        raise RuntimeError(f"[apex_client] get_worst_price_v3 returned abnormal: {res}")
+        raise RuntimeError(f"[apex_client] get_worst_price_v3 返回异常: {res}")
 
     price_str = str(price)
     print(f"[apex_client] worst price for {symbol} {side} size={size_str}: {price_str}")
@@ -681,7 +700,7 @@ def _extract_order_ids(raw_order: Any) -> Tuple[Optional[str], Optional[str]]:
     order_id = None
     client_order_id = None
 
-    def _pick2(d: dict, *keys):
+    def _pick(d: dict, *keys):
         for k in keys:
             v = d.get(k)
             if v is not None:
@@ -689,19 +708,19 @@ def _extract_order_ids(raw_order: Any) -> Tuple[Optional[str], Optional[str]]:
         return None
 
     if isinstance(raw_order, dict):
-        order_id = _pick2(raw_order, "orderId", "id")
-        client_order_id = _pick2(raw_order, "clientOrderId", "clientId")
+        order_id = _pick(raw_order, "orderId", "id")
+        client_order_id = _pick(raw_order, "clientOrderId", "clientId")
 
         data = raw_order.get("data")
         if isinstance(data, dict):
-            order_id = order_id or _pick2(data, "orderId", "id")
-            client_order_id = client_order_id or _pick2(data, "clientOrderId", "clientId")
+            order_id = order_id or _pick(data, "orderId", "id")
+            client_order_id = client_order_id or _pick(data, "clientOrderId", "clientId")
 
     return (str(order_id) if order_id else None, str(client_order_id) if client_order_id else None)
 
 
 # ------------------------------------------------------------
-# ✅ Private WS: account_info_stream_v3 -> orders push
+# ✅ Private WS: account_info_stream_v3 -> fills push
 # ------------------------------------------------------------
 
 def start_private_ws():
@@ -713,7 +732,7 @@ def start_private_ws():
 
     For each order update, we maintain a per-order tracker:
       - cumulative filled qty (cumFilledSize / filledSize)
-      - average fill price (avgPrice / averagePrice / fillAvgPrice)
+      - average fill price (avgPrice / fillAvgPrice / averagePrice)
       - status
 
     From cumulative (qty, avg), we reconstruct delta fills:
@@ -739,6 +758,22 @@ def start_private_ws():
 
     api_creds = _get_api_credentials()
 
+    def _pick(d: dict, *keys):
+        for k in keys:
+            v = d.get(k)
+            if v is not None:
+                return v
+        return None
+
+    def _to_decimal(x) -> Optional[Decimal]:
+        if x is None:
+            return None
+        try:
+            d = Decimal(str(x))
+            return d
+        except Exception:
+            return None
+
     def handle_account(message: dict):
         try:
             if not isinstance(message, dict):
@@ -752,6 +787,7 @@ def start_private_ws():
 
             def _walk(x):
                 if isinstance(x, dict):
+                    # Heuristic: order-like dict if it has any common order fields
                     if any(k in x for k in (
                         "orderId", "id", "clientOrderId", "clientId",
                         "status", "orderStatus", "state",
@@ -823,6 +859,7 @@ def start_private_ws():
                 if cum_qty is not None and cum_qty > prev_cum:
                     delta_qty = (cum_qty - prev_cum)
 
+                    # Determine new notional if possible (prefer explicit notional/value)
                     new_notional = None
                     if notional is not None:
                         new_notional = Decimal(str(notional))
@@ -845,19 +882,24 @@ def start_private_ws():
                         if avg_px is not None and Decimal(str(avg_px)) > 0:
                             prev["avg"] = Decimal(str(avg_px))
                         else:
+                            # compute avg from notional
                             try:
                                 prev["avg"] = (new_notional / Decimal(str(cum_qty)))
                             except Exception:
                                 pass
                     else:
+                        # As a last resort, use last fill price for delta (still better than quote)
                         lf_qty = parsed.get("last_fill_qty")
                         lf_px = parsed.get("last_fill_px")
                         if lf_qty is not None and lf_px is not None and Decimal(str(lf_qty)) > 0 and Decimal(str(lf_px)) > 0:
                             prev["cum_qty"] = Decimal(str(cum_qty))
                             delta_px = Decimal(str(lf_px))
+
                 else:
+                    # Still update cum_qty if present (even if unchanged) for later reconciliation
                     if cum_qty is not None and cum_qty >= 0:
                         prev["cum_qty"] = Decimal(str(cum_qty))
+                    # If avg is newly available, update it
                     if avg_px is not None and cum_qty is not None and cum_qty > 0 and Decimal(str(avg_px)) > 0:
                         prev["avg"] = Decimal(str(avg_px))
                         prev["notional"] = (Decimal(str(avg_px)) * Decimal(str(cum_qty)))
@@ -885,7 +927,6 @@ def start_private_ws():
                         "delta_price": str(delta_px),
                         "raw": parsed.get("raw"),
                         "ts": time.time(),
-                        "source": "ws_order",
                     }
                     try:
                         _ORDER_Q.put_nowait(evt)
@@ -894,7 +935,6 @@ def start_private_ws():
 
         except Exception as e:
             print("[apex_client][WS] handle_account error:", e)
-
     def _run_forever():
         backoff = 1.0
         while True:
@@ -932,6 +972,7 @@ def pop_order_event(timeout: float = 0.5) -> Optional[dict]:
         return None
 
 
+
 def _ws_order_summary(order_id: Optional[str], client_order_id: Optional[str]) -> Optional[Dict[str, Any]]:
     now = time.time()
     ttl = float(os.getenv("WS_ORDER_TTL_SEC", "30"))
@@ -947,6 +988,7 @@ def _ws_order_summary(order_id: Optional[str], client_order_id: Optional[str]) -
             notional = st.get("notional")
 
             if cum > 0:
+                # If avg is missing but notional exists, compute avg.
                 try:
                     if (avg is None) or (Decimal(str(avg)) <= 0):
                         if notional is not None and Decimal(str(notional)) > 0:
@@ -965,6 +1007,8 @@ def _ws_order_summary(order_id: Optional[str], client_order_id: Optional[str]) -
     return None
 
 
+
+
 def get_fill_summary(
     symbol: str,
     order_id: Optional[str] = None,
@@ -972,8 +1016,7 @@ def get_fill_summary(
     max_wait_sec: float = 12.0,
     poll_interval: float = 0.25,
 ) -> Dict[str, Any]:
-    """
-    ✅ Order-based fill summary (NO fills subscription).
+    """✅ Order-based fill summary (NO fills subscription).
 
     Priority:
       1) WS order tracker (_WS_ORDER_STATE), derived from private WS *order* updates.
@@ -982,6 +1025,7 @@ def get_fill_summary(
 
     This function NEVER uses market quote / worstPrice as execution price.
     """
+    # 1) WS order summary
     ws_hit = _ws_order_summary(order_id, client_order_id)
     if ws_hit:
         return {
@@ -1002,6 +1046,7 @@ def get_fill_summary(
     last_err: Optional[Exception] = None
 
     while True:
+        # 2) REST order detail fallback
         try:
             order_obj = _rest_fetch_order_detail(str(order_id))
         except Exception as e:
@@ -1028,6 +1073,7 @@ def get_fill_summary(
             except Exception as e:
                 last_err = e
 
+        # Re-check WS each loop in case WS arrives after first miss.
         ws_hit = _ws_order_summary(order_id, client_order_id)
         if ws_hit:
             return {
@@ -1047,11 +1093,12 @@ def get_fill_summary(
         time.sleep(poll_interval)
 
 
+
 def create_market_order(
     symbol: str,
     side: str,
-    size: Optional[NumberLike] = None,
-    size_usdt: Optional[NumberLike] = None,
+    size: NumberLike | None = None,
+    size_usdt: NumberLike | None = None,
     reduce_only: bool = False,
     client_id: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -1099,10 +1146,13 @@ def create_market_order(
 
     print(f"[apex_client] clientId={apex_client_id} (provided={bool(client_id)})")
 
+
+    # Snap price as well (best-effort). Some gateways validate scale.
     try:
         px_dec = snap_price_for_order(symbol, side, "MARKET", price_str)
         price_str = format(px_dec, f".{rules.get('price_decimals', 2)}f")
     except Exception:
+        # If snapping fails for any reason, fall back to original price_str.
         price_str = str(price_str)
 
     params = {
@@ -1123,7 +1173,7 @@ def create_market_order(
 
     data = raw_order["data"] if isinstance(raw_order, dict) and "data" in raw_order else raw_order
     order_id, client_order_id = _extract_order_ids(raw_order)
-
+    # Ensure tracker contains this order for WS/REST reconciliation
     try:
         od = raw_order.get("data") if isinstance(raw_order, dict) else None
         st = ""
@@ -1132,6 +1182,7 @@ def create_market_order(
         register_order_for_tracking(order_id=order_id, client_order_id=client_order_id, symbol=symbol, status=st or "PENDING")
     except Exception:
         pass
+
 
     if order_id and client_order_id:
         _ORDER_ID_TO_CLIENT_ID[str(order_id)] = str(client_order_id)
@@ -1152,86 +1203,10 @@ def create_market_order(
     }
 
 
-def create_limit_order(
-    symbol: str,
-    side: str,
-    size: NumberLike,
-    price: NumberLike,
-    reduce_only: bool = False,
-    client_id: Optional[str] = None,
-    time_in_force: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    Create a LIMIT order (optionally reduceOnly).
-
-    Notes:
-    - Used for maker-style take-profit: you place a resting LIMIT on the book.
-    - We DO NOT force maker via unknown postOnly flags here.
-    """
-    client = get_client()
-    side = str(side).upper()
-
-    rules = _get_symbol_rules(symbol)
-    qty_decimals = int(rules.get("qty_decimals", 2))
-    px_decimals = int(rules.get("price_decimals", 2))
-
-    qty_dec = _snap_quantity(symbol, Decimal(str(size)))
-    if qty_dec <= 0:
-        raise ValueError(f"size must be > 0 after snap, got={size}")
-
-    px_dec = _snap_price(symbol, Decimal(str(price)), ROUND_UP if side == "BUY" else ROUND_DOWN)
-    if px_dec <= 0:
-        raise ValueError(f"price must be > 0 after snap, got={price}")
-
-    size_str = format(qty_dec, f".{qty_decimals}f")
-    price_str = format(px_dec, f".{px_decimals}f")
-
-    ts = int(time.time())
-    apex_client_id = str(client_id) if client_id else _random_client_id()
-
-    params: Dict[str, Any] = {
-        "symbol": symbol,
-        "side": side,
-        "type": "LIMIT",
-        "size": size_str,
-        "price": price_str,
-        "timestampSeconds": ts,
-        "reduceOnly": reduce_only,
-        "clientId": apex_client_id,
-    }
-    if time_in_force:
-        params["timeInForce"] = str(time_in_force)
-
-    print("[apex_client] create_limit_order params:", params)
-
-    raw_order = _safe_call(client.create_order_v3, **params)
-    print("[apex_client] limit order response:", raw_order)
-
-    order_id, client_order_id = _extract_order_ids(raw_order)
-    try:
-        od = raw_order.get("data") if isinstance(raw_order, dict) else None
-        st = ""
-        if isinstance(od, dict):
-            st = str(od.get("status") or od.get("orderStatus") or od.get("state") or "")
-        register_order_for_tracking(order_id=order_id, client_order_id=client_order_id, symbol=symbol, status=st or "PENDING")
-    except Exception:
-        pass
-
-    if order_id and client_order_id:
-        _ORDER_ID_TO_CLIENT_ID[str(order_id)] = str(client_order_id)
-
-    return {
-        "raw_order": raw_order,
-        "order_id": order_id,
-        "client_order_id": client_order_id,
-        "sent": params,
-    }
-
-
 def create_trigger_order(
     symbol: str,
     side: str,
-    order_type: str,  # STOP_MARKET / TAKE_PROFIT_MARKET / STOP_LIMIT / TAKE_PROFIT_LIMIT
+    order_type: str,             # STOP_MARKET / TAKE_PROFIT_MARKET / STOP_LIMIT / TAKE_PROFIT_LIMIT
     size: NumberLike,
     trigger_price: NumberLike,
     price: Optional[NumberLike] = None,
@@ -1247,17 +1222,19 @@ def create_trigger_order(
     apex_client_id = client_id or _random_client_id()
 
     size_str = str(size)
-
-    # ✅ Snap triggerPrice to tick size
+    # Snap triggerPrice to tick size to satisfy exchange precision rules.
     trigger_dec = snap_price_for_order(symbol, side, order_type, trigger_price)
     trigger_str = str(trigger_dec)
 
-    # ✅ price is required by some gateways even for *_MARKET.
-    # IMPORTANT: Do NOT call worstPrice/marketQuote here. That value is NOT an execution price.
-    # For *_MARKET trigger orders, the gateway ignores `price` on execution. Use triggerPrice as a safe placeholder.
+    # price is required by some SDK/builds even for *_MARKET; fallback to worstPrice
     if price is None:
-        price = trigger_str
+        try:
+            px = get_market_price(symbol, side, size_str)
+        except Exception:
+            px = trigger_str
+        price = px
 
+    # Snap price as well (best-effort). Even for *_MARKET some gateways validate scale.
     try:
         price_dec = snap_price_for_order(symbol, side, order_type, price)
         price = str(price_dec)
@@ -1285,10 +1262,6 @@ def create_trigger_order(
     print("[apex_client] trigger order response:", raw_order)
 
     order_id, client_order_id = _extract_order_ids(raw_order)
-    if order_id and client_order_id:
-        _ORDER_ID_TO_CLIENT_ID[str(order_id)] = str(client_order_id)
-
-    # ✅ also register for REST fallback tracking
     try:
         od = raw_order.get("data") if isinstance(raw_order, dict) else None
         st = ""
@@ -1297,6 +1270,10 @@ def create_trigger_order(
         register_order_for_tracking(order_id=order_id, client_order_id=client_order_id, symbol=symbol, status=st or "PENDING")
     except Exception:
         pass
+
+    if order_id and client_order_id:
+
+        _ORDER_ID_TO_CLIENT_ID[str(order_id)] = str(client_order_id)
 
     return {
         "raw_order": raw_order,
