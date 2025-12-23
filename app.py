@@ -8,6 +8,9 @@ from flask import Flask, request, jsonify, Response
 
 from apex_client import (
     create_market_order,
+    create_trigger_order,
+    cancel_order,
+    pop_order_event,
     get_market_price,
     get_fill_summary,
     get_open_position_for_symbol,
@@ -30,6 +33,11 @@ from pnl_store import (
     clear_lock_level_pct,
     is_signal_processed,
     mark_signal_processed,
+    # exchange protective orders
+    set_protective_orders,
+    get_protective_orders,
+    clear_protective_orders,
+    get_protective_owner_by_order_id,
 )
 
 app = Flask(__name__)
@@ -39,6 +47,12 @@ DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "")
 
 # ✅ 只让 worker 进程启用 WS/Fills（supervisord.conf 里给 worker 设置 ENABLE_WS="1"，web 设置 "0"）
 ENABLE_WS = str(os.getenv("ENABLE_WS", "0")).strip() == "1"
+
+# ✅ Exchange-side protective orders (STOP/TP) managed by worker
+ENABLE_EXCHANGE_PROTECTIVE = str(os.getenv("ENABLE_EXCHANGE_PROTECTIVE", "1")).strip() == "1"
+# Optional TP percent (blank/0 disables). Example: 0.2 means +0.2% TP for LONG, -0.2% for SHORT
+EXCHANGE_TP_PCT = str(os.getenv("EXCHANGE_TP_PCT", "")).strip()
+TRIGGER_PRICE_TYPE = str(os.getenv("TRIGGER_PRICE_TYPE", "")).strip()  # e.g. LAST_PRICE / MARK_PRICE / INDEX_PRICE (if supported)
 
 # 退出互斥窗口（秒）：防止重复平仓
 EXIT_COOLDOWN_SEC = float(os.getenv("EXIT_COOLDOWN_SEC", "2.0"))
@@ -113,52 +127,37 @@ def _to_decimal(x: Any, default: Decimal = Decimal("0")) -> Decimal:
         return default
 
 
-#+#+#+#+########################################
-# BOT GROUPS
-#
-# Per your requirement:
-# - Keep bot-side SL/TP ONLY for: BOT_1–5 (LONG) and BOT_11–15 (SHORT)
-# - Remove bot-side SL/TP for: BOT_6–10 and BOT_16–20 (they remain signal-driven only)
-#
-# Note: In this repo, the only bot-side SL/TP implementation is the ladder-stop loop below.
-#+#+#+#+########################################
-
 # ----------------------------
 # ✅ BOT 分组（按你要求）
+# - 只有 BOT_1–5 (LONG) 与 BOT_11–15 (SHORT) 启用机器人风控（止损/移动止损/可选止盈）
+# - BOT_6–10 与 BOT_16–20：只执行信号与记账（PNL-only / signal-driven only），不跑机器人保护单逻辑
 # ----------------------------
 
-_ALLOWED_LONG_TPSL = {f"BOT_{i}" for i in range(1, 6)}
+# Hard allow-list for bot-side risk management
+_ALLOWED_LONG_TPSL  = {f"BOT_{i}" for i in range(1, 6)}
 _ALLOWED_SHORT_TPSL = {f"BOT_{i}" for i in range(11, 16)}
 
-# “TPSL bots” here means: bots that are allowed to have bot-side SL/TP logic enabled.
-# (In this repo, the only bot-side SL/TP is the ladder stop loop below.)
+# LONG bots that run bot-side risk management (hard limited)
 LONG_TPSL_BOTS = _parse_bot_list(os.getenv("LONG_TPSL_BOTS", ",".join(sorted(_ALLOWED_LONG_TPSL)))) & _ALLOWED_LONG_TPSL
+
+# SHORT bots that run bot-side risk management (hard limited)
 SHORT_TPSL_BOTS = _parse_bot_list(os.getenv("SHORT_TPSL_BOTS", ",".join(sorted(_ALLOWED_SHORT_TPSL)))) & _ALLOWED_SHORT_TPSL
 
-# “PNL only” means: no bot-side SL/TP; only record real fills and follow strategy exit signals.
-LONG_PNL_ONLY_BOTS = _parse_bot_list(
-    os.getenv(
-        "LONG_PNL_ONLY_BOTS",
-        ",".join([*(f"BOT_{i}" for i in range(6, 11)), *(f"BOT_{i}" for i in range(21, 31))]),
-    )
-) - _ALLOWED_LONG_TPSL
+# PNL-only bots (still allowed to trade & record; no bot-side SL/TP)
+_DEFAULT_LONG_PNL_ONLY  = ",".join([f"BOT_{i}" for i in range(6, 11)] + [f"BOT_{i}" for i in range(21, 31)])
+_DEFAULT_SHORT_PNL_ONLY = ",".join([f"BOT_{i}" for i in range(16, 21)] + [f"BOT_{i}" for i in range(31, 41)])
 
-SHORT_PNL_ONLY_BOTS = _parse_bot_list(
-    os.getenv(
-        "SHORT_PNL_ONLY_BOTS",
-        ",".join([*(f"BOT_{i}" for i in range(16, 21)), *(f"BOT_{i}" for i in range(31, 41))]),
-    )
-) - _ALLOWED_SHORT_TPSL
-
+LONG_PNL_ONLY_BOTS  = _parse_bot_list(os.getenv("LONG_PNL_ONLY_BOTS",  _DEFAULT_LONG_PNL_ONLY))
+SHORT_PNL_ONLY_BOTS = _parse_bot_list(os.getenv("SHORT_PNL_ONLY_BOTS", _DEFAULT_SHORT_PNL_ONLY))
 
 # ----------------------------
-# ✅ Ladder Stop (bot-side only; no exchange protective orders)
+# ✅ Ladder Stop / Protective Orders
 # BOT1-5: LONG ladder
 # BOT11-15: SHORT ladder
 # ----------------------------
 
-LADDER_LONG_BOTS  = _parse_bot_list(os.getenv("LADDER_LONG_BOTS",  ",".join(sorted(_ALLOWED_LONG_TPSL)))) & _ALLOWED_LONG_TPSL
-LADDER_SHORT_BOTS = _parse_bot_list(os.getenv("LADDER_SHORT_BOTS", ",".join(sorted(_ALLOWED_SHORT_TPSL)))) & _ALLOWED_SHORT_TPSL
+LADDER_LONG_BOTS  = _parse_bot_list(os.getenv("LADDER_LONG_BOTS",  ",".join([f"BOT_{i}" for i in range(1, 6)]))) & _ALLOWED_LONG_TPSL
+LADDER_SHORT_BOTS = _parse_bot_list(os.getenv("LADDER_SHORT_BOTS", ",".join([f"BOT_{i}" for i in range(11, 16)])))
 
 # Base stop-loss (percent). Example 0.5 -> -0.5% initial lock.
 LADDER_BASE_SL_PCT = Decimal(os.getenv("LADDER_BASE_SL_PCT", "0.5"))
@@ -170,7 +169,7 @@ LADDER_BASE_SL_PCT = Decimal(os.getenv("LADDER_BASE_SL_PCT", "0.5"))
 # 0.55 -> +0.35
 # 0.75 -> +0.55
 # 0.95 -> +0.75
-_DEFAULT_LADDER_LEVELS = "0.15:0.125,0.35:0.15,0.55:0.35,0.75:0.55,0.95:0.75"
+_DEFAULT_LADDER_LEVELS = "0.15:0.125,0.35:0.15,0.45:0.25,0.55:0.35,0.75:0.55,0.95:0.75"
 LADDER_LEVELS_RAW = os.getenv("LADDER_LEVELS", _DEFAULT_LADDER_LEVELS)
 
 # Risk poll interval (seconds)
@@ -267,6 +266,296 @@ def _exit_guard_allow(bot_id: str, symbol: str) -> bool:
 # ----------------------------
 # 预算提取
 # ----------------------------
+
+# ----------------------------
+# ✅ Exchange Protective Orders (SL/TP) helpers
+# ----------------------------
+def _maybe_decimal(x: Any) -> Optional[Decimal]:
+    try:
+        if x is None:
+            return None
+        d = Decimal(str(x))
+        return d
+    except Exception:
+        return None
+
+
+def _close_side_from_direction(direction: str) -> str:
+    return "SELL" if str(direction).upper() == "LONG" else "BUY"
+
+
+def _compute_tp_price(direction: str, entry: Decimal, tp_pct: Decimal) -> Decimal:
+    d = str(direction).upper()
+    if d == "LONG":
+        return entry * (Decimal("1") + (tp_pct / Decimal("100")))
+    else:
+        return entry * (Decimal("1") - (tp_pct / Decimal("100")))
+
+
+def _cancel_if_exists(order_id: Optional[str]):
+    if not order_id:
+        return
+    try:
+        cancel_order(str(order_id))
+    except Exception as e:
+        print(f"[PROTECT] cancel failed order_id={order_id} err={e}")
+
+
+def _sync_exchange_protective(bot_id: str, symbol: str, direction: str, qty: Decimal, entry: Decimal, lock_pct: Decimal):
+    """Ensure exchange-side STOP (and optional TP) exists and matches current lock_pct.
+
+    - Stores IDs/prices in pnl_store.protective_orders
+    - Cancels and replaces orders when lock level changes
+    """
+    if not ENABLE_EXCHANGE_PROTECTIVE:
+        return
+    b = _canon_bot_id(bot_id)
+    sym = str(symbol).upper().strip()
+    diru = str(direction).upper().strip()
+    if diru == "LONG" and b not in _ALLOWED_LONG_TPSL:
+        return
+    if diru == "SHORT" and b not in _ALLOWED_SHORT_TPSL:
+        return
+    if qty <= 0 or entry <= 0:
+        return
+
+    stop_price = _compute_stop_price(diru, entry, lock_pct)
+    close_side = _close_side_from_direction(diru)
+
+    existing = {}
+    try:
+        existing = get_protective_orders(b, sym, diru) or {}
+    except Exception:
+        existing = {}
+
+    # Replace SL if missing or price changed
+    existing_sl_id = existing.get("sl_order_id")
+    existing_sl_price = existing.get("sl_price")
+
+    need_new_sl = True
+    if existing_sl_id and existing_sl_price:
+        try:
+            if Decimal(str(existing_sl_price)) == Decimal(str(stop_price)):
+                need_new_sl = False
+        except Exception:
+            need_new_sl = True
+
+    if need_new_sl:
+        # Cancel old SL before placing new one (avoid multi-stops)
+        _cancel_if_exists(existing_sl_id)
+
+        client_id = f"{b}-{sym}-{diru}-SL-{int(time.time())}"
+        try:
+            res = create_trigger_order(
+                symbol=sym,
+                side=close_side,
+                order_type="STOP_MARKET",
+                size=str(qty),
+                trigger_price=str(stop_price),
+                reduce_only=True,
+                client_id=client_id,
+                expiration_sec=None,
+                trigger_price_type=(TRIGGER_PRICE_TYPE or None),
+            )
+            sl_order_id = res.get("order_id")
+            sl_client_id = res.get("client_order_id")
+            set_protective_orders(
+                bot_id=b, symbol=sym, direction=diru,
+                sl_order_id=str(sl_order_id) if sl_order_id else None,
+                tp_order_id=existing.get("tp_order_id"),
+                sl_client_id=str(sl_client_id) if sl_client_id else client_id,
+                tp_client_id=existing.get("tp_client_id"),
+                sl_price=str(stop_price),
+                tp_price=existing.get("tp_price"),
+                is_active=True,
+            )
+            print(f"[PROTECT] SL upsert bot={b} {diru} {sym} qty={qty} stop={stop_price} order_id={sl_order_id}")
+        except Exception as e:
+            print(f"[PROTECT] SL create failed bot={b} {diru} {sym} err={e}")
+
+    # Optional TP
+    tp_pct_dec: Optional[Decimal] = None
+    if EXCHANGE_TP_PCT not in ("", "0", "0.0"):
+        tp_pct_dec = _maybe_decimal(EXCHANGE_TP_PCT)
+
+    if tp_pct_dec and tp_pct_dec > 0:
+        tp_price = _compute_tp_price(diru, entry, tp_pct_dec)
+        existing_tp_id = existing.get("tp_order_id")
+        existing_tp_price = existing.get("tp_price")
+
+        need_new_tp = True
+        if existing_tp_id and existing_tp_price:
+            try:
+                if Decimal(str(existing_tp_price)) == Decimal(str(tp_price)):
+                    need_new_tp = False
+            except Exception:
+                need_new_tp = True
+
+        if need_new_tp:
+            _cancel_if_exists(existing_tp_id)
+            client_id = f"{b}-{sym}-{diru}-TP-{int(time.time())}"
+            try:
+                res = create_trigger_order(
+                    symbol=sym,
+                    side=close_side,
+                    order_type="TAKE_PROFIT_MARKET",
+                    size=str(qty),
+                    trigger_price=str(tp_price),
+                    reduce_only=True,
+                    client_id=client_id,
+                    expiration_sec=None,
+                )
+                tp_order_id = res.get("order_id")
+                tp_client_id = res.get("client_order_id")
+                # read current (possibly updated) sl from DB
+                cur_po = get_protective_orders(b, sym, diru) or {}
+                set_protective_orders(
+                    bot_id=b, symbol=sym, direction=diru,
+                    sl_order_id=cur_po.get("sl_order_id"),
+                    tp_order_id=str(tp_order_id) if tp_order_id else None,
+                    sl_client_id=cur_po.get("sl_client_id"),
+                    tp_client_id=str(tp_client_id) if tp_client_id else client_id,
+                    sl_price=cur_po.get("sl_price"),
+                    tp_price=str(tp_price),
+                    is_active=True,
+                )
+                print(f"[PROTECT] TP upsert bot={b} {diru} {sym} qty={qty} tp={tp_price} order_id={tp_order_id}")
+            except Exception as e:
+                print(f"[PROTECT] TP create failed bot={b} {diru} {sym} err={e}")
+
+
+def _clear_exchange_protective(bot_id: str, symbol: str, direction: str):
+    b = _canon_bot_id(bot_id)
+    sym = str(symbol).upper().strip()
+    diru = str(direction).upper().strip()
+    try:
+        po = get_protective_orders(b, sym, diru) or {}
+    except Exception:
+        po = {}
+    # cancel both if present
+    _cancel_if_exists(po.get("sl_order_id"))
+    _cancel_if_exists(po.get("tp_order_id"))
+    try:
+        clear_protective_orders(b, sym, diru)
+    except Exception:
+        pass
+
+
+# ----------------------------
+# ✅ WS order-event consumer:
+# - When exchange-side SL/TP fills, record exit + cancel the other leg + cleanup.
+# ----------------------------
+_ORDER_CONSUMER_STARTED = False
+_ORDER_CONSUMER_LOCK = threading.Lock()
+
+
+def _order_consumer_loop():
+    print("[ORDERS] consumer loop started")
+    while True:
+        try:
+            evt = pop_order_event(timeout=0.75)
+            if not evt:
+                continue
+            order_id = evt.get("order_id")
+            status = str(evt.get("status") or "").upper()
+            delta_qty = _maybe_decimal(evt.get("delta_qty")) or Decimal("0")
+
+            # Only act on meaningful updates
+            if (not order_id) or (delta_qty <= 0 and status not in ("FILLED", "CLOSED", "EXECUTED", "DONE")):
+                continue
+
+            owner = {}
+            try:
+                owner = get_protective_owner_by_order_id(str(order_id)) or {}
+            except Exception:
+                owner = {}
+
+            if not owner:
+                continue
+
+            bot_id = owner.get("bot_id")
+            symbol = owner.get("symbol")
+            direction = owner.get("direction")
+            kind = owner.get("kind")  # SL / TP
+            if not bot_id or not symbol or not direction:
+                continue
+
+            # Avoid duplicate exits in very short windows
+            if not _exit_guard_allow(bot_id, str(symbol)):
+                continue
+
+            # Fetch final fill summary for accuracy
+            try:
+                fill = get_fill_summary(
+                    symbol=str(symbol),
+                    order_id=str(order_id),
+                    client_order_id=None,
+                    max_wait_sec=float(os.getenv("FILL_MAX_WAIT_SEC", "25.0")),
+                    poll_interval=float(os.getenv("FILL_POLL_INTERVAL", "0.25")),
+                )
+                exit_price = Decimal(str(fill["avg_fill_price"]))
+                filled_qty = Decimal(str(fill["filled_qty"]))
+            except Exception as e:
+                print(f"[ORDERS] fill summary unavailable order_id={order_id} err={e}")
+                continue
+
+            try:
+                record_exit_fifo(
+                    bot_id=_canon_bot_id(bot_id),
+                    symbol=str(symbol).upper().strip(),
+                    direction=str(direction).upper().strip(),
+                    qty=filled_qty,
+                    price=exit_price,
+                    reason=f"{kind}_exchange_trigger" if kind else "exchange_trigger",
+                )
+            except Exception as e:
+                print("[PNL] record_exit_fifo (exchange protective) error:", e)
+
+            # OCO cancel the other side, then clear state
+            try:
+                po = get_protective_orders(_canon_bot_id(bot_id), str(symbol).upper().strip(), str(direction).upper().strip()) or {}
+                other_id = po.get("tp_order_id") if kind == "SL" else po.get("sl_order_id")
+                _cancel_if_exists(other_id)
+            except Exception:
+                pass
+
+            try:
+                clear_lock_level_pct(_canon_bot_id(bot_id), str(symbol).upper().strip(), str(direction).upper().strip())
+            except Exception:
+                pass
+
+            try:
+                clear_protective_orders(_canon_bot_id(bot_id), str(symbol).upper().strip(), str(direction).upper().strip())
+            except Exception:
+                pass
+
+            # Update in-memory shadow
+            try:
+                key_local = (_canon_bot_id(bot_id), str(symbol).upper().strip())
+                if key_local in BOT_POSITIONS:
+                    BOT_POSITIONS[key_local]["qty"] = Decimal("0")
+                    BOT_POSITIONS[key_local]["entry_price"] = None
+            except Exception:
+                pass
+
+            print(f"[ORDERS] handled protective fill bot={bot_id} {direction} {symbol} kind={kind} qty={filled_qty} px={exit_price}")
+
+        except Exception as e:
+            print("[ORDERS] consumer loop error:", e)
+
+
+def _ensure_order_consumer():
+    global _ORDER_CONSUMER_STARTED
+    with _ORDER_CONSUMER_LOCK:
+        if _ORDER_CONSUMER_STARTED:
+            return
+        t = threading.Thread(target=_order_consumer_loop, daemon=True, name="apex-order-consumer")
+        t.start()
+        _ORDER_CONSUMER_STARTED = True
+        print("[ORDERS] consumer thread created")
+
+
+
 def _extract_budget_usdt(body: dict) -> Decimal:
     size_field = (
         body.get("position_size_usdt")
@@ -498,14 +787,36 @@ def _risk_loop():
                     lock_pct = _maybe_raise_lock(bot_id, symbol, direction, profit_pct)
                     stop_price = _compute_stop_price(direction, entry, Decimal(str(lock_pct)))
 
+                    # ✅ Keep exchange-side SL/TP synced with latest lock level
+                    try:
+                        _sync_exchange_protective(bot_id, symbol, direction, qty, entry, Decimal(str(lock_pct)))
+                    except Exception:
+                        pass
+
                     if _ladder_should_stop(direction, mark, stop_price):
+                        # If exchange protective is enabled, do NOT double-close here.
+                        # The standing STOP_MARKET will trigger on exchange; we only failover-close if no SL exists.
+                        try:
+                            po = get_protective_orders(_canon_bot_id(bot_id), str(symbol).upper().strip(), str(direction).upper().strip()) or {}
+                            has_sl = bool(po.get("sl_order_id")) and str(po.get("is_active", 1)) != "0"
+                        except Exception:
+                            has_sl = False
+
+                        if ENABLE_EXCHANGE_PROTECTIVE and has_sl:
+                            print(
+                                f"[LADDER] stop zone reached (exchange SL pending) bot={bot_id} {direction} {symbol} "
+                                f"qty={qty} entry={entry} mark={mark} profit%={profit_pct:.4f} lock%={lock_pct} stop={stop_price}"
+                            )
+                            continue
+
+                        # Fallback: close locally if no exchange SL is present
                         if not _exit_guard_allow(bot_id, symbol):
                             continue
                         print(
-                            f"[LADDER] STOP bot={bot_id} {direction} {symbol} qty={qty} "
+                            f"[LADDER] STOP (fallback close) bot={bot_id} {direction} {symbol} qty={qty} "
                             f"entry={entry} mark={mark} profit%={profit_pct:.4f} lock%={lock_pct} stop={stop_price}"
                         )
-                        _ladder_close_position(bot_id, symbol, direction, qty, reason="ladder_stop")
+                        _ladder_close_position(bot_id, symbol, direction, qty, reason="ladder_stop_fallback")
 
                 except Exception as e:
                     print("[LADDER] loop error:", e)
@@ -1171,6 +1482,14 @@ def tv_webhook():
                     price=entry_price_dec,
                     reason="strategy_entry_fill",
                 )
+                # ✅ initialize lock level and exchange protective orders (BOT_1–5 / BOT_11–15 only)
+                try:
+                    direction = "LONG" if side_raw == "BUY" else "SHORT"
+                    set_lock_level_pct(bot_id, symbol, direction, -LADDER_BASE_SL_PCT)
+                    _sync_exchange_protective(bot_id, symbol, direction, final_qty, entry_price_dec, -LADDER_BASE_SL_PCT)
+                except Exception as e:
+                    print("[PROTECT] init protective failed:", e)
+
             except Exception as e:
                 print("[PNL] record_entry error:", e)
 
@@ -1307,6 +1626,10 @@ def tv_webhook():
                 exit_price=exit_price,
                 reason="strategy_exit",
             )
+            try:
+                _clear_exchange_protective(bot_id, symbol, direction_to_close)
+            except Exception:
+                pass
         except Exception as e:
             print("[PNL] record_exit_fifo error (strategy):", e)
 
