@@ -43,6 +43,9 @@ SYMBOL_RULES: Dict[str, Dict[str, Any]] = {
 
 _CLIENT: Optional[HttpPrivateSign] = None
 
+# configs_v3 cache (best-effort). Some helpers (e.g., tick-size inference) read this.
+_CONFIGS_V3: Optional[dict] = None
+
 NumberLike = Union[str, float, int]
 
 # ----------------------------
@@ -1212,10 +1215,15 @@ def create_limit_order(
 ) -> Dict[str, Any]:
     """Create a LIMIT order (optionally reduceOnly).
 
+    Typical usage:
+    - Maker-style take-profit: place a resting LIMIT on the book with reduceOnly=True.
+
     Notes:
-    - Intended for maker-style resting orders.
-    - We do NOT enforce postOnly/makerOnly flags here because SDK support varies.
+    - Whether the order is truly "maker" depends on whether the venue supports (and accepts)
+      a post-only / maker-only constraint. If the SDK supports timeInForce='POST_ONLY',
+      pass it via `time_in_force`. `_safe_call` will drop unsupported kwargs automatically.
     """
+
     client = get_client()
     side = str(side).upper()
 
@@ -1227,7 +1235,12 @@ def create_limit_order(
     if qty_dec <= 0:
         raise ValueError(f"size must be > 0 after snap, got={size}")
 
-    px_dec = _snap_price(symbol, Decimal(str(price)), ROUND_UP if side == "BUY" else ROUND_DOWN)
+    # Snap price to tick size; rounding direction is conservative.
+    px_dec = _snap_price(
+        symbol,
+        Decimal(str(price)),
+        ROUND_UP if side == "BUY" else ROUND_DOWN,
+    )
     if px_dec <= 0:
         raise ValueError(f"price must be > 0 after snap, got={price}")
 
@@ -1274,6 +1287,7 @@ def create_limit_order(
         "client_order_id": client_order_id,
         "sent": params,
     }
+
 
 def create_trigger_order(
     symbol: str,
@@ -1381,7 +1395,16 @@ def _norm_symbol(s: str) -> str:
     return str(s or "").upper().replace("-", "").replace("_", "").strip()
 
 
+
+
 def get_open_position_for_symbol(symbol: str) -> Optional[Dict[str, Any]]:
+    """Return the *exchange* open position for a symbol (aggregated across subaccounts/bots).
+
+    Notes
+    - This is NOT bot-isolated. Bot isolation is handled in pnl_store.
+    - We expose extra fields (markPrice/oraclePrice/unrealizedPnl) so app.py can compute
+      stop/lock logic without using worstPrice/quotes.
+    """
     try:
         acc = get_account()
     except Exception as e:
@@ -1393,7 +1416,11 @@ def get_open_position_for_symbol(symbol: str) -> Optional[Dict[str, Any]]:
         data = acc if isinstance(acc, dict) else {}
 
     positions = (
-        data.get("positions") or data.get("openPositions") or data.get("position") or data.get("positionV3") or []
+        data.get("positions")
+        or data.get("openPositions")
+        or data.get("position")
+        or data.get("positionV3")
+        or []
     )
     if not isinstance(positions, list):
         return None
@@ -1410,6 +1437,11 @@ def get_open_position_for_symbol(symbol: str) -> Optional[Dict[str, Any]]:
         side = str(p.get("side", "")).upper()
         entry = p.get("entryPrice")
 
+        # Optional live fields (SDK variants)
+        mark = p.get("markPrice") or p.get("mark_price") or p.get("indexPrice") or p.get("index_price")
+        oracle = p.get("oraclePrice") or p.get("oracle_price")
+        u_pnl = p.get("unrealizedPnl") or p.get("unrealizedPNL") or p.get("unrealized_profit")
+
         try:
             size_dec = Decimal(str(size or "0"))
         except Exception:
@@ -1420,19 +1452,44 @@ def get_open_position_for_symbol(symbol: str) -> Optional[Dict[str, Any]]:
 
         entry_dec = None
         try:
-            if entry is not None:
+            if entry is not None and str(entry) != "":
                 entry_dec = Decimal(str(entry))
         except Exception:
             entry_dec = None
+
+        mark_dec = None
+        try:
+            if mark is not None and str(mark) != "":
+                mark_dec = Decimal(str(mark))
+        except Exception:
+            mark_dec = None
+
+        oracle_dec = None
+        try:
+            if oracle is not None and str(oracle) != "":
+                oracle_dec = Decimal(str(oracle))
+        except Exception:
+            oracle_dec = None
+
+        upnl_dec = None
+        try:
+            if u_pnl is not None and str(u_pnl) != "":
+                upnl_dec = Decimal(str(u_pnl))
+        except Exception:
+            upnl_dec = None
 
         return {
             "symbol": str(p.get("symbol", symbol)),
             "side": side,
             "size": size_dec,
             "entryPrice": entry_dec,
+            "markPrice": mark_dec,
+            "oraclePrice": oracle_dec,
+            "unrealizedPnl": upnl_dec,
             "raw": p,
         }
     return None
+
 
 
 def map_position_side_to_exit_order_side(pos_side: str) -> str:
