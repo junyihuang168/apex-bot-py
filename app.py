@@ -2,14 +2,12 @@ import os
 import time
 import threading
 from decimal import Decimal
-from typing import Dict, Tuple, Optional, Set
+from typing import Dict, Tuple, Optional, Set, Any, List
 
 from flask import Flask, request, jsonify, Response
 
 from apex_client import (
-    create_market_order,
-    create_limit_order,
-    get_market_price,
+    create_market_order,    get_market_price,
     get_fill_summary,
     get_open_position_for_symbol,
     _get_symbol_rules,
@@ -57,10 +55,16 @@ REMOTE_FALLBACK_SYMBOLS = {
 }
 
 # ✅ 固定止损/止盈（百分比）
-FIXED_SL_PCT = Decimal(os.getenv("FIXED_SL_PCT", "0.5"))  # -0.5%
-FIXED_TP_PCT = Decimal(os.getenv("FIXED_TP_PCT", "1.0"))  # +1.0%
+FIXED_SL_PCT = Decimal(os.getenv("FIXED_SL_PCT", "0.3"))  # -0.3%
+FIXED_TP_PCT = Decimal(os.getenv("FIXED_TP_PCT", "0.2"))  # +0.2%
 
 # ✅ 保护单模式：MARKET（默认稳） or LIMIT
+
+# ✅ 只有这些 BOT 会在交易所挂真实的保护单（TP/SL）
+# - 多头：BOT_6..BOT_10
+# - 空头：BOT_16..BOT_20
+PROTECTIVE_BOTS = {f"BOT_{i}" for i in range(6, 11)} | {f"BOT_{i}" for i in range(16, 21)}
+
 PROTECTIVE_ORDER_MODE = str(os.getenv("PROTECTIVE_ORDER_MODE", "MARKET")).upper().strip()
 PROTECTIVE_SLIPPAGE_PCT = Decimal(os.getenv("PROTECTIVE_SLIPPAGE_PCT", "0.15"))  # LIMIT 模式滑点 0.15%
 
