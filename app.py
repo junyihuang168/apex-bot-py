@@ -31,8 +31,6 @@ from pnl_store import (
     get_bot_open_positions,
     get_symbol_open_directions,
     clear_lock_level_pct,
-    get_lock_level_pct,
-    set_lock_level_pct,
     is_signal_processed,
     mark_signal_processed,
     # ✅ protective orders
@@ -59,10 +57,8 @@ REMOTE_FALLBACK_SYMBOLS = {
 }
 
 # ✅ 固定止损/止盈（百分比）
-# - SL: exchange-hosted STOP_* (reduceOnly)
-# - TP: exchange-hosted LIMIT (reduceOnly), aiming to rest on the book (maker when possible)
-FIXED_SL_PCT = Decimal(os.getenv("FIXED_SL_PCT", "0.3"))  # -0.3%
-FIXED_TP_PCT = Decimal(os.getenv("FIXED_TP_PCT", "0.2"))  # +0.2%
+FIXED_SL_PCT = Decimal(os.getenv("FIXED_SL_PCT", "0.5"))  # -0.5%
+FIXED_TP_PCT = Decimal(os.getenv("FIXED_TP_PCT", "1.0"))  # +1.0%
 
 # ✅ 保护单模式：MARKET（默认稳） or LIMIT
 PROTECTIVE_ORDER_MODE = str(os.getenv("PROTECTIVE_ORDER_MODE", "MARKET")).upper().strip()
@@ -121,11 +117,28 @@ def _bot_num(bot_id: str) -> int:
         return 0
 
 
+def _to_decimal(x: Any, default: Decimal = Decimal("0")) -> Decimal:
+    """Best-effort Decimal coercion used by monitor loops.
+
+    Keeps app resilient when WS payload fields are empty strings / None.
+    """
+    if x is None:
+        return default
+    if isinstance(x, Decimal):
+        return x
+    if isinstance(x, str) and x.strip() == "":
+        return default
+    try:
+        return Decimal(str(x))
+    except Exception:
+        return default
+
+
 # ----------------------------
 # ✅ BOT 分组（按你要求）
 # ----------------------------
-LONG_TPSL_BOTS = _parse_bot_list(os.getenv("LONG_TPSL_BOTS", ",".join([f"BOT_{i}" for i in range(6, 11)])))
-SHORT_TPSL_BOTS = _parse_bot_list(os.getenv("SHORT_TPSL_BOTS", ",".join([f"BOT_{i}" for i in range(16, 21)])))
+LONG_TPSL_BOTS = _parse_bot_list(os.getenv("LONG_TPSL_BOTS", ",".join([f"BOT_{i}" for i in range(1, 11)])))
+SHORT_TPSL_BOTS = _parse_bot_list(os.getenv("SHORT_TPSL_BOTS", ",".join([f"BOT_{i}" for i in range(11, 21)])))
 LONG_PNL_ONLY_BOTS = _parse_bot_list(os.getenv("LONG_PNL_ONLY_BOTS", ",".join([f"BOT_{i}" for i in range(21, 31)])))
 SHORT_PNL_ONLY_BOTS = _parse_bot_list(os.getenv("SHORT_PNL_ONLY_BOTS", ",".join([f"BOT_{i}" for i in range(31, 41)])))
 
@@ -283,14 +296,10 @@ def _cancel_existing_brackets(bot_id: str, symbol: str, direction: str):
 
 
 def _place_fixed_brackets(bot_id: str, symbol: str, direction: str, qty: Decimal, entry_price: Decimal):
-    """Place exchange-hosted protective orders for selected bots.
-
-    For LONG_TPSL_BOTS / SHORT_TPSL_BOTS only:
-    - SL: STOP_MARKET (or STOP_LIMIT if PROTECTIVE_ORDER_MODE=LIMIT)
-    - TP: LIMIT (reduceOnly), targeting a resting order (maker when possible)
-
-    Orders are tracked in `pnl_store.protective_orders` so WS/REST order monitoring
-    can auto-record exits and perform OCO (cancel the other protective order after flat).
+    """
+    BOT_1-20 才会走这里：
+    - 下 SL & TP（reduceOnly=True）
+    - 记录到 DB protective_orders，供 WS fills 自动记账 + OCO
     """
     bot_id = _canon_bot_id(bot_id)
     symbol = str(symbol).upper().strip()
@@ -302,48 +311,34 @@ def _place_fixed_brackets(bot_id: str, symbol: str, direction: str, qty: Decimal
     # 先取消旧的（避免重复挂单）
     _cancel_existing_brackets(bot_id, symbol, direction)
 
-    sl_trigger, tp_price = _compute_fixed_bracket_prices(direction, entry_price)
-    if sl_trigger <= 0 or tp_price <= 0:
+    sl_trigger, tp_trigger = _compute_fixed_bracket_prices(direction, entry_price)
+    if sl_trigger <= 0 or tp_trigger <= 0:
         return
 
     expiration = int(time.time()) + int(PROTECTIVE_EXPIRE_SEC)
     exit_side = "SELL" if direction == "LONG" else "BUY"
 
-    # SL order type
     if PROTECTIVE_ORDER_MODE == "LIMIT":
         sl_type = "STOP_LIMIT"
+        tp_type = "TAKE_PROFIT_LIMIT"
         sl_price = _apply_limit_slippage(direction, sl_trigger)
+        tp_price = _apply_limit_slippage(direction, tp_trigger)
     else:
         sl_type = "STOP_MARKET"
+        tp_type = "TAKE_PROFIT_MARKET"
         sl_price = None
+        tp_price = None
 
-    # Snap prices to tick size for clean logs and API safety.
+    # Snap trigger prices to tick size for clean logs and added safety (API also snaps as last-mile).
     try:
         sl_trigger = snap_price_for_order(symbol, exit_side, sl_type, sl_trigger)
+        tp_trigger = snap_price_for_order(symbol, exit_side, tp_type, tp_trigger)
         if sl_price is not None:
             sl_price = snap_price_for_order(symbol, exit_side, sl_type, sl_price)
-        # TP is LIMIT (no trigger)
-        tp_price = snap_price_for_order(symbol, exit_side, "LIMIT", tp_price)
+        if tp_price is not None:
+            tp_price = snap_price_for_order(symbol, exit_side, tp_type, tp_price)
     except Exception as e:
         print(f"[BRACKET] WARNING snap price failed: {e}")
-
-    # Best-effort maker safeguard: nudge TP price so it does not cross the book.
-    # LONG TP is a SELL LIMIT: keep it above current BUY worst (ask proxy).
-    # SHORT TP is a BUY LIMIT: keep it below current SELL worst (bid proxy).
-    try:
-        rules = _get_symbol_rules(symbol)
-        tick = Decimal(str(rules.get("tick_size") or "0.01"))
-        min_qty = Decimal(str(rules.get("min_qty") or "0.01"))
-        if direction == "LONG":
-            ask = Decimal(get_market_price(symbol, "BUY", str(min_qty)))
-            if tp_price <= ask:
-                tp_price = snap_price_for_order(symbol, exit_side, "LIMIT", ask + tick)
-        else:
-            bid = Decimal(get_market_price(symbol, "SELL", str(min_qty)))
-            if tp_price >= bid:
-                tp_price = snap_price_for_order(symbol, exit_side, "LIMIT", bid - tick)
-    except Exception:
-        pass
 
     bnum = _bot_num(bot_id)
     ts = int(time.time())
@@ -361,15 +356,16 @@ def _place_fixed_brackets(bot_id: str, symbol: str, direction: str, qty: Decimal
         client_id=sl_client,
         expiration_sec=expiration,
     )
-
-    # TP is a resting LIMIT reduceOnly order
-    tp_res = create_limit_order(
+    tp_res = create_trigger_order(
         symbol=symbol,
         side=exit_side,
+        order_type=tp_type,
         size=str(qty),
-        price=str(tp_price),
+        trigger_price=str(tp_trigger),
+        price=str(tp_price) if tp_price is not None else None,
         reduce_only=True,
         client_id=tp_client,
+        expiration_sec=expiration,
     )
 
     sl_oid = sl_res.get("order_id")
@@ -384,13 +380,13 @@ def _place_fixed_brackets(bot_id: str, symbol: str, direction: str, qty: Decimal
         sl_client_id=sl_res.get("client_order_id") or sl_client,
         tp_client_id=tp_res.get("client_order_id") or tp_client,
         sl_price=sl_trigger,
-        tp_price=tp_price,
+        tp_price=tp_trigger,
         is_active=True,
     )
 
     print(
         f"[BRACKET] set bot={bot_id} {direction} {symbol} qty={qty} entry={entry_price} "
-        f"SL({sl_type}) trigger={sl_trigger} oid={sl_oid} | TP(LIMIT) price={tp_price} oid={tp_oid}"
+        f"SL({sl_type}) trigger={sl_trigger} oid={sl_oid} | TP({tp_type}) trigger={tp_trigger} oid={tp_oid}"
     )
 
 
@@ -487,6 +483,11 @@ def _orders_loop():
 
         except Exception as e:
             print("[WS-ORDERS] error:", e)
+
+
+# Backwards-compat alias (some older revisions referenced `orders_loop`).
+def orders_loop():
+    return _orders_loop()
 
 
 def _ensure_ws_orders_thread():
