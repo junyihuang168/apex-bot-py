@@ -113,13 +113,42 @@ def _to_decimal(x: Any, default: Decimal = Decimal("0")) -> Decimal:
         return default
 
 
+#+#+#+#+########################################
+# BOT GROUPS
+#
+# Per your requirement:
+# - Keep bot-side SL/TP ONLY for: BOT_1–5 (LONG) and BOT_11–15 (SHORT)
+# - Remove bot-side SL/TP for: BOT_6–10 and BOT_16–20 (they remain signal-driven only)
+#
+# Note: In this repo, the only bot-side SL/TP implementation is the ladder-stop loop below.
+#+#+#+#+########################################
+
 # ----------------------------
 # ✅ BOT 分组（按你要求）
 # ----------------------------
-LONG_TPSL_BOTS = _parse_bot_list(os.getenv("LONG_TPSL_BOTS", ",".join([f"BOT_{i}" for i in range(1, 11)])))
-SHORT_TPSL_BOTS = _parse_bot_list(os.getenv("SHORT_TPSL_BOTS", ",".join([f"BOT_{i}" for i in range(11, 21)])))
-LONG_PNL_ONLY_BOTS = _parse_bot_list(os.getenv("LONG_PNL_ONLY_BOTS", ",".join([f"BOT_{i}" for i in range(21, 31)])))
-SHORT_PNL_ONLY_BOTS = _parse_bot_list(os.getenv("SHORT_PNL_ONLY_BOTS", ",".join([f"BOT_{i}" for i in range(31, 41)])))
+
+_ALLOWED_LONG_TPSL = {f"BOT_{i}" for i in range(1, 6)}
+_ALLOWED_SHORT_TPSL = {f"BOT_{i}" for i in range(11, 16)}
+
+# “TPSL bots” here means: bots that are allowed to have bot-side SL/TP logic enabled.
+# (In this repo, the only bot-side SL/TP is the ladder stop loop below.)
+LONG_TPSL_BOTS = _parse_bot_list(os.getenv("LONG_TPSL_BOTS", ",".join(sorted(_ALLOWED_LONG_TPSL)))) & _ALLOWED_LONG_TPSL
+SHORT_TPSL_BOTS = _parse_bot_list(os.getenv("SHORT_TPSL_BOTS", ",".join(sorted(_ALLOWED_SHORT_TPSL)))) & _ALLOWED_SHORT_TPSL
+
+# “PNL only” means: no bot-side SL/TP; only record real fills and follow strategy exit signals.
+LONG_PNL_ONLY_BOTS = _parse_bot_list(
+    os.getenv(
+        "LONG_PNL_ONLY_BOTS",
+        ",".join([*(f"BOT_{i}" for i in range(6, 11)), *(f"BOT_{i}" for i in range(21, 31))]),
+    )
+) - _ALLOWED_LONG_TPSL
+
+SHORT_PNL_ONLY_BOTS = _parse_bot_list(
+    os.getenv(
+        "SHORT_PNL_ONLY_BOTS",
+        ",".join([*(f"BOT_{i}" for i in range(16, 21)), *(f"BOT_{i}" for i in range(31, 41))]),
+    )
+) - _ALLOWED_SHORT_TPSL
 
 
 # ----------------------------
@@ -128,8 +157,8 @@ SHORT_PNL_ONLY_BOTS = _parse_bot_list(os.getenv("SHORT_PNL_ONLY_BOTS", ",".join(
 # BOT11-15: SHORT ladder
 # ----------------------------
 
-LADDER_LONG_BOTS  = _parse_bot_list(os.getenv("LADDER_LONG_BOTS",  ",".join([f"BOT_{i}" for i in range(1, 6)])))
-LADDER_SHORT_BOTS = _parse_bot_list(os.getenv("LADDER_SHORT_BOTS", ",".join([f"BOT_{i}" for i in range(11, 16)])))
+LADDER_LONG_BOTS  = _parse_bot_list(os.getenv("LADDER_LONG_BOTS",  ",".join(sorted(_ALLOWED_LONG_TPSL)))) & _ALLOWED_LONG_TPSL
+LADDER_SHORT_BOTS = _parse_bot_list(os.getenv("LADDER_SHORT_BOTS", ",".join(sorted(_ALLOWED_SHORT_TPSL)))) & _ALLOWED_SHORT_TPSL
 
 # Base stop-loss (percent). Example 0.5 -> -0.5% initial lock.
 LADDER_BASE_SL_PCT = Decimal(os.getenv("LADDER_BASE_SL_PCT", "0.5"))
