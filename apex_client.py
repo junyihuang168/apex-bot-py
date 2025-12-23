@@ -1299,6 +1299,7 @@ def create_trigger_order(
     reduce_only: bool = True,
     client_id: Optional[str] = None,
     expiration_sec: Optional[int] = None,
+    trigger_price_type: Optional[str] = None,  # e.g. LAST_PRICE / MARK_PRICE / INDEX_PRICE (SDK dependent)
 ) -> Dict[str, Any]:
     client = get_client()
     side = str(side).upper()
@@ -1338,6 +1339,11 @@ def create_trigger_order(
         "reduceOnly": reduce_only,
         "clientId": apex_client_id,
     }
+    if trigger_price_type:
+        try:
+            params["triggerPriceType"] = str(trigger_price_type).upper()
+        except Exception:
+            params["triggerPriceType"] = str(trigger_price_type)
 
     if expiration_sec is not None:
         params["expiration"] = int(expiration_sec)
