@@ -1,3 +1,4 @@
+import os
 import time
 
 from pnl_store import init_db
@@ -7,6 +8,11 @@ import app as app_module
 
 
 def main():
+    # Fail-safe: if supervisor didn't inject env, default worker to ENABLE_WS=1.
+    os.environ.setdefault("ENABLE_WS", "1")
+    os.environ.setdefault("ENABLE_REST_POLL", "1")
+    os.environ.setdefault("ENABLE_EXCHANGE_PROTECTIVE", "1")
+
     init_db()
 
     try:
