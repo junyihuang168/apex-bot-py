@@ -31,6 +31,8 @@ from pnl_store import (
     get_bot_open_positions,
     get_symbol_open_directions,
     clear_lock_level_pct,
+    get_lock_level_pct,
+    set_lock_level_pct,
     is_signal_processed,
     mark_signal_processed,
     # ✅ protective orders
@@ -38,9 +40,6 @@ from pnl_store import (
     get_protective_orders,
     clear_protective_orders,
     find_protective_owner_by_order_id,
-    get_lock_level_pct,
-    set_lock_level_pct,
-    list_recent_trades,
 )
 
 app = Flask(__name__)
@@ -60,20 +59,10 @@ REMOTE_FALLBACK_SYMBOLS = {
 }
 
 # ✅ 固定止损/止盈（百分比）
-FIXED_SL_PCT = Decimal(os.getenv("FIXED_SL_PCT", "0.5"))  # -0.5% base SL (restore BOT_1-5 / BOT_11-15 ladder)
-FIXED_TP_PCT = Decimal(os.getenv("FIXED_TP_PCT", "2.5"))  # +2.5% fixed TP (restore)
-# ✅ Ladder trailing SL (percent, based on TRUE entry price)
-# - Initial SL: -0.5%
-# - Profit >= 0.125% -> lock SL to +0.10%
-# - Profit >= 0.35%  -> lock SL to +0.15%
-# - Then every +0.20% profit -> lock +0.20% (only raise, never lower)
-LADDER_PROFIT_1_PCT = Decimal(os.getenv("LADDER_PROFIT_1_PCT", "0.125"))
-LADDER_LOCK_1_PCT   = Decimal(os.getenv("LADDER_LOCK_1_PCT",   "0.10"))
-LADDER_BASE_PROFIT_PCT = Decimal(os.getenv("LADDER_BASE_PROFIT_PCT", "0.35"))
-LADDER_BASE_LOCK_PCT   = Decimal(os.getenv("LADDER_BASE_LOCK_PCT",   "0.15"))
-LADDER_STEP_PCT        = Decimal(os.getenv("LADDER_STEP_PCT",        "0.20"))
-TRAIL_POLL_INTERVAL_SEC = float(os.getenv("TRAIL_POLL_INTERVAL_SEC", "1.0"))
-
+# - SL: exchange-hosted STOP_* (reduceOnly)
+# - TP: exchange-hosted LIMIT (reduceOnly), aiming to rest on the book (maker when possible)
+FIXED_SL_PCT = Decimal(os.getenv("FIXED_SL_PCT", "0.3"))  # -0.3%
+FIXED_TP_PCT = Decimal(os.getenv("FIXED_TP_PCT", "0.2"))  # +0.2%
 
 # ✅ 保护单模式：MARKET（默认稳） or LIMIT
 PROTECTIVE_ORDER_MODE = str(os.getenv("PROTECTIVE_ORDER_MODE", "MARKET")).upper().strip()
@@ -135,40 +124,24 @@ def _bot_num(bot_id: str) -> int:
 # ----------------------------
 # ✅ BOT 分组（按你要求）
 # ----------------------------
-# Profile A (Ladder SL + optional fixed TP): BOT_1–5 (LONG), BOT_11–15 (SHORT)
-LADDER_LONG_BOTS  = _parse_bot_list(os.getenv("LADDER_LONG_BOTS",  ",".join([f"BOT_{i}" for i in range(1, 6)])))
-LADDER_SHORT_BOTS = _parse_bot_list(os.getenv("LADDER_SHORT_BOTS", ",".join([f"BOT_{i}" for i in range(11, 16)])))
-
-# Profile B (Fixed maker TP + fixed SL): BOT_6–10 (LONG), BOT_16–20 (SHORT)
-FIXED_LONG_BOTS   = _parse_bot_list(os.getenv("FIXED_LONG_BOTS",   ",".join([f"BOT_{i}" for i in range(6, 11)])))
-FIXED_SHORT_BOTS  = _parse_bot_list(os.getenv("FIXED_SHORT_BOTS",  ",".join([f"BOT_{i}" for i in range(16, 21)])))
-
-# PnL-only bots (no protective orders): default BOT_21–40 (override via env if needed)
-LONG_PNL_ONLY_BOTS  = _parse_bot_list(os.getenv("LONG_PNL_ONLY_BOTS",  ",".join([f"BOT_{i}" for i in range(21, 31)])))
+LONG_TPSL_BOTS = _parse_bot_list(os.getenv("LONG_TPSL_BOTS", ",".join([f"BOT_{i}" for i in range(6, 11)])))
+SHORT_TPSL_BOTS = _parse_bot_list(os.getenv("SHORT_TPSL_BOTS", ",".join([f"BOT_{i}" for i in range(16, 21)])))
+LONG_PNL_ONLY_BOTS = _parse_bot_list(os.getenv("LONG_PNL_ONLY_BOTS", ",".join([f"BOT_{i}" for i in range(21, 31)])))
 SHORT_PNL_ONLY_BOTS = _parse_bot_list(os.getenv("SHORT_PNL_ONLY_BOTS", ",".join([f"BOT_{i}" for i in range(31, 41)])))
-
-def _bot_profile(bot_id: str) -> str:
-    b = _canon_bot_id(bot_id)
-    if b in LADDER_LONG_BOTS or b in LADDER_SHORT_BOTS:
-        return "LADDER"
-    if b in FIXED_LONG_BOTS or b in FIXED_SHORT_BOTS:
-        return "FIXED"
-    return "NONE"
 
 
 def _bot_expected_entry_side(bot_id: str) -> Optional[str]:
     b = _canon_bot_id(bot_id)
-    if b in LADDER_LONG_BOTS or b in FIXED_LONG_BOTS or b in LONG_PNL_ONLY_BOTS:
+    if b in LONG_TPSL_BOTS or b in LONG_PNL_ONLY_BOTS:
         return "BUY"
-    if b in LADDER_SHORT_BOTS or b in FIXED_SHORT_BOTS or b in SHORT_PNL_ONLY_BOTS:
+    if b in SHORT_TPSL_BOTS or b in SHORT_PNL_ONLY_BOTS:
         return "SELL"
     return None
 
 
 def _bot_has_exchange_brackets(bot_id: str) -> bool:
     b = _canon_bot_id(bot_id)
-    return (b in LADDER_LONG_BOTS) or (b in LADDER_SHORT_BOTS) or (b in FIXED_LONG_BOTS) or (b in FIXED_SHORT_BOTS)
-
+    return (b in LONG_TPSL_BOTS) or (b in SHORT_TPSL_BOTS)
 
 
 def _exit_guard_allow(bot_id: str, symbol: str) -> bool:
@@ -309,432 +282,161 @@ def _cancel_existing_brackets(bot_id: str, symbol: str, direction: str):
         pass
 
 
-def _sl_trigger_from_lock(entry_price: Decimal, direction: str, lock_pct: Decimal) -> Decimal:
+def _place_fixed_brackets(bot_id: str, symbol: str, direction: str, qty: Decimal, entry_price: Decimal):
+    """Place exchange-hosted protective orders for selected bots.
+
+    For LONG_TPSL_BOTS / SHORT_TPSL_BOTS only:
+    - SL: STOP_MARKET (or STOP_LIMIT if PROTECTIVE_ORDER_MODE=LIMIT)
+    - TP: LIMIT (reduceOnly), targeting a resting order (maker when possible)
+
+    Orders are tracked in `pnl_store.protective_orders` so WS/REST order monitoring
+    can auto-record exits and perform OCO (cancel the other protective order after flat).
     """
-    lock_pct is percent relative to entry.
-      LONG:  lock +0.10% => trigger = entry * (1 + 0.0010)
-      SHORT: lock +0.10% => trigger = entry * (1 - 0.0010)
-    """
-    ep = Decimal(entry_price)
-    lp = Decimal(lock_pct) / Decimal("100")
-    if str(direction).upper() == "LONG":
-        return ep * (Decimal("1") + lp)
-    return ep * (Decimal("1") - lp)
-
-
-def _tp_trigger_from_entry(entry_price: Decimal, direction: str) -> Decimal:
-    ep = Decimal(entry_price)
-    tp = Decimal(FIXED_TP_PCT) / Decimal("100")
-    if str(direction).upper() == "LONG":
-        return ep * (Decimal("1") + tp)
-    return ep * (Decimal("1") - tp)
-
-
-def _snap_price_tick(symbol: str, price: Decimal) -> Decimal:
-    """
-    Snap a price to the symbol's tick size (ROUND_DOWN).
-    """
-    rules = _get_symbol_rules(symbol)
-    tick = Decimal(str(rules.get("tick_size") or rules.get("tickSize") or "0"))
-    if tick <= 0:
-        return Decimal(price)
-    p = Decimal(price)
-    return (p / tick).to_integral_value(rounding="ROUND_DOWN") * tick
-
-
-def _cancel_existing_protective_orders(bot_id: str, symbol: str, direction: str):
-    po = get_protective_orders(bot_id, symbol, direction) or {}
-    for oid_key in ("sl_order_id", "tp_order_id"):
-        oid = po.get(oid_key)
-        if oid:
-            try:
-                cancel_order(str(oid))
-            except Exception:
-                pass
-    try:
-        clear_protective_orders(bot_id, symbol, direction)
-    except Exception:
-        pass
-
-
-def _profit_pct(entry_price: Decimal, mark_price: Decimal, direction: str) -> Decimal:
-    ep = Decimal(entry_price)
-    mp = Decimal(mark_price)
-    if ep <= 0 or mp <= 0:
-        return Decimal("0")
-    if str(direction).upper() == "LONG":
-        return (mp - ep) / ep * Decimal("100")
-    return (ep - mp) / ep * Decimal("100")
-
-
-def _desired_lock_pct_from_profit(profit_pct: Decimal, current_lock_pct: Decimal) -> Decimal:
-    """
-    Ladder logic (only raise):
-      - Start: -0.5%
-      - profit >= 0.125% => lock to +0.10%
-      - profit >= 0.35%  => lock to +0.15%
-      - then for each +0.20% profit => lock +0.20%
-    """
-    p = Decimal(profit_pct)
-    cur = Decimal(current_lock_pct)
-
-    # base (initial lock is stored as -0.5)
-    desired = cur
-
-    if p >= LADDER_PROFIT_1_PCT:
-        desired = max(desired, LADDER_LOCK_1_PCT)
-
-    if p >= LADDER_BASE_PROFIT_PCT:
-        # base lock
-        desired = max(desired, LADDER_BASE_LOCK_PCT)
-
-        # steps above base
-        extra = p - LADDER_BASE_PROFIT_PCT
-        if extra > 0:
-            n = int((extra / LADDER_STEP_PCT).to_integral_value(rounding="ROUND_FLOOR"))
-            desired = max(desired, LADDER_BASE_LOCK_PCT + (LADDER_STEP_PCT * Decimal(n)))
-
-    return desired
-
-
-def _next_lock_target(current_lock_pct: Decimal) -> tuple[Decimal, Decimal]:
-    """
-    Returns (next_profit_threshold_pct, next_lock_pct) for dashboard display.
-    """
-    cur = Decimal(current_lock_pct)
-    if cur < LADDER_LOCK_1_PCT:
-        return (LADDER_PROFIT_1_PCT, LADDER_LOCK_1_PCT)
-    if cur < LADDER_BASE_LOCK_PCT:
-        return (LADDER_BASE_PROFIT_PCT, LADDER_BASE_LOCK_PCT)
-
-    next_lock = cur + LADDER_STEP_PCT
-    next_profit = next_lock + LADDER_STEP_PCT  # lock = profit - step
-    return (next_profit, next_lock)
-
-
-def _place_fixed_brackets(bot_id: str, symbol: str, direction: str, entry_price: Decimal, qty: Decimal):
-    """Place exchange-side protective orders after we have a real entry price.
-
-    Profiles:
-      - FIXED  (BOT_6–10 LONG, BOT_16–20 SHORT): maker TP +0.2% (LIMIT) + SL -0.3% (STOP_LIMIT)
-      - LADDER (BOT_1–5 LONG, BOT_11–15 SHORT): TP +2.5% (TAKE_PROFIT_MARKET) + SL -0.5% (STOP_MARKET) + ladder trail handled separately
-      - NONE   : no protective orders
-    """
-    b = _canon_bot_id(bot_id)
-    direction = str(direction or "").upper()
-    if direction not in ("LONG", "SHORT"):
-        return
-
-    prof = _bot_profile(b)
-    if prof == "NONE":
-        return
-
-    qty = _to_decimal(qty)
-    entry_price = _to_decimal(entry_price)
-    if qty is None or entry_price is None or qty <= 0 or entry_price <= 0:
-        return
-
-    exit_side = "SELL" if direction == "LONG" else "BUY"
-
-    # Always clear stale records first (in case of restart/crash).
-    try:
-        clear_protective_orders(b, symbol, direction)
-    except Exception:
-        pass
-
-    # ----------------------------
-    # Profile B: FIXED maker TP + fixed SL
-    # ----------------------------
-    if prof == "FIXED":
-        tp_pct = _to_decimal(os.getenv("FIXED_MAKER_TP_PCT", "0.2")) or Decimal("0.2")
-        sl_pct = _to_decimal(os.getenv("FIXED_SL_PCT", "0.3")) or Decimal("0.3")
-        buf_pct = _to_decimal(os.getenv("STOP_LIMIT_BUFFER_PCT", "0.05")) or Decimal("0.05")  # 0.05% price buffer
-
-        # TP LIMIT price
-        if direction == "LONG":
-            tp_px = entry_price * (Decimal("1") + (tp_pct / Decimal("100")))
-        else:
-            tp_px = entry_price * (Decimal("1") - (tp_pct / Decimal("100")))
-        tp_px = snap_price_for_order(symbol, exit_side, "LIMIT", tp_px)
-
-        # SL STOP_LIMIT
-        if direction == "LONG":
-            sl_trigger = entry_price * (Decimal("1") - (sl_pct / Decimal("100")))
-            sl_limit = sl_trigger * (Decimal("1") - (buf_pct / Decimal("100")))  # lower limit for SELL
-        else:
-            sl_trigger = entry_price * (Decimal("1") + (sl_pct / Decimal("100")))
-            sl_limit = sl_trigger * (Decimal("1") + (buf_pct / Decimal("100")))  # higher limit for BUY
-
-        sl_trigger = snap_price_for_order(symbol, exit_side, "STOP_LIMIT", sl_trigger)
-        sl_limit = snap_price_for_order(symbol, exit_side, "STOP_LIMIT", sl_limit)
-
-        tp_order = None
-        sl_order = None
-
-        try:
-            tp_order = create_limit_order(
-                symbol=symbol,
-                side=exit_side,
-                size=str(qty),
-                price=str(tp_px),
-                reduce_only=True,
-                time_in_force=os.getenv("TP_TIME_IN_FORCE") or None,
-            )
-        except Exception as e:
-            print(f"[PROTECT][FIXED] TP limit create failed bot={b} {direction} {symbol}: {e}")
-
-        try:
-            sl_order = create_trigger_order(
-                symbol=symbol,
-                side=exit_side,
-                order_type="STOP_LIMIT",
-                size=str(qty),
-                trigger_price=str(sl_trigger),
-                price=str(sl_limit),
-                reduce_only=True,
-            )
-        except Exception as e:
-            print(f"[PROTECT][FIXED] SL stop-limit create failed bot={b} {direction} {symbol}: {e}")
-
-        tp_oid = (tp_order or {}).get("order_id") or (tp_order or {}).get("id")
-        sl_oid = (sl_order or {}).get("order_id") or (sl_order or {}).get("id")
-
-        set_protective_orders(
-            bot_id=b,
-            symbol=symbol,
-            direction=direction,
-            sl_order_id=str(sl_oid) if sl_oid else None,
-            tp_order_id=str(tp_oid) if tp_oid else None,
-            sl_price=sl_trigger,
-            tp_price=tp_px,
-        )
-
-        print(f"[PROTECT][FIXED] bot={b} {direction} {symbol} qty={qty} entry={entry_price} TP={tp_px} SL_trigger={sl_trigger} SL_limit={sl_limit}")
-        return
-
-    # ----------------------------
-    # Profile A: LADDER base brackets (trail loop will later raise SL)
-    # ----------------------------
-    tp_pct = _to_decimal(os.getenv("FIXED_TP_PCT", "2.5")) or Decimal("2.5")
-    sl_pct = _to_decimal(os.getenv("BASE_SL_PCT", "-0.5")) or Decimal("-0.5")  # negative
-
-    if direction == "LONG":
-        tp_trigger = entry_price * (Decimal("1") + (tp_pct / Decimal("100")))
-        sl_trigger = entry_price * (Decimal("1") + (sl_pct / Decimal("100")))  # e.g. 1 - 0.5%
-    else:
-        tp_trigger = entry_price * (Decimal("1") - (tp_pct / Decimal("100")))
-        sl_trigger = entry_price * (Decimal("1") - (sl_pct / Decimal("100")))  # for SHORT, sl_pct is negative so becomes +0.5%
-
-    tp_trigger = snap_price_for_order(symbol, exit_side, "TAKE_PROFIT_MARKET", tp_trigger)
-    sl_trigger = snap_price_for_order(symbol, exit_side, "STOP_MARKET", sl_trigger)
-
-    tp_order = None
-    sl_order = None
-
-    # Keep default behavior as MARKET triggers for ladder bots (more reliable execution).
-    try:
-        tp_order = create_trigger_order(
-            symbol=symbol,
-            side=exit_side,
-            order_type="TAKE_PROFIT_MARKET",
-            size=str(qty),
-            trigger_price=str(tp_trigger),
-            reduce_only=True,
-        )
-    except Exception as e:
-        print(f"[PROTECT][LADDER] TP create failed bot={b} {direction} {symbol}: {e}")
-
-    try:
-        sl_order = create_trigger_order(
-            symbol=symbol,
-            side=exit_side,
-            order_type="STOP_MARKET",
-            size=str(qty),
-            trigger_price=str(sl_trigger),
-            reduce_only=True,
-        )
-    except Exception as e:
-        print(f"[PROTECT][LADDER] SL create failed bot={b} {direction} {symbol}: {e}")
-
-    tp_oid = (tp_order or {}).get("order_id") or (tp_order or {}).get("id")
-    sl_oid = (sl_order or {}).get("order_id") or (sl_order or {}).get("id")
-
-    set_protective_orders(
-        bot_id=b,
-        symbol=symbol,
-        direction=direction,
-        sl_order_id=str(sl_oid) if sl_oid else None,
-        tp_order_id=str(tp_oid) if tp_oid else None,
-        sl_price=sl_trigger,
-        tp_price=tp_trigger,
-    )
-
-    print(f"[PROTECT][LADDER] bot={b} {direction} {symbol} qty={qty} entry={entry_price} TP_trigger={tp_trigger} SL_trigger={sl_trigger}")
-
-
-def _ensure_trailing_thread():
-    global _TRAIL_THREAD_STARTED
-    with _TRAIL_LOCK:
-        if _TRAIL_THREAD_STARTED:
-            return
-        t = threading.Thread(target=_trail_loop, daemon=True)
-        t.start()
-        _TRAIL_THREAD_STARTED = True
-        print("[TRAIL] thread created")
-
-
-def _recreate_sl_only(bot_id: str, symbol: str, direction: str, qty: Decimal, entry_price: Decimal, lock_pct: Decimal):
     bot_id = _canon_bot_id(bot_id)
     symbol = str(symbol).upper().strip()
-    direction = str(direction).upper().strip()
-    qty = Decimal(qty)
-    entry_price = Decimal(entry_price)
-    lock_pct = Decimal(lock_pct)
+    direction = direction.upper()
 
     if qty <= 0 or entry_price <= 0:
         return
 
+    # 先取消旧的（避免重复挂单）
+    _cancel_existing_brackets(bot_id, symbol, direction)
+
+    sl_trigger, tp_price = _compute_fixed_bracket_prices(direction, entry_price)
+    if sl_trigger <= 0 or tp_price <= 0:
+        return
+
+    expiration = int(time.time()) + int(PROTECTIVE_EXPIRE_SEC)
     exit_side = "SELL" if direction == "LONG" else "BUY"
 
-    sl_trigger = _sl_trigger_from_lock(entry_price, direction, lock_pct)
-
+    # SL order type
     if PROTECTIVE_ORDER_MODE == "LIMIT":
         sl_type = "STOP_LIMIT"
-        if direction == "LONG":
-            sl_price = sl_trigger * (Decimal("1") - (PROTECTIVE_SLIPPAGE_PCT / Decimal("100")))
-        else:
-            sl_price = sl_trigger * (Decimal("1") + (PROTECTIVE_SLIPPAGE_PCT / Decimal("100")))
+        sl_price = _apply_limit_slippage(direction, sl_trigger)
     else:
         sl_type = "STOP_MARKET"
         sl_price = None
 
+    # Snap prices to tick size for clean logs and API safety.
     try:
-        sl_trigger = _snap_price_tick(symbol, sl_trigger)
+        sl_trigger = snap_price_for_order(symbol, exit_side, sl_type, sl_trigger)
         if sl_price is not None:
-            sl_price = _snap_price_tick(symbol, sl_price)
+            sl_price = snap_price_for_order(symbol, exit_side, sl_type, sl_price)
+        # TP is LIMIT (no trigger)
+        tp_price = snap_price_for_order(symbol, exit_side, "LIMIT", tp_price)
+    except Exception as e:
+        print(f"[BRACKET] WARNING snap price failed: {e}")
+
+    # Best-effort maker safeguard: nudge TP price so it does not cross the book.
+    # LONG TP is a SELL LIMIT: keep it above current BUY worst (ask proxy).
+    # SHORT TP is a BUY LIMIT: keep it below current SELL worst (bid proxy).
+    try:
+        rules = _get_symbol_rules(symbol)
+        tick = Decimal(str(rules.get("tick_size") or "0.01"))
+        min_qty = Decimal(str(rules.get("min_qty") or "0.01"))
+        if direction == "LONG":
+            ask = Decimal(get_market_price(symbol, "BUY", str(min_qty)))
+            if tp_price <= ask:
+                tp_price = snap_price_for_order(symbol, exit_side, "LIMIT", ask + tick)
+        else:
+            bid = Decimal(get_market_price(symbol, "SELL", str(min_qty)))
+            if tp_price >= bid:
+                tp_price = snap_price_for_order(symbol, exit_side, "LIMIT", bid - tick)
     except Exception:
         pass
 
-    po = get_protective_orders(bot_id, symbol, direction)
-    old_sl = po.get("sl_order_id") if isinstance(po, dict) else None
-    if old_sl:
-        try:
-            cancel_order(str(old_sl))
-        except Exception:
-            pass
+    bnum = _bot_num(bot_id)
+    ts = int(time.time())
+    sl_client = f"{bnum:03d}{ts}01"
+    tp_client = f"{bnum:03d}{ts}02"
 
-    sl = create_trigger_order(
+    sl_res = create_trigger_order(
         symbol=symbol,
         side=exit_side,
         order_type=sl_type,
-        size=qty,
-        trigger_price=sl_trigger,
-        price=sl_price,
+        size=str(qty),
+        trigger_price=str(sl_trigger),
+        price=str(sl_price) if sl_price is not None else None,
         reduce_only=True,
-        client_id=None,
+        client_id=sl_client,
+        expiration_sec=expiration,
     )
-    sl_oid = str((sl or {}).get("id") or "")
-    sl_cid = str((sl or {}).get("clientId") or (sl or {}).get("clientOrderId") or "")
 
-    try:
-        set_protective_orders(
-            bot_id=bot_id,
-            symbol=symbol,
-            direction=direction,
-            sl_order_id=sl_oid,
-            tp_order_id=str(po.get("tp_order_id") or ""),
-            sl_client_id=sl_cid,
-            tp_client_id=str(po.get("tp_client_id") or ""),
-            sl_price=str(sl_trigger),
-            tp_price=str(po.get("tp_price") or ""),
-        )
-        set_lock_level_pct(bot_id, symbol, direction, str(lock_pct))
-    except Exception:
-        pass
+    # TP is a resting LIMIT reduceOnly order
+    tp_res = create_limit_order(
+        symbol=symbol,
+        side=exit_side,
+        size=str(qty),
+        price=str(tp_price),
+        reduce_only=True,
+        client_id=tp_client,
+    )
 
-    print(f"[TRAIL] raise SL bot={bot_id} {direction} {symbol} lock={lock_pct}% trigger={sl_trigger} oid={sl_oid}")
+    sl_oid = sl_res.get("order_id")
+    tp_oid = tp_res.get("order_id")
+
+    set_protective_orders(
+        bot_id=bot_id,
+        symbol=symbol,
+        direction=direction,
+        sl_order_id=str(sl_oid) if sl_oid else None,
+        tp_order_id=str(tp_oid) if tp_oid else None,
+        sl_client_id=sl_res.get("client_order_id") or sl_client,
+        tp_client_id=tp_res.get("client_order_id") or tp_client,
+        sl_price=sl_trigger,
+        tp_price=tp_price,
+        is_active=True,
+    )
+
+    print(
+        f"[BRACKET] set bot={bot_id} {direction} {symbol} qty={qty} entry={entry_price} "
+        f"SL({sl_type}) trigger={sl_trigger} oid={sl_oid} | TP(LIMIT) price={tp_price} oid={tp_oid}"
+    )
 
 
-def _trail_loop():
-    print("[TRAIL] loop started")
-    while True:
-        try:
-            # Iterate over bots with exchange brackets only
-            bots = sorted(set(list(LADDER_LONG_BOTS) + list(LADDER_SHORT_BOTS)))
-            for bot_id in bots:
-                opens = get_bot_open_positions(bot_id)
-                if not opens:
-                    continue
-                for (symbol, direction), info in opens.items():
-                    try:
-                        qty = Decimal(str(info.get("qty") or "0"))
-                        entry_price = Decimal(str(info.get("weighted_entry") or info.get("entry_price") or "0"))
-                        if qty <= 0 or entry_price <= 0:
-                            continue
-                        # mark price (not used as fill price)
-                        # worstPrice is used only as a conservative mark/exit estimate (NOT as fill price)
-                        rules = _get_symbol_rules(symbol)
-                        min_qty = str(rules.get("min_qty") or "0.01")
-                        exit_side = "SELL" if direction == "LONG" else "BUY"
-                        mp = get_market_price(symbol, exit_side, min_qty)
-                        mp = Decimal(str(mp))
-                        p = _profit_pct(entry_price, mp, direction)
-
-                        cur_lock = Decimal(str(get_lock_level_pct(bot_id, symbol, direction) or (-Decimal(FIXED_SL_PCT))))
-                        desired = _desired_lock_pct_from_profit(p, cur_lock)
-
-                        if desired > cur_lock:
-                            _recreate_sl_only(bot_id, symbol, direction, qty, entry_price, desired)
-
-                    except Exception as e:
-                        print("[TRAIL] per-position error:", e)
-            time.sleep(TRAIL_POLL_INTERVAL_SEC)
-        except Exception as e:
-            print("[TRAIL] loop error:", e)
-            time.sleep(2.0)
-
+# ----------------------------
+# ✅ WS orders -> 自动记账 + OCO（NO fills subscription）
+# ----------------------------
 def _orders_loop():
-    """Background consumer for WS/REST order delta events.
-
-    We subscribe to the private WS order stream (main path) and also run a REST poller (backup path).
-    Whenever we receive an order delta fill, we map it back to (bot_id, symbol, direction, kind)
-    via pnl_store.protective_orders and then record_exit_fifo() using the real delta fill price.
-
-    This avoids using market quote / worstPrice as execution price.
-    """
-    print("[WS-ORDERS] loop started (consume order_delta events)")
+    print("[WS-ORDERS] loop started")
     while True:
-        try:
-            evt = pop_order_event(timeout=1.0)
-            if not evt:
-                continue
+        evt = pop_order_event(timeout=0.5)
+        if not evt:
+            continue
 
+        try:
             if str(evt.get("type") or "") != "order_delta":
                 continue
 
-            order_id = str(evt.get("order_id") or "").strip()
-            if not order_id:
+            order_id = str(evt.get("order_id") or "")
+            symbol = str(evt.get("symbol") or "").upper().strip()
+            status = str(evt.get("status") or "").upper().strip()
+
+            delta_qty = evt.get("delta_qty")
+            delta_px = evt.get("delta_price")
+            cum_qty = evt.get("cum_filled_qty")
+
+            if not order_id or not symbol or delta_qty is None or delta_px is None or cum_qty is None:
                 continue
 
-            delta_qty = _to_decimal(evt.get("delta_qty"))
-            delta_px = _to_decimal(evt.get("delta_price"))
-            if delta_qty is None or delta_px is None:
-                continue
-            if delta_qty <= 0 or delta_px <= 0:
+            dq = Decimal(str(delta_qty))
+            dp = Decimal(str(delta_px))
+            if dq <= 0 or dp <= 0:
                 continue
 
             owner = find_protective_owner_by_order_id(order_id)
             if not owner:
-                # Not a tracked protective order (could be entry/exit market order); ignore
                 continue
 
-            bot_id = str(owner.get("bot_id") or "")
-            symbol = str(owner.get("symbol") or "")
-            direction = str(owner.get("direction") or "").upper()
-            kind = str(owner.get("kind") or "").upper()
+            bot_id = _canon_bot_id(owner["bot_id"])
+            direction = str(owner["direction"]).upper()
+            kind = str(owner.get("kind") or "").upper()  # SL / TP
 
-            if not bot_id or not symbol or direction not in ("LONG", "SHORT"):
+            # Idempotency: per (order_id, cum_qty)
+            sig_id = f"orderfill:{order_id}:{cum_qty}"
+            if is_signal_processed(bot_id, sig_id):
                 continue
+            mark_signal_processed(bot_id, sig_id, kind=f"ws_order_{kind.lower()}_delta")
 
             entry_side = "BUY" if direction == "LONG" else "SELL"
 
@@ -742,44 +444,49 @@ def _orders_loop():
                 bot_id=bot_id,
                 symbol=symbol,
                 entry_side=entry_side,
-                qty=delta_qty,
-                exit_price=delta_px,
-                reason=f"protective_{kind or 'order'}",
+                exit_qty=dq,
+                exit_price=dp,
+                reason=f"exchange_{kind.lower()}_order_delta",
             )
-            print(f"[P&L] exit recorded from protective order bot={bot_id} {direction} {symbol} qty={delta_qty} px={delta_px} kind={kind}")
 
-            # If position is flat after this fill, clean up protective orders + lock levels.
-            try:
-                open_pos = get_bot_open_positions(bot_id)
-                key = f"{symbol}:{direction}"
-                remain = open_pos.get(key, {}).get("qty", Decimal("0"))
-                if isinstance(remain, str):
-                    remain = Decimal(remain)
-                if remain is None:
-                    remain = Decimal("0")
+            opens = get_bot_open_positions(bot_id)
+            remaining = opens.get((symbol, direction), {}).get("qty", Decimal("0"))
 
-                if remain <= 0:
-                    # cancel the other leg (if still live)
-                    other_oid = None
-                    if kind == "SL":
-                        other_oid = owner.get("tp_order_id")
-                    elif kind == "TP":
-                        other_oid = owner.get("sl_order_id")
-                    if other_oid:
-                        try:
-                            cancel_order(str(other_oid))
-                        except Exception:
-                            pass
+            po = get_protective_orders(bot_id, symbol, direction)
+            sl_oid = po.get("sl_order_id") if po else None
+            tp_oid = po.get("tp_order_id") if po else None
 
+            if remaining <= 0:
+                other_oid = tp_oid if kind == "SL" else sl_oid
+                if other_oid:
+                    try:
+                        cancel_order(str(other_oid))
+                    except Exception:
+                        pass
+
+                try:
                     clear_protective_orders(bot_id, symbol, direction)
+                except Exception:
+                    pass
+                try:
                     clear_lock_level_pct(bot_id, symbol, direction)
-                    print(f"[P&L] cleared protective/lock bot={bot_id} {direction} {symbol} (position flat)")
-            except Exception:
-                pass
+                except Exception:
+                    pass
+
+                key_local = (bot_id, symbol)
+                if key_local in BOT_POSITIONS:
+                    BOT_POSITIONS[key_local]["qty"] = Decimal("0")
+                    BOT_POSITIONS[key_local]["entry_price"] = None
+
+                print(f"[WS-ORDERS] position closed by {kind}. bot={bot_id} {direction} {symbol} now flat. OCO done.")
+            else:
+                print(
+                    f"[WS-ORDERS] {kind} delta bot={bot_id} {direction} {symbol} "
+                    f"delta_qty={dq} delta_px={dp} remaining={remaining} status={status}"
+                )
 
         except Exception as e:
-            print("[WS-ORDERS] loop error:", e)
-            time.sleep(0.5)
+            print("[WS-ORDERS] error:", e)
 
 
 def _ensure_ws_orders_thread():
@@ -873,25 +580,6 @@ def api_pnl():
                 unrealized += (px - wentry) * qty
             else:
                 unrealized += (wentry - px) * qty
-            po = {}
-            try:
-                po = get_protective_orders(bot_id, symbol, direction) or {}
-            except Exception:
-                po = {}
-
-            cur_lock = ""
-            next_profit = ""
-            next_lock = ""
-            next_sl = ""
-            try:
-                cur_lock = str(get_lock_level_pct(bot_id, symbol, direction) or "")
-                if cur_lock != "":
-                    np, nl = _next_lock_target(Decimal(cur_lock))
-                    next_profit = str(np)
-                    next_lock = str(nl)
-                    next_sl = str(_sl_trigger_from_lock(wentry, direction, nl))
-            except Exception:
-                pass
 
             open_rows.append({
                 "symbol": str(symbol).upper(),
@@ -899,15 +587,7 @@ def api_pnl():
                 "qty": str(qty),
                 "weighted_entry": str(wentry),
                 "mark_price": str(px),
-                "profit_pct": str(_profit_pct(wentry, px, direction)),
-                "sl_trigger": str(po.get("sl_price") or ""),
-                "tp_trigger": str(po.get("tp_price") or ""),
-                "lock_level_pct": cur_lock,
-                "next_profit_threshold_pct": next_profit,
-                "next_lock_level_pct": next_lock,
-                "next_sl_trigger": next_sl,
             })
-
 
         base.update({
             "unrealized": str(unrealized),
@@ -923,30 +603,6 @@ def api_pnl():
 
     out.sort(key=_rt, reverse=True)
     return jsonify({"ts": int(time.time()), "bots": out}), 200
-
-
-@app.route("/api/trades", methods=["GET"])
-def api_trades():
-    if not _require_token():
-        return jsonify({"error": "forbidden"}), 403
-
-    _ensure_monitor_thread()
-
-    only_bot = request.args.get("bot_id")
-    limit = request.args.get("limit", "200")
-    try:
-        limit_i = int(limit)
-        if limit_i < 1:
-            limit_i = 200
-        limit_i = min(limit_i, 500)
-    except Exception:
-        limit_i = 200
-
-    if only_bot:
-        only_bot = _canon_bot_id(only_bot)
-
-    rows = list_recent_trades(bot_id=only_bot, limit=limit_i)
-    return jsonify({"ts": int(time.time()), "trades": rows}), 200
 
 
 @app.route("/dashboard", methods=["GET"])
@@ -1071,41 +727,10 @@ def dashboard():
       </div>
 
       <div class="card">
-  <div class="row" style="align-items:center; justify-content:space-between">
-    <div>
-      <div class="k">Recent trades (realized)</div>
-      <div class="sub">Shows the latest closes recorded by the bot (strategy exits, TP/SL order deltas).</div>
-    </div>
-    <div class="pill">/api/trades</div>
-  </div>
-  <div class="tableWrap" style="margin-top:12px;">
-    <table style="min-width:860px;">
-      <thead>
-        <tr>
-          <th>time</th>
-          <th>bot</th>
-          <th>symbol</th>
-          <th>dir</th>
-          <th>qty</th>
-          <th>entry</th>
-          <th>exit</th>
-          <th>pnl</th>
-          <th>reason</th>
-        </tr>
-      </thead>
-      <tbody id="tradesBody">
-        <tr><td colspan="9" class="sub">Load will also fetch recent trades.</td></tr>
-      </tbody>
-    </table>
-  </div>
-</div>
-
-<div class="card">
         <details>
           <summary>Quick links</summary>
           <div class="sub" style="margin-top:10px; line-height:1.6">
             API (all): <a href="/api/pnl" target="_blank">/api/pnl</a><br />
-            Trades: <a href="/api/trades" target="_blank">/api/trades</a><br />
             API (single bot): <span class="pill">/api/pnl?bot_id=BOT_1</span><br />
             If token is enabled: add <span class="pill">&amp;token=YOUR_TOKEN</span>
           </div>
@@ -1249,31 +874,22 @@ def dashboard():
         if (opens.length) {
           const tr2 = document.createElement('tr');
           const rows = opens.map(p => {
-  const dir = String(p.direction || '');
-  const profit = p.profit_pct || '';
-  const sl = p.sl_trigger || '';
-  const nextSl = p.next_sl_trigger || '';
-  const nextAt = p.next_profit_threshold_pct || '';
-  return `<tr>
-    <td>${p.symbol || ''}</td>
-    <td>${dir}</td>
-    <td>${p.qty || ''}</td>
-    <td>${p.weighted_entry || ''}</td>
-    <td>${p.mark_price || ''}</td>
-    <td>${profit}</td>
-    <td>${sl}</td>
-    <td>${nextSl}</td>
-    <td>${nextAt}</td>
-  </tr>`;
-}).join('');
-
+            const dir = String(p.direction || '');
+            return `<tr>
+              <td>${p.symbol || ''}</td>
+              <td>${dir}</td>
+              <td>${p.qty || ''}</td>
+              <td>${p.weighted_entry || ''}</td>
+              <td>${p.mark_price || ''}</td>
+            </tr>`;
+          }).join('');
           tr2.innerHTML = `
             <td colspan="7">
               <details>
                 <summary>Open positions for ${b.bot_id} (${opens.length})</summary>
                 <div class="tableWrap" style="margin-top:10px;">
                   <table style="min-width:620px;">
-                    <thead><tr><th>symbol</th><th>dir</th><th>qty</th><th>entry</th><th>mark</th><th>pnl%</th><th>SL</th><th>next SL</th><th>next @pnl%</th></tr></thead>
+                    <thead><tr><th>symbol</th><th>direction</th><th>qty</th><th>weighted_entry</th><th>mark_price</th></tr></thead>
                     <tbody>${rows}</tbody>
                   </table>
                 </div>
@@ -1283,59 +899,9 @@ def dashboard():
           tbody.appendChild(tr2);
         }
       }
-    await fetchTrades();
-}
+    }
 
-async function fetchTrades() {
-  const token = tokenEl.value.trim() || getSavedToken();
-  if (!token) return;
-
-  const bot = (botEl.value || '').trim();
-  let url = '/api/trades?limit=200';
-  if (bot) url += `&bot_id=${encodeURIComponent(bot)}`;
-
-  let res;
-  try {
-    res = await fetch(url, { headers: { 'X-Dashboard-Token': token } });
-  } catch (e) {
-    return;
-  }
-  if (!res.ok) return;
-
-  let data;
-  try { data = await res.json(); } catch (e) { data = null; }
-  const trades = (data && data.trades) ? data.trades : [];
-
-  const tb = el('tradesBody');
-  if (!tb) return;
-  if (!trades.length) {
-    tb.innerHTML = '<tr><td colspan="9" class="sub">No trades yet.</td></tr>';
-    return;
-  }
-
-  tb.innerHTML = '';
-  for (const t of trades) {
-    const tr = document.createElement('tr');
-    const ts = Number(t.ts || 0);
-    const dt = ts ? new Date(ts * 1000).toLocaleString() : '';
-    const pnl = Number(t.realized_pnl || 0);
-    tr.innerHTML = `
-      <td class="sub">${dt}</td>
-      <td>${t.bot_id || ''}</td>
-      <td>${t.symbol || ''}</td>
-      <td>${t.direction || ''}</td>
-      <td>${t.exit_qty || ''}</td>
-      <td>${t.entry_price || ''}</td>
-      <td>${t.exit_price || ''}</td>
-      <td class="${clsPNL(pnl)}">${fmt(pnl)}</td>
-      <td class="sub">${t.reason || ''}</td>
-    `;
-    tb.appendChild(tr);
-  }
-}
-
-function setAutoRefresh(
-) {
+    function setAutoRefresh() {
       if (timer) { clearInterval(timer); timer = null; }
       const sec = Number(refreshEl.value || 0);
       if (sec > 0) timer = setInterval(fetchPnL, sec * 1000);
