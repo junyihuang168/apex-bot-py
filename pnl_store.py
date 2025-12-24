@@ -591,6 +591,12 @@ def find_protective_owner_by_order_id(order_id: str) -> Dict[str, Any]:
     finally:
         conn.close()
 
+
+# Backward-compatible alias (older app.py expects this name)
+def get_protective_owner_by_order_id(order_id: str) -> Dict[str, Any]:
+    return find_protective_owner_by_order_id(order_id)
+
+
 def list_recent_trades(bot_id: Optional[str] = None, limit: int = 200) -> list:
     """
     Recent realized trades (from exits table), newest first.
