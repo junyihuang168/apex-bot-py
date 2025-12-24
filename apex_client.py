@@ -64,6 +64,9 @@ _ORDER_STATE: Dict[str, Dict[str, Any]] = {}
 # A small queue of raw fill events (optional; currently not consumed by app.py)
 _FILL_Q: "queue.Queue[dict]" = queue.Queue(maxsize=20000)
 
+# A small queue of order update events (optional)
+_ORDER_Q: "queue.Queue[dict]" = queue.Queue(maxsize=20000)
+
 
 # REST poller
 _REST_POLL_STARTED = False
@@ -306,6 +309,122 @@ def create_market_order(
         "worst_price": str(worst_price),
     }
 
+
+
+
+
+def create_trigger_order(
+    symbol: str,
+    side: str,
+    order_type: str,
+    size: NumberLike,
+    trigger_price: NumberLike,
+    price: Optional[NumberLike] = None,
+    reduce_only: bool = True,
+    client_id: Optional[str] = None,
+    trigger_price_type: Optional[str] = None,
+    expiration_sec: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Create a conditional (trigger) order (STOP/TP).
+
+    Backward-compatible shim: some app.py versions import this symbol.
+    """
+    client = get_client()
+    sym = str(symbol).upper().strip()
+    side_u = str(side).upper().strip()
+    otype = str(order_type).upper().strip()
+    qty = str(size)
+
+    client_id = client_id or _random_client_id()
+
+    # snap trigger/price to tick-size best-effort
+    try:
+        trigger_str = str(_snap_price(sym, Decimal(str(trigger_price))))
+    except Exception:
+        trigger_str = str(trigger_price)
+
+    if price is None:
+        try:
+            price = get_market_price(sym, side_u, qty)
+        except Exception:
+            price = trigger_str
+
+    try:
+        price_str = str(_snap_price(sym, Decimal(str(price))))
+    except Exception:
+        price_str = str(price)
+
+    params: Dict[str, Any] = {
+        "symbol": sym,
+        "side": side_u,
+        "type": otype,
+        "size": qty,
+        "price": price_str,
+        "triggerPrice": trigger_str,
+        "reduceOnly": bool(reduce_only),
+        "clientOrderId": str(client_id),
+    }
+    if trigger_price_type:
+        params["triggerPriceType"] = str(trigger_price_type).upper()
+    if expiration_sec is not None:
+        params["expiration"] = int(expiration_sec)
+
+    res = _safe_call(getattr(client, "create_order_v3"), **params)
+
+    order_id = None
+    client_order_id = None
+    if isinstance(res, dict):
+        data = res.get("data") if isinstance(res.get("data"), dict) else res
+        order_id = data.get("orderId") or data.get("id")
+        client_order_id = data.get("clientOrderId") or data.get("clientId") or client_id
+    else:
+        try:
+            order_id = getattr(res, "orderId", None)
+        except Exception:
+            order_id = None
+        client_order_id = client_id
+
+    if order_id:
+        register_order_for_tracking(
+            order_id=str(order_id),
+            client_order_id=str(client_order_id),
+            symbol=sym,
+            expected_qty=qty,
+            status="PENDING",
+        )
+
+    return {
+        "raw": res,
+        "order_id": str(order_id) if order_id is not None else None,
+        "client_order_id": str(client_order_id) if client_order_id is not None else str(client_id),
+        "symbol": sym,
+        "side": side_u,
+        "size": qty,
+        "trigger_price": trigger_str,
+        "price": price_str,
+        "type": otype,
+    }
+
+
+def cancel_order(order_id: str) -> Dict[str, Any]:
+    """Cancel an order by orderId (best-effort across SDK versions)."""
+    client = get_client()
+    oid = str(order_id or "").strip()
+    if not oid:
+        return {"ok": False, "error": "missing order_id"}
+
+    for name in ("cancel_order_v3", "cancelOrderV3", "cancel_order", "cancelOrder"):
+        if not hasattr(client, name):
+            continue
+        fn = getattr(client, name)
+        try:
+            return _safe_call(fn, orderId=oid)
+        except Exception:
+            try:
+                return _safe_call(fn, id=oid)
+            except Exception:
+                continue
+    return {"ok": False, "error": "cancel not supported by this SDK build"}
 
 # -----------------------------------------------------------------------------
 # Positions
@@ -643,6 +762,12 @@ def start_private_ws() -> None:
                         st["expected_qty"] = upd.get("expected_qty")
                     _ORDER_STATE[oid] = st
 
+                                        # optional order event queue
+                    try:
+                        _ORDER_Q.put_nowait({"type": "order", **upd})
+                    except Exception:
+                        pass
+
                     # If we have cumQty+avg but no fills, we can backfill agg (lower priority)
                     agg = _FILL_AGG.get(oid)
                     if (agg is None or Decimal(str(agg.get("qty") or "0")) <= 0) and st.get("cum_qty") and st.get("avg_px"):
@@ -684,6 +809,13 @@ def start_private_ws() -> None:
                 backoff = min(backoff * 2.0, 30.0)
 
     threading.Thread(target=_run_forever, daemon=True, name="apex-private-ws").start()
+
+
+def pop_order_event(timeout: float = 0.5) -> Optional[dict]:
+    try:
+        return _ORDER_Q.get(timeout=timeout)
+    except Exception:
+        return None
 
 
 def pop_fill_event(timeout: float = 0.5) -> Optional[dict]:
