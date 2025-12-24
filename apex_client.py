@@ -203,8 +203,25 @@ def _snap_price(symbol: str, price: Decimal) -> Decimal:
 
 
 def get_market_price(symbol: str, side: str, size: NumberLike) -> str:
-    """Return worstPrice quote (string) for MARKET signature."""
+    """Return a numeric worstPrice quote (string) for MARKET signature.
+
+    Some SDK endpoints may return nested dict payloads or non-numeric objects.
+    This helper is strict: it only returns values that can be parsed as Decimal > 0.
+    """
     client = get_client()
+
+    def _as_num_str(v):
+        if v is None:
+            return None
+        s = str(v).strip()
+        if not s:
+            return None
+        try:
+            d = Decimal(s)
+        except Exception:
+            return None
+        return s if d > 0 else None
+
     methods = [
         "get_worst_price",
         "get_worst_price_v3",
@@ -212,6 +229,7 @@ def get_market_price(symbol: str, side: str, size: NumberLike) -> str:
         "getWorstPriceV3",
         "worst_price_v3",
     ]
+
     last_err = None
     for name in methods:
         if not hasattr(client, name):
@@ -219,27 +237,37 @@ def get_market_price(symbol: str, side: str, size: NumberLike) -> str:
         fn = getattr(client, name)
         try:
             res = _safe_call(fn, symbol=str(symbol).upper(), side=str(side).upper(), size=str(size))
+
+            # dict payload
             if isinstance(res, dict):
                 data = res.get("data") if res.get("data") is not None else res
-                for k in ("worstPrice", "price", "worst_price"):
-                    v = data.get(k) if isinstance(data, dict) else None
-                    if v is not None:
-                        return str(v)
-            if res is not None:
-                return str(res)
+                if isinstance(data, dict):
+                    for k in ("worstPrice", "price", "worst_price"):
+                        s = _as_num_str(data.get(k))
+                        if s:
+                            return s
+                # If dict but no numeric in expected keys, keep trying other methods
+                continue
+
+            # raw scalar
+            s = _as_num_str(res)
+            if s:
+                return s
+
         except Exception as e:
             last_err = e
 
-    # Fallback: try mark price from positions; last resort return "0".
+    # Fallback: try mark/oracle/index price from positions; last resort "0".
     try:
         pos = get_open_position_for_symbol(symbol)
-        mp = None
         if isinstance(pos, dict):
             mp = pos.get("markPrice") or pos.get("oraclePrice") or pos.get("indexPrice")
-        if mp is not None:
-            return str(mp)
+            s = _as_num_str(mp)
+            if s:
+                return s
     except Exception:
         pass
+
     if last_err:
         print(f"[apex_client] get_market_price fallback used (last_err={last_err})")
     return "0"
@@ -310,9 +338,6 @@ def create_market_order(
     }
 
 
-
-
-
 def create_trigger_order(
     symbol: str,
     side: str,
@@ -359,322 +384,305 @@ def create_trigger_order(
         "side": side_u,
         "type": otype,
         "size": qty,
-        "price": price_str,
         "triggerPrice": trigger_str,
+        "price": price_str,
         "reduceOnly": bool(reduce_only),
         "clientOrderId": str(client_id),
     }
+
     if trigger_price_type:
-        params["triggerPriceType"] = str(trigger_price_type).upper()
+        params["triggerPriceType"] = str(trigger_price_type)
+
     if expiration_sec is not None:
         params["expiration"] = int(expiration_sec)
 
-    res = _safe_call(getattr(client, "create_order_v3"), **params)
+    # Attempt multiple SDK method names
+    method_names = ["create_trigger_order_v3", "createTriggerOrderV3", "create_conditional_order_v3", "createConditionalOrderV3"]
+    last_err = None
+    for name in method_names:
+        if hasattr(client, name):
+            try:
+                res = _safe_call(getattr(client, name), **params)
+                return {"raw": res, "client_order_id": str(client_id)}
+            except Exception as e:
+                last_err = e
 
-    order_id = None
-    client_order_id = None
-    if isinstance(res, dict):
-        data = res.get("data") if isinstance(res.get("data"), dict) else res
-        order_id = data.get("orderId") or data.get("id")
-        client_order_id = data.get("clientOrderId") or data.get("clientId") or client_id
-    else:
+    # Some SDKs reuse create_order_v3 for trigger orders with "timeInForce"/"triggerPrice"
+    if hasattr(client, "create_order_v3"):
         try:
-            order_id = getattr(res, "orderId", None)
-        except Exception:
-            order_id = None
-        client_order_id = client_id
+            res = _safe_call(getattr(client, "create_order_v3"), **params)
+            return {"raw": res, "client_order_id": str(client_id)}
+        except Exception as e:
+            last_err = e
+
+    raise RuntimeError(f"create_trigger_order failed (last_err={last_err})")
+
+
+def cancel_order(order_id: Optional[str] = None, client_id: Optional[str] = None, symbol: Optional[str] = None) -> Dict[str, Any]:
+    """Cancel by order_id or client_id (best effort)."""
+    client = get_client()
+    sym = str(symbol).upper().strip() if symbol else None
+    last_err = None
 
     if order_id:
-        register_order_for_tracking(
-            order_id=str(order_id),
-            client_order_id=str(client_order_id),
-            symbol=sym,
-            expected_qty=qty,
-            status="PENDING",
-        )
-
-    return {
-        "raw": res,
-        "order_id": str(order_id) if order_id is not None else None,
-        "client_order_id": str(client_order_id) if client_order_id is not None else str(client_id),
-        "symbol": sym,
-        "side": side_u,
-        "size": qty,
-        "trigger_price": trigger_str,
-        "price": price_str,
-        "type": otype,
-    }
-
-
-def cancel_order(order_id: str) -> Dict[str, Any]:
-    """Cancel an order by orderId (best-effort across SDK versions)."""
-    client = get_client()
-    oid = str(order_id or "").strip()
-    if not oid:
-        return {"ok": False, "error": "missing order_id"}
-
-    for name in ("cancel_order_v3", "cancelOrderV3", "cancel_order", "cancelOrder"):
-        if not hasattr(client, name):
-            continue
-        fn = getattr(client, name)
-        try:
-            return _safe_call(fn, orderId=oid)
-        except Exception:
+        # try cancel_order_v3
+        if hasattr(client, "cancel_order_v3"):
             try:
-                return _safe_call(fn, id=oid)
-            except Exception:
-                continue
-    return {"ok": False, "error": "cancel not supported by this SDK build"}
+                res = _safe_call(getattr(client, "cancel_order_v3"), orderId=str(order_id), symbol=sym)
+                return {"raw": res}
+            except Exception as e:
+                last_err = e
+
+    if client_id:
+        if hasattr(client, "cancel_order_by_client_id_v3"):
+            try:
+                res = _safe_call(getattr(client, "cancel_order_by_client_id_v3"), clientOrderId=str(client_id), symbol=sym)
+                return {"raw": res}
+            except Exception as e:
+                last_err = e
+
+    raise RuntimeError(f"cancel_order failed (last_err={last_err})")
+
 
 # -----------------------------------------------------------------------------
 # Positions
 # -----------------------------------------------------------------------------
 
 
-def get_open_position_for_symbol(symbol: str) -> Dict[str, Any]:
+def get_open_position_for_symbol(symbol: str) -> Optional[dict]:
+    """Return a position dict for symbol if exists, else None."""
     client = get_client()
     sym = str(symbol).upper().strip()
 
-    methods = [
-        "get_positions_v3",
-        "get_open_positions_v3",
-        "positions_v3",
-        "open_positions_v3",
-    ]
-    for name in methods:
-        if not hasattr(client, name):
-            continue
-        try:
-            res = _safe_call(getattr(client, name))
-            data = res
-            if isinstance(res, dict):
-                data = res.get("data") if res.get("data") is not None else (res.get("positions") or res.get("list") or res)
-            if isinstance(data, dict) and "positions" in data:
-                data = data["positions"]
+    if hasattr(client, "get_positions_v3"):
+        res = _safe_call(getattr(client, "get_positions_v3"))
+        if isinstance(res, dict):
+            data = res.get("data") if isinstance(res.get("data"), list) else res.get("data", [])
             if isinstance(data, list):
                 for p in data:
-                    if not isinstance(p, dict):
-                        continue
-                    if str(p.get("symbol") or p.get("market") or "").upper().strip() == sym:
-                        return p
-        except Exception:
-            continue
-    return {}
-
-
-# -----------------------------------------------------------------------------
-# WS parsing: orders + fills
-# -----------------------------------------------------------------------------
-
-
-def _walk_collect(root: Any, predicate) -> Iterable[Dict[str, Any]]:
-    out: list[Dict[str, Any]] = []
-    stack = [root]
-    while stack:
-        x = stack.pop()
-        if isinstance(x, dict):
-            if predicate(x):
-                out.append(x)
-            for v in x.values():
-                if isinstance(v, (dict, list)):
-                    stack.append(v)
-        elif isinstance(x, list):
-            for v in x:
-                if isinstance(v, (dict, list)):
-                    stack.append(v)
-    return out
-
-
-def _pick(d: Dict[str, Any], *keys) -> Any:
-    for k in keys:
-        v = d.get(k)
-        if v is not None:
-            return v
+                    if str(p.get("symbol", "")).upper() == sym and Decimal(str(p.get("size", "0"))) != 0:
+                        return dict(p)
+        elif isinstance(res, list):
+            for p in res:
+                if str(getattr(p, "symbol", "")).upper() == sym and Decimal(str(getattr(p, "size", "0"))) != 0:
+                    return p.__dict__
     return None
 
 
-def _to_dec(x: Any) -> Optional[Decimal]:
-    if x is None:
-        return None
-    if isinstance(x, str) and x.strip() == "":
-        return None
-    try:
-        return Decimal(str(x))
-    except Exception:
-        return None
+# -----------------------------------------------------------------------------
+# WS tracking + fill aggregation
+# -----------------------------------------------------------------------------
 
 
-def _parse_fill(x: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    d = x.get("data") if isinstance(x.get("data"), dict) else x
-    if not isinstance(d, dict):
-        return None
-
-    order_id = _pick(d, "orderId", "order_id", "id")
-    if order_id is None:
-        return None
-
-    fill_id = _pick(d, "fillId", "tradeId", "matchFillId", "id")
-    price = _to_dec(_pick(d, "fillPrice", "matchFillPrice", "price", "tradePrice"))
-    size = _to_dec(_pick(d, "fillSize", "matchFillSize", "size", "qty", "filledSize"))
-    if price is None or size is None or price <= 0 or size <= 0:
-        return None
-
-    symbol = _pick(d, "symbol", "market")
-    client_oid = _pick(d, "clientOrderId", "clientId", "client_id")
-    fee = _to_dec(_pick(d, "fee", "commission", "tradeFee"))
-    ts = _pick(d, "ts", "timestamp", "createdAt", "time")
-    try:
-        ts_f = float(ts) if ts is not None else time.time()
-        # Some APIs use ms
-        if ts_f > 10_000_000_000:
-            ts_f = ts_f / 1000.0
-    except Exception:
-        ts_f = time.time()
-
-    return {
-        "order_id": str(order_id),
-        "fill_id": str(fill_id) if fill_id is not None else f"{order_id}:{price}:{size}:{ts_f}",
-        "symbol": str(symbol).upper().strip() if symbol is not None else None,
-        "client_order_id": str(client_oid) if client_oid is not None else None,
-        "price": price,
-        "qty": size,
-        "fee": fee,
-        "ts": ts_f,
-        "raw": d,
+def register_order_for_tracking(order_id: str, client_order_id: str, symbol: str, expected_qty: str) -> None:
+    _ORDER_STATE[str(order_id)] = {
+        "orderId": str(order_id),
+        "clientOrderId": str(client_order_id),
+        "symbol": str(symbol).upper(),
+        "expectedQty": str(expected_qty),
+        "status": "NEW",
+        "cumQty": "0",
+        "avgPrice": None,
+        "updatedAt": time.time(),
     }
 
 
-def _parse_order_update(x: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    d = x.get("data") if isinstance(x.get("data"), dict) else x
-    if not isinstance(d, dict):
-        return None
-    order_id = _pick(d, "orderId", "id")
-    if order_id is None:
-        return None
-
-    symbol = _pick(d, "symbol", "market")
-    client_oid = _pick(d, "clientOrderId", "clientId")
-    status = str(_pick(d, "status", "orderStatus", "state") or "").upper().strip()
-    cum_qty = _to_dec(_pick(
-        d,
-        "cumFilledSize", "filledSize", "sizeFilled", "executedQty",
-        "cumSuccessFillSize", "cumMatchFillSize",
-    ))
-    avg_px = _to_dec(_pick(d, "avgPrice", "averagePrice", "fillAvgPrice", "avgFillPrice"))
-    cum_val = _to_dec(_pick(d, "cumSuccessFillValue", "cumMatchFillValue", "cumFilledValue", "filledValue"))
-
-    return {
-        "order_id": str(order_id),
-        "symbol": str(symbol).upper().strip() if symbol is not None else None,
-        "client_order_id": str(client_oid) if client_oid is not None else None,
-        "status": status,
-        "cum_qty": cum_qty,
-        "avg_px": avg_px,
-        "cum_val": cum_val,
-        "raw": d,
-        "ts": time.time(),
-    }
+def _dedupe_key(order_id: str, fill_id: Optional[str]) -> str:
+    return f"{order_id}:{fill_id or ''}"
 
 
-def _dedupe_key(order_id: str, fill_id: str) -> str:
-    return f"{order_id}:{fill_id}"
-
-
-def _dedupe_add(key: str, ts: float) -> bool:
-    """Return True if new; False if duplicate."""
-    ttl = float(os.getenv("FILL_DEDUPE_TTL_SEC", "3600"))
-    max_items = int(os.getenv("FILL_DEDUPE_MAX", "50000"))
-
-    # prune old
+def _dedupe_put(key: str, ttl_sec: int = 3600, max_size: int = 20000) -> bool:
+    """Return True if new, False if already seen."""
+    now = time.time()
+    # purge expired
     while _FILL_DEDUPE:
-        k0, t0 = next(iter(_FILL_DEDUPE.items()))
-        if ts - t0 <= ttl and len(_FILL_DEDUPE) <= max_items:
+        k, ts = next(iter(_FILL_DEDUPE.items()))
+        if now - ts > ttl_sec:
+            _FILL_DEDUPE.popitem(last=False)
+        else:
             break
-        _FILL_DEDUPE.popitem(last=False)
 
     if key in _FILL_DEDUPE:
+        _FILL_DEDUPE.move_to_end(key)
         return False
-    _FILL_DEDUPE[key] = ts
+
+    _FILL_DEDUPE[key] = now
+    _FILL_DEDUPE.move_to_end(key)
+
+    if len(_FILL_DEDUPE) > max_size:
+        _FILL_DEDUPE.popitem(last=False)
     return True
 
 
-def _apply_fill(fill: Dict[str, Any]) -> None:
-    oid = fill["order_id"]
-    qty = Decimal(str(fill["qty"]))
-    px = Decimal(str(fill["price"]))
-    notional = qty * px
-    now = float(fill.get("ts") or time.time())
+def _agg_add_fill(order_id: str, price: Decimal, size: Decimal, fee: Optional[Decimal] = None) -> None:
+    oid = str(order_id)
+    a = _FILL_AGG.get(oid)
+    if a is None:
+        a = {"qty": Decimal("0"), "notional": Decimal("0"), "fee": Decimal("0")}
+        _FILL_AGG[oid] = a
+    a["qty"] += size
+    a["notional"] += price * size
+    if fee is not None:
+        a["fee"] += fee
 
-    agg = _FILL_AGG.get(oid)
-    if agg is None:
-        agg = {
-            "order_id": oid,
-            "symbol": fill.get("symbol"),
-            "client_order_id": fill.get("client_order_id"),
-            "qty": Decimal("0"),
-            "notional": Decimal("0"),
-            "fee": Decimal("0"),
-            "ts": now,
-            "source": "ws_fills",
-        }
-        _FILL_AGG[oid] = agg
 
-    agg["qty"] = Decimal(str(agg["qty"])) + qty
-    agg["notional"] = Decimal(str(agg["notional"])) + notional
-    if fill.get("fee") is not None:
+def _agg_get_avg(order_id: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    a = _FILL_AGG.get(str(order_id))
+    if not a:
+        return None, None, None
+    qty = a["qty"]
+    if qty <= 0:
+        return None, "0", str(a.get("fee", "0"))
+    avg = (a["notional"] / qty).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+    return str(avg), str(qty), str(a.get("fee", "0"))
+
+
+def pop_fill_event(timeout: float = 0.0) -> Optional[dict]:
+    try:
+        return _FILL_Q.get(timeout=timeout)
+    except Exception:
+        return None
+
+
+def pop_order_event(timeout: float = 0.0) -> Optional[dict]:
+    try:
+        return _ORDER_Q.get(timeout=timeout)
+    except Exception:
+        return None
+
+
+def _extract_iterable(obj: Any) -> Iterable[dict]:
+    """Normalize payload content into iterable of dicts."""
+    if obj is None:
+        return []
+    if isinstance(obj, dict):
+        return [obj]
+    if isinstance(obj, list):
+        return [x for x in obj if isinstance(x, dict)]
+    return []
+
+
+def _handle_ws_message(msg: Any) -> None:
+    """Parse WS msg and update caches (orders + fills)."""
+    if msg is None:
+        return
+    # apexomni may deliver dict already or raw json string
+    if isinstance(msg, str):
         try:
-            agg["fee"] = Decimal(str(agg["fee"])) + Decimal(str(fill["fee"]))
+            import json
+            msg = json.loads(msg)
+        except Exception:
+            return
+    if not isinstance(msg, dict):
+        return
+
+    contents = msg.get("contents") or msg.get("data") or msg
+
+    # Known shapes:
+    #  - contents: { "orders": [...], "fills": [...] }
+    #  - contents: { "orders": {...}, "fills": {...} }
+    #  - contents: [ ... ] (rare)
+    if isinstance(contents, list):
+        # try to detect type by keys per item
+        for it in contents:
+            if not isinstance(it, dict):
+                continue
+            _handle_ws_message({"contents": it})
+        return
+
+    if not isinstance(contents, dict):
+        return
+
+    # Orders
+    for key in ("orders", "order", "orderUpdates", "order_update"):
+        if key in contents:
+            for o in _extract_iterable(contents.get(key)):
+                _handle_order_update(o)
+
+    # Fills / Trades
+    for key in ("fills", "fill", "trades", "trade", "fillUpdates", "tradeUpdates"):
+        if key in contents:
+            for f in _extract_iterable(contents.get(key)):
+                _handle_fill_update(f)
+
+
+def _handle_order_update(o: dict) -> None:
+    try:
+        oid = str(o.get("orderId") or o.get("id") or "").strip()
+        if not oid:
+            return
+        st = str(o.get("status") or o.get("state") or "").upper()
+        cum = o.get("cumQty") or o.get("cum_size") or o.get("filledSize") or o.get("filledQty") or "0"
+        avg = o.get("avgPrice") or o.get("averagePrice") or o.get("avg_fill_price") or o.get("priceAvg")
+
+        rec = _ORDER_STATE.get(oid) or {"orderId": oid}
+        rec.update(
+            {
+                "status": st or rec.get("status"),
+                "cumQty": str(cum),
+                "avgPrice": str(avg) if avg is not None else rec.get("avgPrice"),
+                "symbol": str(o.get("symbol") or rec.get("symbol") or "").upper(),
+                "clientOrderId": str(o.get("clientOrderId") or o.get("clientId") or rec.get("clientOrderId") or ""),
+                "updatedAt": time.time(),
+                "raw": o,
+            }
+        )
+        _ORDER_STATE[oid] = rec
+        try:
+            _ORDER_Q.put_nowait(o)
         except Exception:
             pass
-    agg["ts"] = now
-    if fill.get("symbol"):
-        agg["symbol"] = fill.get("symbol")
-    if fill.get("client_order_id"):
-        agg["client_order_id"] = fill.get("client_order_id")
-
-    # optional event queue
-    try:
-        _FILL_Q.put_nowait({"type": "fill", **fill})
     except Exception:
-        pass
-
-
-def register_order_for_tracking(
-    order_id: str,
-    client_order_id: Optional[str] = None,
-    symbol: Optional[str] = None,
-    expected_qty: Optional[str] = None,
-    status: str = "PENDING",
-) -> None:
-    if not order_id:
         return
-    st = _ORDER_STATE.get(str(order_id))
-    if st is None:
-        st = {
-            "order_id": str(order_id),
-            "client_order_id": client_order_id,
-            "symbol": str(symbol).upper().strip() if symbol else None,
-            "status": str(status).upper().strip(),
-            "cum_qty": Decimal("0"),
-            "avg_px": None,
-            "expected_qty": _to_dec(expected_qty) if expected_qty is not None else None,
-            "ts": time.time(),
-        }
-        _ORDER_STATE[str(order_id)] = st
-    else:
-        if client_order_id:
-            st["client_order_id"] = client_order_id
-        if symbol:
-            st["symbol"] = str(symbol).upper().strip()
-        if status:
-            st["status"] = str(status).upper().strip()
-        if expected_qty is not None:
-            st["expected_qty"] = _to_dec(expected_qty)
-        st["ts"] = time.time()
+
+
+def _handle_fill_update(f: dict) -> None:
+    try:
+        oid = str(f.get("orderId") or f.get("id") or "").strip()
+        if not oid:
+            # sometimes trade payload uses "order" nested
+            od = f.get("order") if isinstance(f.get("order"), dict) else None
+            if od:
+                oid = str(od.get("orderId") or od.get("id") or "").strip()
+        if not oid:
+            return
+
+        fill_id = str(f.get("fillId") or f.get("tradeId") or f.get("id") or "").strip() or None
+        key = _dedupe_key(oid, fill_id)
+        if not _dedupe_put(key):
+            return
+
+        px = f.get("price") or f.get("fillPrice") or f.get("tradePrice") or f.get("avgPrice")
+        sz = f.get("size") or f.get("fillSize") or f.get("qty") or f.get("tradeSize") or f.get("filledSize")
+
+        try:
+            px_d = Decimal(str(px))
+            sz_d = Decimal(str(sz))
+        except Exception:
+            return
+        if px_d <= 0 or sz_d <= 0:
+            return
+
+        fee = f.get("fee") or f.get("commission") or f.get("tradingFee")
+        fee_d = None
+        if fee is not None:
+            try:
+                fee_d = Decimal(str(fee))
+            except Exception:
+                fee_d = None
+
+        _agg_add_fill(order_id=oid, price=px_d, size=sz_d, fee=fee_d)
+
+        try:
+            _FILL_Q.put_nowait({"orderId": oid, "fillId": fill_id, "price": str(px_d), "size": str(sz_d), "fee": str(fee_d) if fee_d is not None else None, "raw": f})
+        except Exception:
+            pass
+    except Exception:
+        return
 
 
 def start_private_ws() -> None:
-    """Idempotent. Subscribe to private stream and parse BOTH orders and fills."""
+    """Start private WS (orders + fills) in background thread (idempotent)."""
     global _WS_STARTED
     with _WS_LOCK:
         if _WS_STARTED:
@@ -682,418 +690,282 @@ def start_private_ws() -> None:
         _WS_STARTED = True
 
     if WebSocket is None:
-        print("[apex_client][WS] apexomni websocket_api unavailable; WS disabled")
+        print("[apex_client][WS] WebSocket class not available; skipping WS.")
         return
 
     endpoint = _get_ws_endpoint()
     if not endpoint:
-        print("[apex_client][WS] WS endpoint unavailable; WS disabled")
+        print("[apex_client][WS] WS endpoint missing; skipping WS.")
         return
 
-    api_creds = _get_api_credentials()
+    api = _get_api_credentials()
+    ws = WebSocket(endpoint)
 
-    def handle_account(message: Dict[str, Any]):
-        try:
-            if not isinstance(message, dict):
-                return
-            contents = message.get("contents")
-            if not isinstance(contents, dict):
-                return
-
-            # ----- fills -----
-            def is_fill(d: Dict[str, Any]) -> bool:
-                # heuristics: must have orderId + (price) + (size)
-                if not any(k in d for k in ("orderId", "order_id")):
-                    return False
-                if not any(k in d for k in ("fillPrice", "matchFillPrice", "price", "tradePrice")):
-                    return False
-                if not any(k in d for k in ("fillSize", "matchFillSize", "size", "qty", "filledSize")):
-                    return False
-                return True
-
-            fill_candidates = []
-            for k in ("fills", "trades", "matchFills", "fillsV3", "trade", "fill"):
-                if k in contents:
-                    fill_candidates.append(contents.get(k))
-            if not fill_candidates:
-                fill_candidates = [contents]
-
-            for root in fill_candidates:
-                for raw in _walk_collect(root, is_fill):
-                    fill = _parse_fill(raw)
-                    if not fill:
-                        continue
-                    key = _dedupe_key(fill["order_id"], fill["fill_id"])
-                    if not _dedupe_add(key, float(fill["ts"])):
-                        continue
-                    _apply_fill(fill)
-
-            # ----- orders -----
-            def is_order(d: Dict[str, Any]) -> bool:
-                return any(k in d for k in ("orderId", "clientOrderId", "status", "cumFilledSize", "avgPrice"))
-
-            order_candidates = []
-            for k in ("orders", "order", "orderUpdates", "ordersV3"):
-                if k in contents:
-                    order_candidates.append(contents.get(k))
-            if not order_candidates:
-                order_candidates = [contents]
-
-            for root in order_candidates:
-                for raw in _walk_collect(root, is_order):
-                    upd = _parse_order_update(raw)
-                    if not upd:
-                        continue
-                    oid = upd["order_id"]
-                    st = _ORDER_STATE.get(oid) or {"order_id": oid}
-                    st.update({
-                        "client_order_id": upd.get("client_order_id") or st.get("client_order_id"),
-                        "symbol": upd.get("symbol") or st.get("symbol"),
-                        "status": upd.get("status") or st.get("status"),
-                        "ts": time.time(),
-                    })
-
-                    # cumulative fields (best effort)
-                    if upd.get("cum_qty") is not None:
-                        st["cum_qty"] = Decimal(str(upd["cum_qty"]))
-                    if upd.get("avg_px") is not None:
-                        st["avg_px"] = Decimal(str(upd["avg_px"]))
-                    if upd.get("expected_qty") is not None:
-                        st["expected_qty"] = upd.get("expected_qty")
-                    _ORDER_STATE[oid] = st
-
-                                        # optional order event queue
+    def _worker():
+        while True:
+            try:
+                # login
+                try:
+                    _safe_call(getattr(ws, "login"), api_key=api["key"], secret=api["secret"], passphrase=api["passphrase"])
+                except Exception:
                     try:
-                        _ORDER_Q.put_nowait({"type": "order", **upd})
+                        _safe_call(getattr(ws, "login"), **api)
                     except Exception:
                         pass
 
-                    # If we have cumQty+avg but no fills, we can backfill agg (lower priority)
-                    agg = _FILL_AGG.get(oid)
-                    if (agg is None or Decimal(str(agg.get("qty") or "0")) <= 0) and st.get("cum_qty") and st.get("avg_px"):
-                        cum_qty = Decimal(str(st.get("cum_qty") or "0"))
-                        avg_px = Decimal(str(st.get("avg_px") or "0"))
-                        if cum_qty > 0 and avg_px > 0:
-                            _FILL_AGG[oid] = {
-                                "order_id": oid,
-                                "symbol": st.get("symbol"),
-                                "client_order_id": st.get("client_order_id"),
-                                "qty": cum_qty,
-                                "notional": cum_qty * avg_px,
-                                "fee": Decimal("0"),
-                                "ts": time.time(),
-                                "source": "ws_orders",
-                            }
+                # subscribe private streams
+                # We try multiple subscribe APIs across versions.
+                subscribed = False
+                candidates = [
+                    ("account_info_stream_v3", {"channel": "account_info_stream_v3"}),
+                    ("subscribe", {"channel": "account_info_stream_v3"}),
+                    ("subscribe_private", {"channel": "account_info_stream_v3"}),
+                    ("subscribe_account_info_stream_v3", {}),
+                ]
+                for method, kwargs in candidates:
+                    if hasattr(ws, method):
+                        try:
+                            _safe_call(getattr(ws, method), **kwargs)
+                            subscribed = True
+                            break
+                        except Exception:
+                            continue
 
-        except Exception as e:
-            print("[apex_client][WS] handle_account error:", e)
+                if subscribed:
+                    print("[apex_client][WS] subscribed: account_info_stream_v3 (orders+fills)")
+                else:
+                    print("[apex_client][WS] subscribe failed; WS may not deliver orders/fills.")
 
-    def _run_forever():
-        backoff = 1.0
-        while True:
-            try:
-                ws = WebSocket(endpoint=endpoint, api_key_credentials=api_creds)
-                ws.account_info_stream_v3(handle_account)
-                print("[apex_client][WS] subscribed: account_info_stream_v3 (orders+fills)")
-                backoff = 1.0
+                # message loop
                 while True:
                     try:
-                        if hasattr(ws, "ping"):
-                            ws.ping()
+                        # Different versions: ws.recv() / ws.receive() / ws.listen(callback)
+                        if hasattr(ws, "recv"):
+                            msg = ws.recv()
+                            _handle_ws_message(msg)
+                        elif hasattr(ws, "receive"):
+                            msg = ws.receive()
+                            _handle_ws_message(msg)
+                        elif hasattr(ws, "listen"):
+                            def _cb(m):
+                                _handle_ws_message(m)
+                            ws.listen(_cb)
+                        else:
+                            time.sleep(1.0)
                     except Exception:
-                        raise
-                    time.sleep(15)
+                        # connection dropped -> break to reconnect
+                        break
+
             except Exception as e:
-                print(f"[apex_client][WS] reconnect: {e} (sleep {backoff}s)")
-                time.sleep(backoff)
-                backoff = min(backoff * 2.0, 30.0)
+                print(f"[apex_client][WS] loop error: {e}")
 
-    threading.Thread(target=_run_forever, daemon=True, name="apex-private-ws").start()
+            # backoff reconnect
+            time.sleep(1.0)
 
-
-def pop_order_event(timeout: float = 0.5) -> Optional[dict]:
-    try:
-        return _ORDER_Q.get(timeout=timeout)
-    except Exception:
-        return None
-
-
-def pop_fill_event(timeout: float = 0.5) -> Optional[dict]:
-    try:
-        return _FILL_Q.get(timeout=timeout)
-    except Exception:
-        return None
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
 
 
 # -----------------------------------------------------------------------------
-# REST fallback: orders + fills/trades
+# Fill summary API for app.py / pnl_store integration
 # -----------------------------------------------------------------------------
 
+def get_fill_summary(order_id: Optional[str] = None, client_order_id: Optional[str] = None, timeout_sec: float = 3.0) -> Dict[str, Any]:
+    """Return best-effort fill summary for an order.
 
-def _rest_fetch_order(order_id: str) -> Optional[Dict[str, Any]]:
-    client = get_client()
-    if not order_id:
-        return None
-    for name in ("get_order_v3", "get_order_detail_v3", "get_order_by_id_v3", "getOrderV3", "getOrderDetailV3"):
-        if not hasattr(client, name):
-            continue
-        fn = getattr(client, name)
-        try:
-            res = _safe_call(fn, orderId=str(order_id))
-            return res if isinstance(res, dict) else {"data": res}
-        except Exception:
-            try:
-                res = _safe_call(fn, id=str(order_id))
-                return res if isinstance(res, dict) else {"data": res}
-            except Exception:
-                continue
-    return None
+    Priority:
+      1) WS fills aggregation (true execution)
+      2) WS order state avg/cum (if present)
+      3) REST fallback (fills/trades by orderId or order detail)
+    """
+    t0 = time.time()
+    oid = str(order_id) if order_id else None
+
+    # 1) If orderId provided, try agg immediately
+    if oid:
+        avg, qty, fee = _agg_get_avg(oid)
+        if avg and qty:
+            return {"source": "ws_fills", "order_id": oid, "avg_price": avg, "filled_qty": qty, "fee": fee}
+
+    # If we only have client_order_id, map to oid by scanning state
+    if not oid and client_order_id:
+        cid = str(client_order_id)
+        for k, v in _ORDER_STATE.items():
+            if str(v.get("clientOrderId") or "") == cid:
+                oid = str(k)
+                break
+
+    # 2) Wait briefly for WS fills to arrive
+    while time.time() - t0 < timeout_sec:
+        if oid:
+            avg, qty, fee = _agg_get_avg(oid)
+            if avg and qty:
+                return {"source": "ws_fills", "order_id": oid, "avg_price": avg, "filled_qty": qty, "fee": fee}
+
+        # Check order state avg/cum
+        if oid and oid in _ORDER_STATE:
+            st = _ORDER_STATE[oid]
+            avgp = st.get("avgPrice")
+            cum = st.get("cumQty")
+            if avgp not in (None, "", "None") and cum not in (None, "", "None"):
+                try:
+                    if Decimal(str(cum)) > 0 and Decimal(str(avgp)) > 0:
+                        return {"source": "ws_orders", "order_id": oid, "avg_price": str(avgp), "filled_qty": str(cum), "fee": None}
+                except Exception:
+                    pass
+
+        time.sleep(0.05)
+
+    # 3) REST fallback (best-effort)
+    if oid:
+        rest = _rest_fill_summary(oid)
+        if rest:
+            return rest
+
+    return {"source": "none", "order_id": oid, "avg_price": None, "filled_qty": None, "fee": None}
 
 
-def _rest_fetch_fills_by_order(order_id: str, symbol: Optional[str] = None) -> Optional[list]:
-    """Best-effort REST fills/trades lookup by orderId across SDK versions."""
+def _rest_fill_summary(order_id: str) -> Optional[Dict[str, Any]]:
+    """REST gap-fill. Tries to locate fills/trades or at least order detail."""
     client = get_client()
     oid = str(order_id)
 
-    method_names = [
+    # Try likely fills endpoints (SDK naming differs)
+    fill_methods = [
         "get_fills_v3",
-        "fills_v3",
-        "get_user_fills_v3",
+        "fillsV3",
         "get_trades_v3",
-        "get_user_trades_v3",
-        "trade_history_v3",
-        "get_trade_history_v3",
-        "get_fill_history_v3",
-        "fill_history_v3",
+        "tradesV3",
+        "get_order_fills_v3",
+        "getOrderFillsV3",
     ]
 
-    for name in method_names:
-        if not hasattr(client, name):
-            continue
-        fn = getattr(client, name)
-        try:
-            res = _safe_call(fn, orderId=oid, symbol=(symbol or None))
-        except Exception:
-            try:
-                res = _safe_call(fn, order_id=oid, symbol=(symbol or None))
-            except Exception:
-                continue
-
+    def _as_list(res: Any) -> list:
         if res is None:
-            continue
-
-        data = res
+            return []
         if isinstance(res, dict):
-            data = res.get("data") if res.get("data") is not None else (res.get("list") or res.get("fills") or res.get("trades") or res)
-        if isinstance(data, dict) and "list" in data:
-            data = data["list"]
-        if isinstance(data, list):
-            return data
+            data = res.get("data")
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict):
+                # sometimes {data:{list:[...]}}
+                for k in ("list", "items", "fills", "trades"):
+                    v = data.get(k)
+                    if isinstance(v, list):
+                        return v
+            return []
+        if isinstance(res, list):
+            return res
+        return []
+
+    for name in fill_methods:
+        if hasattr(client, name):
+            try:
+                res = _safe_call(getattr(client, name), orderId=oid)
+                items = _as_list(res)
+                if items:
+                    # weighted avg
+                    qty = Decimal("0")
+                    notional = Decimal("0")
+                    fee = Decimal("0")
+                    for it in items:
+                        if not isinstance(it, dict):
+                            continue
+                        px = it.get("price") or it.get("fillPrice") or it.get("tradePrice")
+                        sz = it.get("size") or it.get("fillSize") or it.get("qty") or it.get("tradeSize")
+                        try:
+                            px_d = Decimal(str(px))
+                            sz_d = Decimal(str(sz))
+                        except Exception:
+                            continue
+                        if px_d <= 0 or sz_d <= 0:
+                            continue
+                        qty += sz_d
+                        notional += px_d * sz_d
+                        try:
+                            fee += Decimal(str(it.get("fee") or it.get("commission") or "0"))
+                        except Exception:
+                            pass
+                    if qty > 0:
+                        avg = (notional / qty).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+                        return {"source": "rest_fills", "order_id": oid, "avg_price": str(avg), "filled_qty": str(qty), "fee": str(fee)}
+            except Exception:
+                pass
+
+    # Fall back to order detail if fills not available
+    order_methods = ["get_order_v3", "getOrderV3", "get_order_detail_v3", "getOrderDetailV3"]
+    for name in order_methods:
+        if hasattr(client, name):
+            try:
+                res = _safe_call(getattr(client, name), orderId=oid)
+                if isinstance(res, dict):
+                    data = res.get("data") if isinstance(res.get("data"), dict) else res
+                    avg = data.get("avgPrice") or data.get("averagePrice")
+                    cum = data.get("cumQty") or data.get("filledQty") or data.get("filledSize")
+                    if avg is not None and cum is not None:
+                        try:
+                            if Decimal(str(avg)) > 0 and Decimal(str(cum)) > 0:
+                                return {"source": "rest_order", "order_id": oid, "avg_price": str(avg), "filled_qty": str(cum), "fee": None}
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
     return None
 
 
+# -----------------------------------------------------------------------------
+# REST order poller (backup path)
+# -----------------------------------------------------------------------------
+
 def start_order_rest_poller(poll_interval: float = 5.0) -> None:
-    """Background REST reconciliation to fill WS gaps (orders+fills)."""
+    """Start a lightweight REST poller to refresh order status and gap-fill WS."""
     global _REST_POLL_STARTED
     with _REST_POLL_LOCK:
         if _REST_POLL_STARTED:
             return
         _REST_POLL_STARTED = True
 
-    def _loop():
-        gap_sec = float(os.getenv("REST_GAP_SEC", "3"))
+    def _poll():
         while True:
             try:
-                now = time.time()
-                # only poll recently-touched orders
-                order_ids = list(_ORDER_STATE.keys())
-                for oid in order_ids:
-                    st = _ORDER_STATE.get(oid) or {}
-                    if now - float(st.get("ts") or 0) < gap_sec:
+                client = get_client()
+                # Iterate tracked orders and refresh detail
+                for oid, st in list(_ORDER_STATE.items()):
+                    # only poll recent/in-flight orders
+                    age = time.time() - float(st.get("updatedAt") or 0)
+                    if age > 3600:
                         continue
+                    try:
+                        if hasattr(client, "get_order_v3"):
+                            res = _safe_call(getattr(client, "get_order_v3"), orderId=str(oid))
+                        else:
+                            res = None
+                        if isinstance(res, dict):
+                            data = res.get("data") if isinstance(res.get("data"), dict) else res
+                            _handle_order_update(data if isinstance(data, dict) else {})
+                    except Exception:
+                        pass
 
-                    # If we already have fills and order is terminal, no need.
-                    agg = _FILL_AGG.get(oid)
-                    if agg and Decimal(str(agg.get("qty") or "0")) > 0 and str(st.get("status") or "").upper() in {"FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED"}:
-                        continue
+                    # gap-fill if order says filled but fills missing
+                    try:
+                        st2 = _ORDER_STATE.get(oid) or {}
+                        status = str(st2.get("status") or "").upper()
+                        cum = st2.get("cumQty")
+                        if status in {"FILLED", "CLOSED"}:
+                            avg, qty, _fee = _agg_get_avg(oid)
+                            if (not qty) and (cum not in (None, "", "None")):
+                                try:
+                                    if Decimal(str(cum)) > 0:
+                                        _rest_fill_summary(str(oid))  # will compute if possible
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
 
-                    # 1) refresh order detail
-                    od = _rest_fetch_order(oid)
-                    if isinstance(od, dict):
-                        d = od.get("data") if isinstance(od.get("data"), dict) else od
-                        if isinstance(d, dict):
-                            upd = _parse_order_update(d)
-                            if upd:
-                                st.update({
-                                    "status": upd.get("status") or st.get("status"),
-                                    "symbol": upd.get("symbol") or st.get("symbol"),
-                                    "client_order_id": upd.get("client_order_id") or st.get("client_order_id"),
-                                    "ts": time.time(),
-                                })
-                                if upd.get("cum_qty") is not None:
-                                    st["cum_qty"] = Decimal(str(upd.get("cum_qty")))
-                                if upd.get("avg_px") is not None:
-                                    st["avg_px"] = Decimal(str(upd.get("avg_px")))
-                                _ORDER_STATE[oid] = st
+            except Exception:
+                pass
+            time.sleep(max(1.0, float(poll_interval)))
 
-                    # 2) fills fallback (truth source)
-                    agg_qty = Decimal(str((agg or {}).get("qty") or "0"))
-                    need_fills = (agg is None) or (agg_qty <= 0)
-                    if need_fills:
-                        fills = _rest_fetch_fills_by_order(oid, symbol=st.get("symbol"))
-                        if isinstance(fills, list) and fills:
-                            for raw in fills:
-                                if not isinstance(raw, dict):
-                                    continue
-                                fill = _parse_fill(raw)
-                                if not fill:
-                                    continue
-                                key = _dedupe_key(fill["order_id"], fill["fill_id"])
-                                if not _dedupe_add(key, float(fill["ts"])):
-                                    continue
-                                fill["ts"] = float(fill.get("ts") or time.time())
-                                fill["raw_source"] = "rest"
-                                _apply_fill(fill)
-
-                    # If REST still can't get fills, but order has cum+avg, backfill.
-                    agg2 = _FILL_AGG.get(oid)
-                    if (agg2 is None or Decimal(str(agg2.get("qty") or "0")) <= 0) and st.get("cum_qty") and st.get("avg_px"):
-                        cum_qty = Decimal(str(st.get("cum_qty") or "0"))
-                        avg_px = Decimal(str(st.get("avg_px") or "0"))
-                        if cum_qty > 0 and avg_px > 0:
-                            _FILL_AGG[oid] = {
-                                "order_id": oid,
-                                "symbol": st.get("symbol"),
-                                "client_order_id": st.get("client_order_id"),
-                                "qty": cum_qty,
-                                "notional": cum_qty * avg_px,
-                                "fee": Decimal("0"),
-                                "ts": time.time(),
-                                "source": "rest_order",
-                            }
-
-            except Exception as e:
-                print("[apex_client][REST] poller error:", e)
-
-            time.sleep(max(0.5, poll_interval))
-
-    threading.Thread(target=_loop, daemon=True, name="apex-rest-poller").start()
-
-
-# -----------------------------------------------------------------------------
-# Public fill summary API used by app.py
-# -----------------------------------------------------------------------------
-
-
-def _agg_summary(order_id: Optional[str], client_order_id: Optional[str]) -> Optional[Dict[str, Any]]:
-    if order_id:
-        agg = _FILL_AGG.get(str(order_id))
-        if agg:
-            qty = Decimal(str(agg.get("qty") or "0"))
-            notional = Decimal(str(agg.get("notional") or "0"))
-            if qty > 0 and notional > 0:
-                return {
-                    "order_id": str(order_id),
-                    "client_order_id": agg.get("client_order_id") or client_order_id,
-                    "filled_qty": qty,
-                    "avg_fill_price": (notional / qty),
-                    "fee": agg.get("fee"),
-                    "source": agg.get("source"),
-                }
-    # clientOrderId fallback: scan a small subset (best effort)
-    if client_order_id:
-        cid = str(client_order_id)
-        for oid, agg in list(_FILL_AGG.items())[-200:]:
-            if str(agg.get("client_order_id") or "") == cid:
-                qty = Decimal(str(agg.get("qty") or "0"))
-                notional = Decimal(str(agg.get("notional") or "0"))
-                if qty > 0 and notional > 0:
-                    return {
-                        "order_id": oid,
-                        "client_order_id": cid,
-                        "filled_qty": qty,
-                        "avg_fill_price": (notional / qty),
-                        "fee": agg.get("fee"),
-                        "source": agg.get("source"),
-                    }
-    return None
-
-
-def get_fill_summary(
-    symbol: str,
-    order_id: Optional[str] = None,
-    client_order_id: Optional[str] = None,
-    max_wait_sec: float = 25.0,
-    poll_interval: float = 0.25,
-) -> Dict[str, Any]:
-    """Return authoritative fill summary.
-
-    Priority:
-      1) WS fills aggregation
-      2) WS orders (cum+avg) (backup)
-      3) REST fills/trades by orderId (gap fill)
-      4) REST order detail (last resort)
-    """
-    start_private_ws()
-    if _env_bool("ENABLE_REST_POLL", True):
-        # Ensure poller is running; it's idempotent.
-        try:
-            start_order_rest_poller(poll_interval=float(os.getenv("REST_ORDER_POLL_INTERVAL", "5.0")))
-        except Exception:
-            pass
-
-    t0 = time.time()
-    last_source = None
-    while True:
-        summ = _agg_summary(order_id, client_order_id)
-        if summ:
-            last_source = summ.get("source")
-            # If order is terminal or we've waited enough, return.
-            st = _ORDER_STATE.get(str(summ.get("order_id"))) if summ.get("order_id") else None
-            status = str((st or {}).get("status") or "").upper()
-            if status in {"FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED"}:
-                return {
-                    "symbol": str(symbol).upper().strip(),
-                    "order_id": str(summ["order_id"]),
-                    "client_order_id": summ.get("client_order_id"),
-                    "filled_qty": str(summ["filled_qty"]),
-                    "avg_fill_price": str(summ["avg_fill_price"]),
-                    "fee": str(summ.get("fee")) if summ.get("fee") is not None else None,
-                    "source": str(summ.get("source") or ""),
-                }
-            # Non-terminal: still allow return if qty>0 and waited enough.
-            if time.time() - t0 >= max_wait_sec:
-                return {
-                    "symbol": str(symbol).upper().strip(),
-                    "order_id": str(summ["order_id"]),
-                    "client_order_id": summ.get("client_order_id"),
-                    "filled_qty": str(summ["filled_qty"]),
-                    "avg_fill_price": str(summ["avg_fill_price"]),
-                    "fee": str(summ.get("fee")) if summ.get("fee") is not None else None,
-                    "source": str(summ.get("source") or ""),
-                }
-
-        if time.time() - t0 >= max_wait_sec:
-            break
-        time.sleep(max(0.05, poll_interval))
-
-    # Last resort: try REST order detail -> cum+avg
-    if order_id:
-        od = _rest_fetch_order(str(order_id))
-        if isinstance(od, dict):
-            d = od.get("data") if isinstance(od.get("data"), dict) else od
-            if isinstance(d, dict):
-                upd = _parse_order_update(d)
-                if upd and upd.get("cum_qty") and upd.get("avg_px") and Decimal(str(upd["cum_qty"])) > 0 and Decimal(str(upd["avg_px"])) > 0:
-                    return {
-                        "symbol": str(symbol).upper().strip(),
-                        "order_id": str(order_id),
-                        "client_order_id": client_order_id,
-                        "filled_qty": str(upd["cum_qty"]),
-                        "avg_fill_price": str(upd["avg_px"]),
-                        "fee": None,
-                        "source": "rest_order_last",
-                    }
-
-    raise RuntimeError(f"fill_summary timeout; last_source={last_source}")
+    t = threading.Thread(target=_poll, daemon=True)
+    t.start()
