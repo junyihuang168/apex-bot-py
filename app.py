@@ -15,6 +15,8 @@ from apex_client import (
     _snap_quantity,
     start_private_ws,
     start_order_rest_poller,
+    create_trigger_order,
+    cancel_order,
 )
 
 from pnl_store import (
@@ -30,6 +32,9 @@ from pnl_store import (
     clear_lock_level_pct,
     is_signal_processed,
     mark_signal_processed,
+    set_protective_orders,
+    get_protective_orders,
+    clear_protective_orders
 )
 
 app = Flask(__name__)
@@ -48,7 +53,10 @@ REMOTE_FALLBACK_SYMBOLS = {
     s.strip().upper() for s in os.getenv("REMOTE_FALLBACK_SYMBOLS", "").split(",") if s.strip()
 }
 
-# ✅ 说明：本版本不在交易所挂真实 TP/SL 单；仅使用真实 fills 进行记账，并由机器人在后台按规则触发平仓。
+# ✅ 说明：本版本同时支持：
+# - bot-side stop（后台监控价格后 reduceOnly 市价平仓）
+# - exchange-native stop（在交易所挂 Stop-Market/Trigger-Market 保护单）
+# 止损基准必须使用真实 fills（成交均价）。
 
 # 本地 cache（仅辅助）
 BOT_POSITIONS: Dict[Tuple[str, str], dict] = {}
@@ -113,68 +121,51 @@ def _to_decimal(x: Any, default: Decimal = Decimal("0")) -> Decimal:
         return default
 
 
-#+#+#+#+########################################
-# BOT GROUPS
-#
-# Per your requirement:
-# - Keep bot-side SL/TP ONLY for: BOT_1–5 (LONG) and BOT_11–15 (SHORT)
-# - Remove bot-side SL/TP for: BOT_6–10 and BOT_16–20 (they remain signal-driven only)
-#
-# Note: In this repo, the only bot-side SL/TP implementation is the ladder-stop loop below.
-#+#+#+#+########################################
-
 # ----------------------------
 # ✅ BOT 分组（按你要求）
 # ----------------------------
-
-_ALLOWED_LONG_TPSL = {f"BOT_{i}" for i in range(1, 6)}
-_ALLOWED_SHORT_TPSL = {f"BOT_{i}" for i in range(11, 16)}
-
-# “TPSL bots” here means: bots that are allowed to have bot-side SL/TP logic enabled.
-# (In this repo, the only bot-side SL/TP is the ladder stop loop below.)
-LONG_TPSL_BOTS = _parse_bot_list(os.getenv("LONG_TPSL_BOTS", ",".join(sorted(_ALLOWED_LONG_TPSL)))) & _ALLOWED_LONG_TPSL
-SHORT_TPSL_BOTS = _parse_bot_list(os.getenv("SHORT_TPSL_BOTS", ",".join(sorted(_ALLOWED_SHORT_TPSL)))) & _ALLOWED_SHORT_TPSL
-
-# “PNL only” means: no bot-side SL/TP; only record real fills and follow strategy exit signals.
-LONG_PNL_ONLY_BOTS = _parse_bot_list(
-    os.getenv(
-        "LONG_PNL_ONLY_BOTS",
-        ",".join([*(f"BOT_{i}" for i in range(6, 11)), *(f"BOT_{i}" for i in range(21, 31))]),
-    )
-) - _ALLOWED_LONG_TPSL
-
-SHORT_PNL_ONLY_BOTS = _parse_bot_list(
-    os.getenv(
-        "SHORT_PNL_ONLY_BOTS",
-        ",".join([*(f"BOT_{i}" for i in range(16, 21)), *(f"BOT_{i}" for i in range(31, 41))]),
-    )
-) - _ALLOWED_SHORT_TPSL
+LONG_TPSL_BOTS = _parse_bot_list(os.getenv("LONG_TPSL_BOTS", ",".join([f"BOT_{i}" for i in range(1, 11)])))
+SHORT_TPSL_BOTS = _parse_bot_list(os.getenv("SHORT_TPSL_BOTS", ",".join([f"BOT_{i}" for i in range(11, 21)])))
+LONG_PNL_ONLY_BOTS = _parse_bot_list(os.getenv("LONG_PNL_ONLY_BOTS", ",".join([f"BOT_{i}" for i in range(21, 31)])))
+SHORT_PNL_ONLY_BOTS = _parse_bot_list(os.getenv("SHORT_PNL_ONLY_BOTS", ",".join([f"BOT_{i}" for i in range(31, 41)])))
 
 
 # ----------------------------
 # ✅ Ladder Stop (bot-side only; no exchange protective orders)
-# BOT1-5: LONG ladder
-# BOT11-15: SHORT ladder
+# Hard rule (per your requirement):
+#   - BOT1-5:  LONG ladder stop enabled
+#   - BOT11-15: SHORT ladder stop enabled
+#   - BOT6-10 / BOT16-20: NO bot-side SL/TP (signal-only / PnL-only)
 # ----------------------------
 
-LADDER_LONG_BOTS  = _parse_bot_list(os.getenv("LADDER_LONG_BOTS",  ",".join(sorted(_ALLOWED_LONG_TPSL)))) & _ALLOWED_LONG_TPSL
-LADDER_SHORT_BOTS = _parse_bot_list(os.getenv("LADDER_SHORT_BOTS", ",".join(sorted(_ALLOWED_SHORT_TPSL)))) & _ALLOWED_SHORT_TPSL
+_ALLOWED_LADDER_LONG_BOTS  = {f"BOT_{i}" for i in range(1, 6)}
+_ALLOWED_LADDER_SHORT_BOTS = {f"BOT_{i}" for i in range(11, 16)}
+
+# Even if env vars are set incorrectly, we will hard-filter them into the allowed range.
+LADDER_LONG_BOTS  = _parse_bot_list(os.getenv("LADDER_LONG_BOTS",  ",".join(sorted(_ALLOWED_LADDER_LONG_BOTS)))) & _ALLOWED_LADDER_LONG_BOTS
+LADDER_SHORT_BOTS = _parse_bot_list(os.getenv("LADDER_SHORT_BOTS", ",".join(sorted(_ALLOWED_LADDER_SHORT_BOTS)))) & _ALLOWED_LADDER_SHORT_BOTS
 
 # Base stop-loss (percent). Example 0.5 -> -0.5% initial lock.
 LADDER_BASE_SL_PCT = Decimal(os.getenv("LADDER_BASE_SL_PCT", "0.5"))
 
 # Profit% : lock% mapping (both in percent, not decimals)
-# Default (your old ladder):
+# Default ladder (your ladder B):
 # 0.15 -> +0.125
 # 0.35 -> +0.15
+# 0.45 -> +0.25
 # 0.55 -> +0.35
+# Continue stepping (same style as before):
 # 0.75 -> +0.55
 # 0.95 -> +0.75
-_DEFAULT_LADDER_LEVELS = "0.15:0.125,0.35:0.15,0.55:0.35,0.75:0.55,0.95:0.75"
+_DEFAULT_LADDER_LEVELS = "0.15:0.125,0.35:0.15,0.45:0.25,0.55:0.35,0.75:0.55,0.95:0.75"
 LADDER_LEVELS_RAW = os.getenv("LADDER_LEVELS", _DEFAULT_LADDER_LEVELS)
 
 # Risk poll interval (seconds)
 RISK_POLL_INTERVAL = float(os.getenv("RISK_POLL_INTERVAL", "1.0"))
+
+# exchange stop mode: off | exchange | bot | both
+EXCHANGE_STOP_MODE = str(os.getenv("EXCHANGE_STOP_MODE", "both")).strip().lower()
+DEFAULT_SL_PCT = Decimal(os.getenv("DEFAULT_SL_PCT", "0.5"))
 
 
 def _parse_ladder_levels(s: str):
@@ -208,6 +199,33 @@ def _bot_uses_ladder(bot_id: str, direction: str) -> bool:
     if d == "SHORT":
         return b in LADDER_SHORT_BOTS
     return False
+
+def _bot_uses_exchange_stop(bot_id: str, direction: str) -> bool:
+    """Whether this bot+direction should place exchange-native stop orders.
+
+    Only BOT_1-5 (LONG) and BOT_11-15 (SHORT).
+
+    Controlled by EXCHANGE_STOP_MODE.
+"""
+    b = _canon_bot_id(bot_id)
+    d = str(direction or '').upper()
+    if EXCHANGE_STOP_MODE in ('off', 'bot'):
+        return False
+    if d == 'LONG':
+        return b in _ALLOWED_LONG_TPSL
+    if d == 'SHORT':
+        return b in _ALLOWED_SHORT_TPSL
+    return False
+
+def _compute_sl_trigger_price(entry_price: Decimal, direction: str, sl_pct: Decimal) -> Decimal:
+    """Compute stop trigger price from entry fill price. sl_pct is in percent (e.g. 0.6)."""
+    d = str(direction or '').upper()
+    if sl_pct <= 0:
+        sl_pct = DEFAULT_SL_PCT
+    if d == 'LONG':
+        return entry_price * (Decimal('1') - (sl_pct / Decimal('100')))
+    else:
+        return entry_price * (Decimal('1') + (sl_pct / Decimal('100')))
 
 
 def _get_mark_price(symbol: str) -> Optional[Decimal]:
@@ -289,23 +307,10 @@ def _compute_entry_qty(symbol: str, side: str, budget: Decimal) -> Decimal:
     rules = _get_symbol_rules(symbol)
     min_qty = rules["min_qty"]
 
-    # Reference price is only used for sizing (qty = budget / ref_price).
-    # It may come from worstPrice / markPrice / other SDK variants. Must be numeric.
-    raw_ref = get_market_price(symbol, side, str(min_qty))
-    ref_price_dec = _to_decimal(raw_ref, default=Decimal("0"))
-
-    # Last-resort env fallback (so webhook won't 500 if public quote glitches).
-    # You can set DEFAULT_REF_PRICE=100 to temporarily unblock sizing.
+    ref_qty = str(max(rules.get('min_qty', min_qty), rules.get('step_size', min_qty)))
+    ref_price_dec = Decimal(get_market_price(symbol, side, ref_qty, apply_buffer=False, include_position_fallback=False))
     if ref_price_dec <= 0:
-        env_ref = os.getenv("DEFAULT_REF_PRICE", "").strip()
-        if env_ref:
-            ref_price_dec = _to_decimal(env_ref, default=Decimal("0"))
-
-    if ref_price_dec <= 0:
-        raise ValueError(
-            f"invalid reference price for qty compute: symbol={symbol} side={side} ref={raw_ref!r}"
-        )
-
+        raise ValueError(f"invalid reference price: {ref_price_dec}")
     theoretical_qty = budget / ref_price_dec
     snapped_qty = _snap_quantity(symbol, theoretical_qty)
 
@@ -416,6 +421,19 @@ def _ladder_close_position(bot_id: str, symbol: str, direction: str, qty: Decima
     bnum = _bot_num(bot_id)
     ts_now = int(time.time())
     exit_client_id = f"{bnum:03d}{ts_now}90"
+
+    # Cancel exchange-native protective orders (if any) before bot-side close
+    try:
+        po = get_protective_orders(bot_id, symbol, direction) or {}
+        sl_oid = po.get('sl_order_id')
+        if sl_oid:
+            try:
+                cancel_order(order_id=str(sl_oid), symbol=symbol)
+            except Exception as ce:
+                print('[PROTECT] cancel SL before ladder close failed:', ce)
+        clear_protective_orders(bot_id, symbol, direction)
+    except Exception:
+        pass
 
     try:
         order = create_market_order(
@@ -1190,13 +1208,54 @@ def tv_webhook():
             except Exception as e:
                 print("[PNL] record_entry error:", e)
 
-        # Ladder SL/lock state (bot-side only; no exchange protective orders)
+        # Ladder SL/lock state (bot-side) + optional exchange stop (exchange-native)
         direction = "LONG" if side_raw == "BUY" else "SHORT"
         if _bot_uses_ladder(bot_id, direction) and entry_price_dec is not None and final_qty > 0:
             try:
                 set_lock_level_pct(bot_id, symbol, direction, -LADDER_BASE_SL_PCT)
             except Exception as e:
                 print("[LADDER] set base lock failed:", e)
+
+        # Exchange-native stop (Stop-Market / Trigger-Market) using REAL fills as baseline
+        try:
+            use_sl = bool(body.get('use_sl', False))
+            sl_pct = _to_decimal(body.get('sl_percent'), default=DEFAULT_SL_PCT)
+            if use_sl and entry_price_dec is not None and final_qty > 0 and _bot_uses_exchange_stop(bot_id, direction):
+                # cancel previous protective if any
+                prev = get_protective_orders(bot_id, symbol, direction) or {}
+                prev_sl = prev.get('sl_order_id')
+                if prev_sl:
+                    try:
+                        cancel_order(order_id=str(prev_sl), symbol=symbol)
+                    except Exception as ce:
+                        print('[PROTECT] cancel previous SL failed:', ce)
+                # compute trigger price (snap inside apex_client)
+                trig_price = _compute_sl_trigger_price(entry_price_dec, direction, sl_pct)
+                stop_side = 'SELL' if direction == 'LONG' else 'BUY'
+                sl_client_id = f"{bnum:03d}{ts_now}03"
+                po = create_trigger_order(
+                    symbol=symbol,
+                    side=stop_side,
+                    size=str(final_qty),
+                    trigger_price=str(trig_price),
+                    reduce_only=True,
+                    client_id=sl_client_id,
+                    trigger_type='STOP_MARKET',
+                )
+                sl_order_id = po.get('order_id') or po.get('data', {}).get('id') or po.get('data', {}).get('orderId')
+                if sl_order_id:
+                    set_protective_orders(
+                        bot_id=bot_id, symbol=symbol, direction=direction,
+                        sl_order_id=str(sl_order_id), tp_order_id=None,
+                        sl_client_id=sl_client_id, tp_client_id=None,
+                        sl_price=trig_price, tp_price=None,
+                        is_active=True,
+                    )
+                    print(f'[PROTECT] SL placed bot={bot_id} symbol={symbol} dir={direction} side={stop_side} trig={trig_price} oid={sl_order_id}')
+                else:
+                    print('[PROTECT] SL placement returned no order_id:', po)
+        except Exception as pe:
+            print('[PROTECT] exchange SL placement skipped/failed:', pe)
 
         return jsonify({
             "status": "ok",
@@ -1267,6 +1326,16 @@ def tv_webhook():
         ts_now = int(time.time())
         exit_client_id = f"{bnum:03d}{ts_now}02"
 
+        # Cancel exchange-native protective orders (if any) before manual exit
+        try:
+            po = get_protective_orders(bot_id, symbol, direction_to_close) or {}
+            sl_oid = po.get('sl_order_id')
+            if sl_oid:
+                cancel_order(order_id=sl_oid)
+            clear_protective_orders(bot_id, symbol, direction_to_close)
+        except Exception as pe:
+            print('[PROTECT] cancel protective on strategy exit skipped/failed:', pe)
+
         try:
             order = create_market_order(
                 symbol=symbol,
@@ -1328,6 +1397,17 @@ def tv_webhook():
 
         try:
             clear_lock_level_pct(bot_id, symbol, direction_to_close)
+        except Exception:
+            pass
+
+        # Clear DB record of protective orders after exit
+        try:
+            clear_protective_orders(bot_id, symbol, direction_to_close)
+        except Exception:
+            pass
+
+        try:
+            clear_protective_orders(bot_id, symbol, direction_to_close)
         except Exception:
             pass
 
