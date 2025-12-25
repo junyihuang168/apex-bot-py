@@ -9,6 +9,7 @@ from flask import Flask, request, jsonify, Response
 from apex_client import (
     create_market_order,
     get_market_price,
+    get_reference_price,
     get_fill_summary,
     get_open_position_for_symbol,
     _get_symbol_rules,
