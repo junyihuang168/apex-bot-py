@@ -15,8 +15,6 @@ from apex_client import (
     _snap_quantity,
     start_private_ws,
     start_order_rest_poller,
-    create_trigger_order,
-    cancel_order,
 )
 
 from pnl_store import (
@@ -32,10 +30,6 @@ from pnl_store import (
     clear_lock_level_pct,
     is_signal_processed,
     mark_signal_processed,
-    set_protective_orders,
-    get_protective_orders,
-    clear_protective_orders,
-    find_protective_owner_by_order_id,
 )
 
 app = Flask(__name__)
@@ -206,18 +200,6 @@ def _parse_ladder_levels(s: str):
 LADDER_LEVELS = _parse_ladder_levels(LADDER_LEVELS_RAW)
 
 
-# Exchange-native protective stop orders (optional)
-# STOP_MODE:
-#   - 'bot'      : only bot-side monitoring & market close (default)
-#   - 'exchange' : place/maintain STOP_MARKET trigger on exchange (no bot-side stop close)
-#   - 'both'     : exchange trigger + bot-side emergency close
-STOP_MODE = os.getenv('STOP_MODE', 'bot').strip().lower()
-
-# Only these bots get protective stops / ladder trailing
-PROTECTIVE_BOTS = sorted(set(LADDER_LONG_BOTS) | set(LADDER_SHORT_BOTS))
-
-
-
 def _bot_uses_ladder(bot_id: str, direction: str) -> bool:
     b = _canon_bot_id(bot_id)
     d = str(direction or "").upper()
@@ -259,74 +241,6 @@ def _compute_stop_price(direction: str, entry: Decimal, lock_pct: Decimal) -> De
     else:
         return entry * (Decimal("1") - (lock_pct / Decimal("100")))
 
-
-
-def _exchange_stop_side(direction: str) -> str:
-    d = str(direction or '').upper()
-    return 'SELL' if d == 'LONG' else 'BUY'
-
-
-def _ensure_exchange_stop(bot_id: str, symbol: str, direction: str, qty: Decimal, entry_price: Decimal, lock_pct: Decimal) -> None:
-    """Create or replace an exchange-native STOP_MARKET trigger order tied to the bot's current lock_pct.
-
-    We store the protective order id in pnl_store so we can cancel/replace later.
-    """
-    if STOP_MODE not in ('exchange', 'both'):
-        return
-    b = _canon_bot_id(bot_id)
-    if b not in PROTECTIVE_BOTS:
-        return
-
-    stop_price = _compute_stop_price(direction, entry_price, lock_pct)
-    if stop_price <= 0 or qty <= 0:
-        return
-
-    # Check existing protective stop
-    existing = get_protective_orders(b, symbol) or {}
-    old_id = existing.get('sl_order_id')
-
-    # Replace only if needed
-    if old_id:
-        try:
-            cancel_order(symbol, old_id)
-        except Exception as e:
-            print(f"[PROTECT] cancel old stop failed bot={b} symbol={symbol} order_id={old_id} err={e}")
-
-    side = _exchange_stop_side(direction)
-    try:
-        res = create_trigger_order(
-            symbol=symbol,
-            side=side,
-            size=str(qty),
-            trigger_price=str(stop_price),
-            reduce_only=True,
-            order_type='STOP_MARKET',
-        )
-        order_id = None
-        if isinstance(res, dict):
-            d = res.get('data') if res.get('data') is not None else res
-            if isinstance(d, dict):
-                order_id = d.get('orderId') or d.get('id') or d.get('order_id')
-        if not order_id:
-            # keep raw for debugging
-            print(f"[PROTECT] create_trigger_order response missing id: {res}")
-            return
-        set_protective_orders(b, symbol, sl_order_id=str(order_id), tp_order_id=None)
-        print(f"[PROTECT] exchange stop set bot={b} symbol={symbol} dir={direction} stop={stop_price} order_id={order_id}")
-    except Exception as e:
-        print(f"[PROTECT] exchange stop set failed bot={b} symbol={symbol} err={e}")
-
-
-def _clear_exchange_stop(bot_id: str, symbol: str) -> None:
-    b = _canon_bot_id(bot_id)
-    existing = get_protective_orders(b, symbol) or {}
-    old_id = existing.get('sl_order_id')
-    if old_id:
-        try:
-            cancel_order(symbol, old_id)
-        except Exception as e:
-            print(f"[PROTECT] cancel stop failed bot={b} symbol={symbol} order_id={old_id} err={e}")
-    clear_protective_orders(b, symbol)
 
 
 def _bot_expected_entry_side(bot_id: str) -> Optional[str]:
@@ -371,19 +285,34 @@ def _extract_budget_usdt(body: dict) -> Decimal:
 # ----------------------------
 # 预算 -> snapped qty
 # ----------------------------
-def _compute_entry_qty(symbol: str, side: str, budget: Decimal) -> Decimal:
-    rules = _get_symbol_rules(symbol)
+def _compute_entry_qty(symbol: str, side: str, size_usdt: Any) -> Decimal:
+    """Compute order size (contract qty) from a USDT notional.
+
+    Uses a reference price derived from:
+      1) webhook `price` (if present elsewhere in handler; see `_extract_ref_price_from_payload`)
+      2) public ticker markPrice (crossSymbolName) via `get_market_price()`
+    """
+    sym = str(symbol).upper().strip()
+    side_u = str(side).upper().strip()
+
+    rules = _get_symbol_rules(sym)
     min_qty = rules["min_qty"]
 
-    ref_price_dec = Decimal(get_market_price(symbol, side, str(min_qty)))
-    theoretical_qty = budget / ref_price_dec
-    snapped_qty = _snap_quantity(symbol, theoretical_qty)
+    budget_usdt = _to_decimal(size_usdt, default=Decimal("0"))
+    if budget_usdt <= 0:
+        raise ValueError(f"invalid size_usdt: {size_usdt}")
 
-    if snapped_qty <= 0:
-        raise ValueError(f"snapped_qty <= 0, symbol={symbol}, budget={budget}")
+    # Get reference price (string) and coerce to Decimal safely
+    ref_price_str = get_market_price(sym, side_u, str(min_qty))
+    ref_price_dec = _to_decimal(ref_price_str, default=Decimal("0"))
+    if ref_price_dec <= 0:
+        raise RuntimeError(f"invalid reference price for qty compute: {ref_price_str}")
 
-    return snapped_qty
-
+    qty = budget_usdt / ref_price_dec
+    qty = _snap_quantity(sym, qty)
+    if qty < min_qty:
+        qty = min_qty
+    return qty
 
 def _order_status_and_reason(order: dict):
     data = (order or {}).get("data", {}) or {}
