@@ -292,19 +292,8 @@ def get_market_price(symbol: str, side: str, size: NumberLike) -> str:
 
     if last_err:
         print(f"[apex_client] get_market_price fallback used (last_err={last_err})")
-    return "0".
-    try:
-        pos = get_open_position_for_symbol(symbol)
-        mp = None
-        if isinstance(pos, dict):
-            mp = pos.get("markPrice") or pos.get("oraclePrice") or pos.get("indexPrice")
-        if mp is not None:
-            return str(mp)
-    except Exception:
-        pass
-    if last_err:
-        print(f"[apex_client] get_market_price fallback used (last_err={last_err})")
     return "0"
+
 
 
 # -----------------------------------------------------------------------------
