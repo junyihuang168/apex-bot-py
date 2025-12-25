@@ -161,7 +161,7 @@ def get_client() -> HttpPrivateSign:
 
 
 def _get_symbol_rules(symbol: str) -> Dict[str, Any]:
-    s = str(symbol).upper().strip()
+    s = format_symbol(symbol)
     rules = SYMBOL_RULES.get(s)
     if rules:
         merged = dict(DEFAULT_SYMBOL_RULES)
@@ -259,7 +259,7 @@ def create_market_order(
     client_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     client = get_client()
-    sym = str(symbol).upper().strip()
+    sym = format_symbol(symbol)
     side_u = str(side).upper().strip()
     qty = str(size)
 
@@ -312,9 +312,50 @@ def create_market_order(
 # -----------------------------------------------------------------------------
 
 
+def create_trigger_order(
+    symbol: str,
+    side: str,
+    qty: str,
+    trigger_price: str,
+    reduce_only: bool = True,
+    client_order_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create an exchange-native Stop-Market (Trigger-Market) order.
+
+    Notes:
+    - For STOP_MARKET orders, ApeX still requires a `price` field for protection.
+      We use `get_market_price()` as a best-effort bound; if that fails, we fall back
+      to the trigger price itself.
+    - `side` should be the execution side (SELL closes a LONG, BUY closes a SHORT).
+    """
+    client = get_client()
+    sym = format_symbol(symbol)
+    side_u = str(side).upper().strip()
+
+    # Best-effort protective price (market-protection). If unavailable, use trigger price.
+    try:
+        protective_price = get_market_price(sym, side_u, qty)
+    except Exception:
+        protective_price = str(trigger_price)
+
+    payload = {
+        "symbol": sym,
+        "side": side_u,
+        "type": "STOP_MARKET",
+        "size": str(qty),
+        "price": str(protective_price),
+        "triggerPrice": str(trigger_price),
+        "reduceOnly": bool(reduce_only),
+    }
+    if client_order_id:
+        payload["clientOrderId"] = str(client_order_id)
+
+    register_order_for_tracking(payload.get("clientOrderId"), sym)
+    return _safe_call(client.create_order_v3, **payload)
+
 def get_open_position_for_symbol(symbol: str) -> Dict[str, Any]:
     client = get_client()
-    sym = str(symbol).upper().strip()
+    sym = format_symbol(symbol)
 
     methods = [
         "get_positions_v3",
@@ -415,7 +456,7 @@ def _parse_fill(x: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return {
         "order_id": str(order_id),
         "fill_id": str(fill_id) if fill_id is not None else f"{order_id}:{price}:{size}:{ts_f}",
-        "symbol": str(symbol).upper().strip() if symbol is not None else None,
+        "symbol": format_symbol(symbol) if symbol is not None else None,
         "client_order_id": str(client_oid) if client_oid is not None else None,
         "price": price,
         "qty": size,
@@ -446,7 +487,7 @@ def _parse_order_update(x: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     return {
         "order_id": str(order_id),
-        "symbol": str(symbol).upper().strip() if symbol is not None else None,
+        "symbol": format_symbol(symbol) if symbol is not None else None,
         "client_order_id": str(client_oid) if client_oid is not None else None,
         "status": status,
         "cum_qty": cum_qty,
@@ -534,7 +575,7 @@ def register_order_for_tracking(
         st = {
             "order_id": str(order_id),
             "client_order_id": client_order_id,
-            "symbol": str(symbol).upper().strip() if symbol else None,
+            "symbol": format_symbol(symbol) if symbol else None,
             "status": str(status).upper().strip(),
             "cum_qty": Decimal("0"),
             "avg_px": None,
@@ -546,7 +587,7 @@ def register_order_for_tracking(
         if client_order_id:
             st["client_order_id"] = client_order_id
         if symbol:
-            st["symbol"] = str(symbol).upper().strip()
+            st["symbol"] = format_symbol(symbol)
         if status:
             st["status"] = str(status).upper().strip()
         if expected_qty is not None:
@@ -922,7 +963,7 @@ def get_fill_summary(
             status = str((st or {}).get("status") or "").upper()
             if status in {"FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED"}:
                 return {
-                    "symbol": str(symbol).upper().strip(),
+                    "symbol": format_symbol(symbol),
                     "order_id": str(summ["order_id"]),
                     "client_order_id": summ.get("client_order_id"),
                     "filled_qty": str(summ["filled_qty"]),
@@ -933,7 +974,7 @@ def get_fill_summary(
             # Non-terminal: still allow return if qty>0 and waited enough.
             if time.time() - t0 >= max_wait_sec:
                 return {
-                    "symbol": str(symbol).upper().strip(),
+                    "symbol": format_symbol(symbol),
                     "order_id": str(summ["order_id"]),
                     "client_order_id": summ.get("client_order_id"),
                     "filled_qty": str(summ["filled_qty"]),
@@ -955,7 +996,7 @@ def get_fill_summary(
                 upd = _parse_order_update(d)
                 if upd and upd.get("cum_qty") and upd.get("avg_px") and Decimal(str(upd["cum_qty"])) > 0 and Decimal(str(upd["avg_px"])) > 0:
                     return {
-                        "symbol": str(symbol).upper().strip(),
+                        "symbol": format_symbol(symbol),
                         "order_id": str(order_id),
                         "client_order_id": client_order_id,
                         "filled_qty": str(upd["cum_qty"]),
@@ -964,130 +1005,23 @@ def get_fill_summary(
                         "source": "rest_order_last",
                     }
 
-    raise RuntimeError(f"fill_summary timeout; last_source={last_source}")
+    raise RuntimeError(f"fill_summary timeout; last_source={last_source}")# ──────────────────────────────────────────────────────────────
+# SYMBOL NORMALIZATION
+# ──────────────────────────────────────────────────────────────
+
+def format_symbol(symbol: str) -> str:
+    """Normalize a contract symbol to ApeX private API format (e.g., 'BTC-USDT')."""
+    s = str(symbol).upper().replace("/", "-").replace("_", "-").strip()
+    if "-" in s:
+        return s
+    # Best-effort split for common quotes (fallback to raw if unknown)
+    for quote in ("USDT", "USDC", "USD", "BTC", "ETH"):
+        if s.endswith(quote) and len(s) > len(quote):
+            return f"{s[:-len(quote)]}-{quote}"
+    return s
+
+def format_symbol_for_ticker(symbol: str) -> str:
+    """Normalize to public ticker crossSymbolName (e.g., 'BTCUSDT')."""
+    return re.sub(r"[^A-Z0-9]", "", format_symbol(symbol))
 
 
-# ───────────────────────────────────────────────────────────────
-# Trigger / Cancel helpers (exchange-native protective orders)
-# ───────────────────────────────────────────────────────────────
-
-def _extract_order_id(resp: Any) -> Optional[str]:
-    """Best-effort extraction of order id from various API response shapes."""
-    try:
-        if resp is None:
-            return None
-        if isinstance(resp, dict):
-            # Common shapes: {"data":{"orderId":"..."}} or {"orderId":"..."} or {"data":{"id":"..."}}
-            data = resp.get("data")
-            if isinstance(data, dict):
-                for k in ("orderId", "id", "order_id"):
-                    v = data.get(k)
-                    if v:
-                        return str(v)
-            for k in ("orderId", "id", "order_id"):
-                v = resp.get(k)
-                if v:
-                    return str(v)
-        return None
-    except Exception:
-        return None
-
-
-def create_trigger_order(
-    symbol: str,
-    side: str,
-    trigger_type: str,
-    size: Any,
-    trigger_price: Any,
-    reduce_only: bool = True,
-    client_id: Optional[str] = None,
-    time_in_force: str = "GTT",
-) -> Dict[str, Any]:
-    """
-    Create an exchange-native trigger order (e.g., STOP_MARKET / TRIGGER_MARKET).
-
-    Notes:
-    - ApeX Omni v3 endpoints typically require numeric fields as strings.
-    - For market/stop-market style orders, the API often still expects a `price` parameter.
-      We source it via `get_market_price(...)` (worst price) as a safe signature price.
-    """
-    sym = str(symbol).strip()
-    _side = str(side).strip().upper()
-    _type = str(trigger_type).strip().upper()
-
-    # Snap qty + trigger price
-    rules = _get_symbol_rules(sym)
-    qty = _snap_quantity(sym, Decimal(str(size)))
-    trig_px = _snap_price(sym, Decimal(str(trigger_price)))
-
-    # Fetch a usable reference price for request signing / validation
-    ref_price = get_market_price(sym, _side, qty)
-    try:
-        ref_dec = Decimal(str(ref_price))
-    except Exception:
-        ref_dec = Decimal("0")
-
-    if ref_dec <= 0:
-        raise ValueError(f"invalid reference price for trigger order: symbol={sym} side={_side} ref={ref_price}")
-
-    payload = dict(
-        symbol=sym,
-        side=_side,
-        type=_type,
-        size=str(qty),
-        price=str(ref_dec),
-        triggerPrice=str(trig_px),
-        reduceOnly=bool(reduce_only),
-        timeInForce=time_in_force,
-    )
-    if client_id:
-        payload["clientId"] = str(client_id)
-
-    client = get_client()
-    # Prefer SDK method name if present; otherwise fall back to generic create_order_v3
-    fn = getattr(client, "create_order_v3", None)
-    if fn is None:
-        raise RuntimeError("apexomni client missing create_order_v3()")
-
-    resp = _safe_call(fn, **payload)
-    return {
-        "ok": True,
-        "order_id": _extract_order_id(resp),
-        "client_id": client_id,
-        "request": payload,
-        "raw": resp,
-    }
-
-
-def cancel_order(
-    order_id: Optional[str] = None,
-    symbol: Optional[str] = None,
-    client_id: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Cancel an order by order_id (preferred) or client_id when available."""
-    client = get_client()
-
-    # 1) Cancel by orderId
-    if order_id:
-        for method in ("cancel_order_v3", "cancel_order", "cancelOrderV3"):
-            fn = getattr(client, method, None)
-            if fn:
-                kwargs = {"orderId": str(order_id)}
-                # Some implementations require symbol; provide when present
-                if symbol:
-                    kwargs["symbol"] = str(symbol)
-                resp = _safe_call(fn, **kwargs)
-                return {"ok": True, "mode": "order_id", "order_id": str(order_id), "raw": resp}
-
-    # 2) Cancel by clientId (if SDK supports)
-    if client_id:
-        for method in ("cancel_order_by_client_id_v3", "cancel_order_by_client_id", "cancelOrderByClientIdV3"):
-            fn = getattr(client, method, None)
-            if fn:
-                kwargs = {"clientId": str(client_id)}
-                if symbol:
-                    kwargs["symbol"] = str(symbol)
-                resp = _safe_call(fn, **kwargs)
-                return {"ok": True, "mode": "client_id", "client_id": str(client_id), "raw": resp}
-
-    return {"ok": False, "error": "no supported cancel method or missing identifiers", "order_id": order_id, "client_id": client_id, "symbol": symbol}
