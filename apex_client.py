@@ -8,6 +8,8 @@ from collections import OrderedDict
 from decimal import Decimal, ROUND_DOWN
 from typing import Any, Dict, Optional, Tuple, Union, Iterable
 
+import requests
+
 from apexomni.http_private_sign import HttpPrivateSign
 from apexomni.constants import (
     APEX_OMNI_HTTP_MAIN,
@@ -199,53 +201,96 @@ def _snap_price(symbol: str, price: Decimal) -> Decimal:
 # -----------------------------------------------------------------------------
 
 
-def get_market_price(symbol: str, side: str, size: NumberLike) -> str:
-    """Return worstPrice quote (string) for MARKET signature."""
-    client = get_client()
-    methods = [
-        "get_worst_price",
-        "get_worst_price_v3",
-        "getWorstPrice",
-        "getWorstPriceV3",
-        "worst_price_v3",
-    ]
-    last_err = None
-    for name in methods:
-        if not hasattr(client, name):
-            continue
-        fn = getattr(client, name)
+def get_reference_price(symbol: str) -> Decimal:
+    """Public ticker-based reference price (no auth).
+
+    We prefer indexPrice (used by ApeX for market order bound rules), then markPrice, then lastPrice.
+    The public ticker endpoint sometimes expects `crossSymbolName` without dashes (e.g., BTCUSDT),
+    but we also try the dashed form as a fallback (e.g., BTC-USDT).
+    """
+    base_url, _ = _get_base_and_network()
+    sym_dash = format_symbol(symbol)
+    candidates = [sym_dash.replace("-", ""), sym_dash]
+
+    last_err: Optional[Exception] = None
+    for sym in candidates:
         try:
-            res = _safe_call(fn, symbol=str(symbol).upper(), side=str(side).upper(), size=str(size))
-            if isinstance(res, dict):
-                data = res.get("data") if res.get("data") is not None else res
-                for k in ("worstPrice", "price", "worst_price"):
-                    v = data.get(k) if isinstance(data, dict) else None
-                    if v is not None:
-                        return str(v)
-            if res is not None:
-                return str(res)
+            url = f"{base_url}/api/v3/ticker"
+            resp = requests.get(url, params={"symbol": sym}, timeout=8)
+            resp.raise_for_status()
+            j = resp.json()
+
+            data = j.get("data")
+            if isinstance(data, list) and data:
+                item = data[0]
+            elif isinstance(data, dict):
+                item = data
+            else:
+                raise ValueError(f"unexpected ticker payload: keys={list(j.keys())}")
+
+            for k in ("indexPrice", "markPrice", "lastPrice", "price"):
+                v = item.get(k)
+                if v is None or v == "":
+                    continue
+                return Decimal(str(v))
+
+            raise ValueError(f"no numeric price in ticker: keys={list(item.keys())}")
         except Exception as e:
             last_err = e
 
-    # Fallback: try mark price from positions; last resort return "0".
+    raise ValueError(f"ticker lookup failed for {sym_dash} (last_err={last_err})")
+
+def get_market_price(symbol: str, side: str, size: str) -> str:
+    """Price used only as a 'reference/worse' bound for signing market orders.
+
+    Primary path: use public ticker index price + buffer (robust, no 'args invalid' issues).
+    Fallback path: call private worst-price endpoint(s).
+    """
+    side_u = (side or "").upper()
+    if side_u not in ("BUY", "SELL"):
+        side_u = "BUY"
+
     try:
-        pos = get_open_position_for_symbol(symbol)
-        mp = None
-        if isinstance(pos, dict):
-            mp = pos.get("markPrice") or pos.get("oraclePrice") or pos.get("indexPrice")
-        if mp is not None:
-            return str(mp)
-    except Exception:
-        pass
-    if last_err:
-        print(f"[apex_client] get_market_price fallback used (last_err={last_err})")
+        ref = get_reference_price(symbol)
+        buf = Decimal(os.getenv("SIG_PRICE_BUFFER_PCT", "0.02"))
+        if buf < 0:
+            buf = Decimal("0.02")
+        price = ref * (Decimal("1") + buf) if side_u == "BUY" else ref * (Decimal("1") - buf)
+        price = _snap_price(symbol, price)
+        return str(price)
+    except Exception as e:
+        last_err = f"ticker fallback used (last_err={e})"
+
+    # ---- Fallback: private worst-price ----
+    try:
+        client = get_client()
+        methods = [
+            getattr(client, "get_worst_price_v3", None),
+            getattr(client, "get_worst_price", None),
+            getattr(client, "getWorstPrice", None),
+        ]
+        for fn in methods:
+            if not fn:
+                continue
+            try:
+                r = fn(symbol=format_symbol(symbol), side=side_u, size=str(size))
+                if isinstance(r, dict):
+                    data = r.get("data") or r
+                    for k in ("price", "worstPrice", "worst_price"):
+                        if k in data and data[k]:
+                            p = _snap_price(symbol, Decimal(str(data[k])))
+                            return str(p)
+                    last_err = f"no numeric price in response for {getattr(fn,'__name__','fn')}: {list(r.keys())}"
+                else:
+                    p = _snap_price(symbol, Decimal(str(r)))
+                    return str(p)
+            except Exception as ie:
+                last_err = str(ie)
+    except Exception as ce:
+        last_err = str(ce)
+
+    print(f"[apex_client] get_market_price fallback used (last_err={last_err})")
     return "0"
-
-
-# -----------------------------------------------------------------------------
-# Order placement
-# -----------------------------------------------------------------------------
-
 
 def _random_client_id() -> str:
     return str(int(float(str(random.random())[2:])))
