@@ -3,11 +3,12 @@ import time
 import random
 import inspect
 import threading
-import requests
 import queue
 from collections import OrderedDict
 from decimal import Decimal, ROUND_DOWN
 from typing import Any, Dict, Optional, Tuple, Union, Iterable
+
+import requests
 
 from apexomni.http_private_sign import HttpPrivateSign
 from apexomni.constants import (
@@ -83,6 +84,70 @@ def _get_base_and_network() -> Tuple[str, int]:
     base_url = APEX_OMNI_HTTP_MAIN if use_mainnet else APEX_OMNI_HTTP_TEST
     network_id = NETWORKID_OMNI_MAIN_ARB if use_mainnet else NETWORKID_TEST
     return base_url, network_id
+
+# -----------------------------------------------------------------------------
+# Helpers: symbol normalization and public price fallback
+# -----------------------------------------------------------------------------
+
+def _format_symbol(symbol: str) -> str:
+    """Normalize symbol to Apex format, typically 'BASE-QUOTE' (e.g., 'ZEC-USDT')."""
+    s = str(symbol).strip().upper().replace('/', '-')
+    if '-' in s:
+        return s
+    for q in ('USDT', 'USDC', 'USD'):
+        if s.endswith(q) and len(s) > len(q):
+            return f"{s[:-len(q)]}-{q}"
+    return s
+
+def _api_url(base_url: str, path: str) -> str:
+    b = str(base_url).rstrip('/')
+    if b.endswith('/api'):
+        b = b[:-4]
+    return f"{b}/api/{str(path).lstrip('/')}"
+
+def _public_ticker_v3(symbol: str):
+    """Public ticker fallback. Returns a Decimal price or None."""
+    base_url, _ = _get_base_and_network()
+    sym = _format_symbol(symbol)
+    url = _api_url(base_url, 'v3/ticker')
+    try:
+        r = requests.get(url, params={'symbol': sym}, timeout=5)
+        j = r.json()
+    except Exception as e:
+        print(f"[apex_client] ticker v3 failed: {e}")
+        return None
+
+    data = None
+    if isinstance(j, dict):
+        data = j.get('data')
+        if isinstance(data, list) and data:
+            for it in data:
+                if isinstance(it, dict) and str(it.get('symbol', '')).upper() == sym:
+                    data = it
+                    break
+            if isinstance(data, list):
+                data = data[0]
+        if data is None:
+            data = j
+
+    if not isinstance(data, dict):
+        return None
+
+    for k in ('markPrice', 'indexPrice', 'oraclePrice', 'midPrice', 'lastPrice', 'price'):
+        v = data.get(k)
+        if v is None:
+            continue
+        try:
+            dv = Decimal(str(v))
+            if dv > 0:
+                return dv
+        except Exception:
+            continue
+
+    if isinstance(j, dict) and 'msg' in j:
+        print(f"[apex_client] ticker v3 error: code={j.get('code')} msg={j.get('msg')}")
+    return None
+
 
 
 def _get_ws_endpoint() -> Optional[str]:
@@ -201,176 +266,92 @@ def _snap_price(symbol: str, price: Decimal) -> Decimal:
 
 
 
-
-# -----------------------------------------------------------------------------
-# Public price helpers (no auth)
-# -----------------------------------------------------------------------------
-
-def _public_ticker_v3(symbol: str) -> Optional[Decimal]:
-    """Fetch a usable reference price via public ticker endpoint."""
-    base_url, _ = _get_base_and_network()
-    sym = str(symbol).upper().strip()
-    url = f"{base_url}/api/v3/ticker"
-    try:
-        r = requests.get(url, params={"symbol": sym}, timeout=5)
-        j = r.json()
-    except Exception as e:
-        print(f"[apex_client] public_ticker_v3 failed: {e}")
-        return None
-
-    data = j.get("data") if isinstance(j, dict) and isinstance(j.get("data"), dict) else j
-    if not isinstance(data, dict):
-        return None
-
-    for k in ("markPrice", "lastPrice", "indexPrice", "oraclePrice"):
-        v = data.get(k)
-        if v is None:
-            continue
-        try:
-            dv = Decimal(str(v))
-            if dv > 0:
-                return dv
-        except Exception:
-            continue
-    return None
-
-
-def _public_worst_price_v1(symbol: str, side: str, size: str) -> Optional[Decimal]:
-    """Fetch worstPrice via public v1 endpoint (same as seen in DO logs)."""
-    base_url, _ = _get_base_and_network()
-    sym = str(symbol).upper().strip()
-    side_u = str(side).upper().strip()
-    url = f"{base_url}/api/v1/get-worst-price"
-    try:
-        r = requests.get(url, params={"symbol": sym, "side": side_u, "size": str(size)}, timeout=5)
-        j = r.json()
-    except Exception as e:
-        print(f"[apex_client] public_worst_price_v1 failed: {e}")
-        return None
-
-    data = j.get("data") if isinstance(j, dict) and isinstance(j.get("data"), dict) else j
-    if not isinstance(data, dict):
-        return None
-
-    for k in ("worstPrice", "worst_price", "price"):
-        v = data.get(k)
-        if v is None:
-            continue
-        try:
-            dv = Decimal(str(v))
-            if dv > 0:
-                return dv
-        except Exception:
-            continue
-
-    # Some error payloads are like {'code','msg','timeCost'}; log msg for debugging
-    if isinstance(j, dict) and "msg" in j:
-        print(f"[apex_client] public_worst_price_v1 error: code={j.get('code')} msg={j.get('msg')}")
-    return None
-
-def get_market_price(symbol: str, side: str, size: str = "0.01", *, apply_buffer: bool = True, include_position_fallback: bool = True) -> str:
-    """Return a usable reference price string for sizing or as a worstPrice bound.
+def get_market_price(symbol: str, side: str, size: NumberLike) -> str:
+    """Return a conservative reference price used for MARKET orders and sizing.
 
     Priority:
-      1) Public ticker v3 (markPrice/lastPrice/indexPrice)
-      2) Signed worst price v3 methods (if available)
-      3) Public /api/v1/get-worst-price
-      4) Position entry price (optional)
+      1) Public ticker v3 (works even when WS is disabled)
+      2) Signed worst price methods from the SDK (if available)
+      3) Position-derived mark/oracle/index price (if available)
 
-    If apply_buffer=True, we apply a small buffer against slippage consistent with worstPrice usage.
+    If everything fails, returns "0" (caller should treat that as error).
     """
-
     sym = _format_symbol(symbol)
-    side_u = str(side).upper()
-
-    # Pick a "safe" reference size (avoid triggering endpoint errors on too-small sizes)
-    rules = _get_symbol_rules(sym)
-    try:
-        req_size = Decimal(str(size))
-    except Exception:
-        req_size = Decimal("0")
-    min_qty = rules.get('min_qty', Decimal('0.01'))
-    step = rules.get('step_size', Decimal('0.01'))
-    safe_size = max(req_size, min_qty, step)
-
-    buffer_pct = Decimal(os.getenv('WORST_PRICE_BUFFER_PCT', '0.003'))  # 0.3% default
-
-    def _apply(p: Decimal) -> Decimal:
-        if not apply_buffer:
-            return p
-        if p <= 0:
-            return p
-        if side_u == 'BUY':
-            return p * (Decimal('1') + buffer_pct)
-        else:
-            return p * (Decimal('1') - buffer_pct)
-
-    last_err = None
+    side_u = str(side).upper().strip()
 
     # 1) Public ticker
     try:
         p0 = _public_ticker_v3(sym)
         if p0 and p0 > 0:
-            return str(_snap_price(sym, _apply(p0)))
-    except Exception as e:
-        last_err = e
+            return str(_snap_price(sym, p0))
+    except Exception:
+        pass
 
-    # 2) Signed worst price methods (SDK)
-    try:
-        client = get_client()
-        for fn_name in ('get_worst_price_v3', 'getWorstPriceV3', 'get_worst_price'):
-            fn = getattr(client, fn_name, None)
-            if not callable(fn):
-                continue
-            try:
-                resp = _safe_call(fn, symbol=sym, side=side_u, size=str(safe_size))
-                data = resp.get('data') if isinstance(resp, dict) else None
-                raw = None
-                if isinstance(data, dict):
-                    for k in ('worstPrice', 'worst_price', 'price', 'worst_price_in_usd'):
-                        if k in data and data[k] not in (None, ''):
-                            raw = data[k]
-                            break
-                if raw is None and isinstance(resp, dict):
-                    # sometimes the payload is flattened
-                    for k in ('worstPrice', 'worst_price', 'price'):
-                        if k in resp and resp[k] not in (None, ''):
-                            raw = resp[k]
-                            break
-                if raw is not None:
-                    p1 = Decimal(str(raw))
-                    if p1 > 0:
-                        return str(_snap_price(sym, _apply(p1)))
-                # If it's an error envelope, keep msg/code for debugging
-                if isinstance(resp, dict) and set(resp.keys()) >= {'code', 'msg'}:
-                    last_err = RuntimeError(f"{fn_name} error code={resp.get('code')} msg={resp.get('msg')}")
-            except Exception as e:
-                last_err = e
-    except Exception as e:
-        last_err = e
+    client = get_client()
 
-    # 3) Public get-worst-price
-    try:
-        p2 = _public_worst_price_v1(sym, side_u, safe_size)
-        if p2 and p2 > 0:
-            return str(_snap_price(sym, _apply(p2)))
-    except Exception as e:
-        last_err = e
-
-    # 4) Position fallback (optional)
-    if include_position_fallback:
+    # 2) Signed worst price
+    methods = [
+        'get_worst_price_v3',
+        'getWorstPriceV3',
+        'get_worst_price',
+        'getWorstPrice',
+        'worst_price_v3',
+    ]
+    last_err = None
+    for name in methods:
+        if not hasattr(client, name):
+            continue
+        fn = getattr(client, name)
         try:
-            pos = get_open_position_for_symbol(sym)
-            if pos:
-                ep = pos.get('entry_price')
-                if ep:
-                    p3 = Decimal(str(ep))
-                    if p3 > 0:
-                        return str(_snap_price(sym, _apply(p3)))
+            res = _safe_call(fn, symbol=sym, side=side_u, size=str(size))
+            data = res.get('data') if isinstance(res, dict) and res.get('data') is not None else res
+
+            if isinstance(data, dict):
+                for k in ('worstPrice', 'worst_price', 'price'):
+                    v = data.get(k)
+                    if v is None:
+                        continue
+                    dv = Decimal(str(v))
+                    if dv > 0:
+                        return str(_snap_price(sym, dv))
+                if 'msg' in data:
+                    last_err = RuntimeError(f"{name}: {data.get('code')} {data.get('msg')}")
+                    continue
+
+            if data is not None and not isinstance(data, (dict, list)):
+                dv = Decimal(str(data))
+                if dv > 0:
+                    return str(_snap_price(sym, dv))
+
         except Exception as e:
             last_err = e
 
-    raise RuntimeError(f"Cannot fetch reference price for {sym} (last_err={last_err})")
+    # 3) Position-derived fallback
+    try:
+        pos = get_open_position_for_symbol(sym)
+        mp = None
+        if isinstance(pos, dict):
+            mp = pos.get('markPrice') or pos.get('oraclePrice') or pos.get('indexPrice')
+        if mp is not None:
+            dv = Decimal(str(mp))
+            if dv > 0:
+                return str(_snap_price(sym, dv))
+    except Exception:
+        pass
+
+    if last_err:
+        print(f"[apex_client] get_market_price fallback used (last_err={last_err})")
+    return '0'
+
+
+# -----------------------------------------------------------------------------
+# Order placement
+# -----------------------------------------------------------------------------
+
+
+def _random_client_id() -> str:
+    return str(int(float(str(random.random())[2:])))
+
 
 def create_market_order(
     symbol: str,
@@ -427,179 +408,6 @@ def create_market_order(
         "worst_price": str(worst_price),
     }
 
-
-
-
-# -----------------------------------------------------------------------------
-# Exchange-native trigger orders (Stop-Market / Trigger-Market)
-# -----------------------------------------------------------------------------
-
-def create_trigger_order(
-    symbol: str,
-    side: str,
-    size: str,
-    trigger_price: str,
-    reduce_only: bool = True,
-    client_id: str | None = None,
-    trigger_type: str = "STOP_MARKET",
-):
-    """Place an exchange-native trigger order.
-
-    Notes:
-    - ApeX Omni SDK method names vary by version. This wrapper probes multiple candidates.
-    - We *only* use a method if it supports trigger/stop price parameters; otherwise we fail closed.
-    """
-    client = get_client()
-    sym = str(symbol).upper().strip()
-    side_u = str(side).upper().strip()
-
-    qty = _snap_quantity(sym, Decimal(str(size)))
-    if qty <= 0:
-        raise ValueError(f"invalid trigger qty: {size}")
-
-    tp = _snap_price(sym, Decimal(str(trigger_price)))
-    if tp <= 0:
-        raise ValueError(f"invalid trigger price: {trigger_price}")
-
-    cid = client_id or _random_client_id()
-
-    # Common kw variants across SDK versions.
-    kw_variants = [
-        {
-            "symbol": sym,
-            "side": side_u,
-            "type": trigger_type,
-            "size": str(qty),
-            "reduceOnly": bool(reduce_only),
-            "clientOrderId": cid,
-            "triggerPrice": str(tp),
-        },
-        {
-            "symbol": sym,
-            "side": side_u,
-            "type": trigger_type,
-            "size": str(qty),
-            "reduceOnly": bool(reduce_only),
-            "clientOrderId": cid,
-            "stopPrice": str(tp),
-        },
-        {
-            "symbol": sym,
-            "side": side_u,
-            "type": trigger_type,
-            "size": str(qty),
-            "reduceOnly": bool(reduce_only),
-            "clientOrderId": cid,
-            "trigger_price": str(tp),
-        },
-        {
-            "symbol": sym,
-            "side": side_u,
-            "type": trigger_type,
-            "size": str(qty),
-            "reduce_only": bool(reduce_only),
-            "client_id": cid,
-            "trigger_price": str(tp),
-        },
-    ]
-
-    # Candidate method names (we will probe in order).
-    method_names = [
-        "create_trigger_order_v3",
-        "create_stop_order_v3",
-        "create_conditional_order_v3",
-        "createTriggerOrderV3",
-        "createStopOrderV3",
-        "createConditionalOrderV3",
-        "create_order_v3",  # only if signature includes trigger fields
-    ]
-
-    last_err = None
-    for m in method_names:
-        fn = getattr(client, m, None)
-        if not callable(fn):
-            continue
-
-        # Fail-closed for create_order_v3 if it doesn't accept any trigger fields.
-        if m == "create_order_v3":
-            try:
-                sig = inspect.signature(fn)
-                params = set(sig.parameters.keys())
-                if not ({"triggerPrice", "stopPrice", "trigger_price", "stop_price"} & params):
-                    continue
-            except Exception:
-                continue
-
-        for kw in kw_variants:
-            try:
-                res = _safe_call(fn, **kw)
-                # Normalize orderId
-                data = (res or {}).get("data") if isinstance(res, dict) else None
-                oid = None
-                if isinstance(res, dict):
-                    oid = res.get("order_id") or (data.get("orderId") if isinstance(data, dict) else None)
-                if not oid and isinstance(data, dict):
-                    oid = data.get("id")
-                if not oid:
-                    # Some SDKs return orderId directly
-                    if isinstance(res, str) and res:
-                        oid = res
-                if oid:
-                    _remember_client_id(str(oid), cid)
-                    return {
-                        "order_id": str(oid),
-                        "client_order_id": cid,
-                        "raw": res,
-                    }
-                # If no order_id, treat as failure.
-                last_err = RuntimeError(f"no order id in response for {m}")
-            except Exception as e:
-                last_err = e
-                continue
-
-    raise RuntimeError(f"trigger order not supported / failed: {last_err}")
-
-
-def cancel_order(order_id: str | None = None, client_order_id: str | None = None, symbol: str | None = None):
-    """Cancel an order by order_id or client_order_id."""
-    client = get_client()
-    oid = str(order_id).strip() if order_id else None
-    cid = str(client_order_id).strip() if client_order_id else None
-    sym = str(symbol).upper().strip() if symbol else None
-
-    method_names = [
-        "cancel_order_v3",
-        "cancelOrderV3",
-        "cancel_order",
-        "cancelOrder",
-        "cancel_order_by_client_id_v3",
-        "cancelOrderByClientIdV3",
-    ]
-
-    last_err = None
-    for m in method_names:
-        fn = getattr(client, m, None)
-        if not callable(fn):
-            continue
-        try:
-            # Try by order id first.
-            if oid:
-                try:
-                    return _safe_call(fn, orderId=oid, symbol=sym)
-                except Exception:
-                    return _safe_call(fn, order_id=oid, symbol=sym)
-
-            if cid:
-                try:
-                    return _safe_call(fn, clientOrderId=cid, symbol=sym)
-                except Exception:
-                    return _safe_call(fn, client_order_id=cid, symbol=sym)
-
-        except Exception as e:
-            last_err = e
-            continue
-
-    raise RuntimeError(f"cancel order failed / unsupported: {last_err}")
 
 # -----------------------------------------------------------------------------
 # Positions
