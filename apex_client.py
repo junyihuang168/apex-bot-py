@@ -104,14 +104,28 @@ def _get_api_credentials() -> Dict[str, str]:
 
 
 def _safe_call(fn, **kwargs):
-    """Call SDK function with only supported kwargs (cross-version compatible)."""
+    """
+    Call an SDK function in a cross-version compatible way.
+
+    - If we can introspect the signature and the function does NOT accept **kwargs,
+      we only pass parameters that exist in the signature.
+    - If the function accepts **kwargs (VAR_KEYWORD), we pass all non-None kwargs.
+    - We do NOT "fallback" to passing all kwargs after a failure, because that
+      re-introduces unsupported parameter names and causes TypeError loops.
+    """
+    call_kwargs = {k: v for k, v in kwargs.items() if v is not None}
     try:
         sig = inspect.signature(fn)
-        allowed = set(sig.parameters.keys())
-        call_kwargs = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
+        params = sig.parameters
+        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        if has_var_kw:
+            return fn(**call_kwargs)
+        allowed = set(params.keys())
+        filtered = {k: v for k, v in call_kwargs.items() if k in allowed}
+        return fn(**filtered)
+    except (ValueError, TypeError):
+        # Signature not available (C-extensions / dynamic wrappers): best effort
         return fn(**call_kwargs)
-    except Exception:
-        return fn(**{k: v for k, v in kwargs.items() if v is not None})
 
 
 def _install_compat_shims(client: HttpPrivateSign) -> None:
@@ -296,6 +310,72 @@ def _random_client_id() -> str:
     return str(int(float(str(random.random())[2:])))
 
 
+
+def _create_order_v3_compat(client: HttpPrivateSign, *, symbol: str, side: str, order_type: str,
+                           size: str, price: str, reduce_only: bool, client_id: Optional[str]) -> Dict[str, Any]:
+    """
+    SDK parameter names differ across apexomni versions.
+    Try a small matrix of common parameter aliases and return the first successful response.
+    """
+    base = {
+        "symbol": symbol,
+        "side": side,
+    }
+
+    type_variants = [
+        {"type": order_type},
+        {"orderType": order_type},
+    ]
+    size_variants = [
+        {"size": size},
+        {"qty": size},
+    ]
+    price_variants = [
+        {"price": price},
+        {"limitPrice": price},
+    ]
+    reduce_variants = [
+        {"reduceOnly": bool(reduce_only)},
+        {"reduce_only": bool(reduce_only)},
+    ]
+    client_variants = []
+    if client_id:
+        client_variants = [
+            {"clientId": str(client_id)},
+            {"clientOrderId": str(client_id)},
+            {"client_id": str(client_id)},
+        ]
+    else:
+        client_variants = [{}]
+
+    last_exc = None
+    for t in type_variants:
+        for s in size_variants:
+            for p in price_variants:
+                for r in reduce_variants:
+                    for c in client_variants:
+                        payload = {}
+                        payload.update(base)
+                        payload.update(t)
+                        payload.update(s)
+                        payload.update(p)
+                        payload.update(r)
+                        payload.update(c)
+                        try:
+                            return _safe_call(getattr(client, "create_order_v3"), **payload)
+                        except TypeError as e:
+                            # Most common: unexpected keyword argument
+                            last_exc = e
+                            continue
+                        except Exception as e:
+                            last_exc = e
+                            continue
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("create_order_v3 failed with all compatible parameter variants")
+
+
 def create_market_order(
     symbol: str,
     side: str,
@@ -313,15 +393,15 @@ def create_market_order(
 
     client_id = client_id or _random_client_id()
 
-    res = _safe_call(
-        getattr(client, "create_order_v3"),
+    res = _create_order_v3_compat(
+        client,
         symbol=sym,
         side=side_u,
-        type="MARKET",
+        order_type="MARKET",
         size=qty,
         price=str(worst_price),
-        reduceOnly=bool(reduce_only),
-        clientOrderId=str(client_id),
+        reduce_only=bool(reduce_only),
+        client_id=str(client_id) if client_id else None,
     )
 
     order_id = None
