@@ -15,9 +15,6 @@ from apex_client import (
     _snap_quantity,
     start_private_ws,
     start_order_rest_poller,
-    create_trigger_order,
-    cancel_order,
-    pop_fill_event,
 )
 
 from pnl_store import (
@@ -33,11 +30,6 @@ from pnl_store import (
     clear_lock_level_pct,
     is_signal_processed,
     mark_signal_processed,
-    # exchange-native protective orders
-    set_protective_orders,
-    get_protective_orders,
-    clear_protective_orders,
-    get_protective_owner_by_order_id,
 )
 
 app = Flask(__name__)
@@ -56,10 +48,7 @@ REMOTE_FALLBACK_SYMBOLS = {
     s.strip().upper() for s in os.getenv("REMOTE_FALLBACK_SYMBOLS", "").split(",") if s.strip()
 }
 
-# ✅ 说明：
-# - 机器人后台仍会执行 bot-side 风控（Ladder Trail / stop）并用市价 reduceOnly 平仓
-# - 同时可选：在交易所挂 exchange-native Stop-Market / Trigger-Market（硬止损兜底）
-# - “真实 fills” 用于：记账、移动止损锚定价、以及 exchange-native stop 的触发价计算
+# ✅ 说明：本版本不在交易所挂真实 TP/SL 单；仅使用真实 fills 进行记账，并由机器人在后台按规则触发平仓。
 
 # 本地 cache（仅辅助）
 BOT_POSITIONS: Dict[Tuple[str, str], dict] = {}
@@ -140,21 +129,6 @@ def _to_decimal(x: Any, default: Decimal = Decimal("0")) -> Decimal:
 
 _ALLOWED_LONG_TPSL = {f"BOT_{i}" for i in range(1, 6)}
 _ALLOWED_SHORT_TPSL = {f"BOT_{i}" for i in range(11, 16)}
-
-# Exchange-native stops apply to BOTH long/short for these bots.
-PROTECTIVE_BOTS = _ALLOWED_LONG_TPSL | _ALLOWED_SHORT_TPSL
-
-# Enable/disable exchange-native Stop-Market (hard stop) placement.
-ENABLE_EXCHANGE_NATIVE_STOP = str(os.getenv("ENABLE_EXCHANGE_NATIVE_STOP", "1")).strip() == "1"
-
-# If webhook doesn't provide sl_percent, fall back to this percent.
-# (Avoid referencing LADDER_BASE_SL_PCT before it is defined.)
-EXCHANGE_SL_DEFAULT_PCT = Decimal(
-    os.getenv("EXCHANGE_SL_DEFAULT_PCT", os.getenv("LADDER_BASE_SL_PCT", "0.5"))
-)
-
-# Trigger price type is SDK-dependent. Leave empty to use exchange default.
-TRIGGER_PRICE_TYPE = os.getenv("TRIGGER_PRICE_TYPE", "").strip() or None
 
 # “TPSL bots” here means: bots that are allowed to have bot-side SL/TP logic enabled.
 # (In this repo, the only bot-side SL/TP is the ladder stop loop below.)
@@ -315,7 +289,23 @@ def _compute_entry_qty(symbol: str, side: str, budget: Decimal) -> Decimal:
     rules = _get_symbol_rules(symbol)
     min_qty = rules["min_qty"]
 
-    ref_price_dec = Decimal(get_market_price(symbol, side, str(min_qty)))
+    # Reference price is only used for sizing (qty = budget / ref_price).
+    # It may come from worstPrice / markPrice / other SDK variants. Must be numeric.
+    raw_ref = get_market_price(symbol, side, str(min_qty))
+    ref_price_dec = _to_decimal(raw_ref, default=Decimal("0"))
+
+    # Last-resort env fallback (so webhook won't 500 if public quote glitches).
+    # You can set DEFAULT_REF_PRICE=100 to temporarily unblock sizing.
+    if ref_price_dec <= 0:
+        env_ref = os.getenv("DEFAULT_REF_PRICE", "").strip()
+        if env_ref:
+            ref_price_dec = _to_decimal(env_ref, default=Decimal("0"))
+
+    if ref_price_dec <= 0:
+        raise ValueError(
+            f"invalid reference price for qty compute: symbol={symbol} side={side} ref={raw_ref!r}"
+        )
+
     theoretical_qty = budget / ref_price_dec
     snapped_qty = _snap_quantity(symbol, theoretical_qty)
 
@@ -359,127 +349,8 @@ def _get_signal_id(body: dict, mode: str, bot_id: str, symbol: str) -> str:
 
 
 # ----------------------------
-# ✅ 交易所 Stop-Market / Trigger-Market（硬止损）
+# ✅ 交易所 TP/SL（固定百分比）下单
 # ----------------------------
-
-
-def _bot_can_use_exchange_stop(bot_id: str) -> bool:
-    b = _canon_bot_id(bot_id)
-    return ENABLE_EXCHANGE_NATIVE_STOP and b in PROTECTIVE_BOTS
-
-
-def _mk_protective_client_id(bot_id: str, suffix: str) -> str:
-    """Deterministic numeric clientId used by exchange-native protective orders.
-
-    suffix:
-      - 91: stop-loss
-      - 92: take-profit (reserved)
-    """
-    bnum = _bot_num(bot_id)
-    ts_now = int(time.time())
-    return f"{bnum:03d}{ts_now}{suffix}"
-
-
-def _cancel_exchange_protective(bot_id: str, symbol: str, direction: str):
-    try:
-        prot = get_protective_orders(bot_id, symbol, direction)
-    except Exception:
-        prot = None
-    if not prot:
-        return
-
-    sl_order_id = prot.get("sl_order_id")
-    if sl_order_id:
-        try:
-            cancel_order(str(sl_order_id))
-        except Exception:
-            pass
-
-    try:
-        clear_protective_orders(bot_id, symbol, direction)
-    except Exception:
-        pass
-
-
-def _place_exchange_stop_market(
-    bot_id: str,
-    symbol: str,
-    direction: str,
-    qty: Decimal,
-    entry_price: Decimal,
-    sl_percent: Optional[Decimal] = None,
-) -> Optional[dict]:
-    """Place exchange-native hard stop (Stop-Market/Trigger-Market).
-
-    This is a *backup* stop; the primary exit logic can still be bot-side ladder.
-    Trigger price is computed from **real entry fills**.
-    """
-    if qty <= 0 or entry_price <= 0:
-        return None
-    if not _bot_can_use_exchange_stop(bot_id):
-        return None
-
-    b = _canon_bot_id(bot_id)
-    sym = str(symbol).upper().strip()
-    d = str(direction).upper().strip()
-
-    sl_pct = sl_percent if sl_percent is not None else EXCHANGE_SL_DEFAULT_PCT
-    try:
-        sl_pct = Decimal(str(sl_pct))
-    except Exception:
-        sl_pct = EXCHANGE_SL_DEFAULT_PCT
-
-    # Cancel any previous protective orders first
-    _cancel_exchange_protective(b, sym, d)
-
-    exit_side = "SELL" if d == "LONG" else "BUY"
-
-    # LONG stop below; SHORT stop above
-    if d == "LONG":
-        trigger_price = entry_price * (Decimal("1") - (sl_pct / Decimal("100")))
-    else:
-        trigger_price = entry_price * (Decimal("1") + (sl_pct / Decimal("100")))
-
-    client_id = _mk_protective_client_id(b, "91")
-
-    # Try STOP_MARKET first; fallback to TRIGGER_MARKET for older gateways.
-    last_err = None
-    for typ in ("STOP_MARKET", "TRIGGER_MARKET"):
-        try:
-            res = create_trigger_order(
-                symbol=sym,
-                side=exit_side,
-                order_type=typ,
-                size=str(qty),
-                trigger_price=str(trigger_price),
-                reduce_only=True,
-                client_id=client_id,
-                trigger_price_type=TRIGGER_PRICE_TYPE,
-            )
-            sl_order_id = res.get("order_id")
-            sl_client_id = res.get("client_order_id") or client_id
-            if sl_order_id:
-                try:
-                    set_protective_orders(
-                        bot_id=b,
-                        symbol=sym,
-                        direction=d,
-                        sl_order_id=str(sl_order_id),
-                        tp_order_id=None,
-                        sl_client_id=str(sl_client_id),
-                        tp_client_id=None,
-                        sl_price=str(trigger_price),
-                        tp_price=None,
-                    )
-                except Exception:
-                    pass
-            return res
-        except Exception as e:
-            last_err = e
-            continue
-
-    print(f"[PROTECTIVE] create stop failed bot={b} {d} {sym}: {last_err}")
-    return None
 
 
 # ----------------------------
@@ -585,12 +456,6 @@ def _ladder_close_position(bot_id: str, symbol: str, direction: str, qty: Decima
     except Exception as e:
         print("[LADDER] record_exit_fifo error:", e)
 
-    # If we used exchange-native protective stop, cancel it after a successful bot-side exit.
-    try:
-        _cancel_exchange_protective(bot_id, symbol, direction)
-    except Exception:
-        pass
-
     try:
         opens2 = get_bot_open_positions(bot_id)
         rem = opens2.get((symbol, direction), {}).get("qty", Decimal("0"))
@@ -674,116 +539,6 @@ def _ensure_risk_thread():
         _RISK_THREAD_STARTED = True
         print("[LADDER] risk thread created")
 
-
-# ----------------------------
-# ✅ WS Fill consumer: record exchange-native protective stop fills
-# ----------------------------
-_FILL_CONSUMER_STARTED = False
-_FILL_CONSUMER_LOCK = threading.Lock()
-
-
-def _fill_event_key(ev: dict) -> str:
-    # Best-effort de-dup key (WS may deliver duplicates across reconnects)
-    oid = str(ev.get("order_id") or "")
-    sym = str(ev.get("symbol") or "")
-    px = str(ev.get("fill_price") or "")
-    q = str(ev.get("fill_qty") or "")
-    t = str(ev.get("ts") or ev.get("created_at") or "")
-    return f"{oid}|{sym}|{px}|{q}|{t}"
-
-
-def _fills_consumer_loop():
-    print("[SYSTEM] fill consumer loop started")
-    seen: Set[str] = set()
-    while True:
-        try:
-            ev = pop_fill_event(timeout=1.0)
-            if not ev:
-                continue
-            k = _fill_event_key(ev)
-            if k in seen:
-                continue
-            # prune occasionally
-            if len(seen) > 5000:
-                seen.clear()
-            seen.add(k)
-
-            order_id = str(ev.get("order_id") or "")
-            if not order_id:
-                continue
-
-            owner = None
-            try:
-                owner = get_protective_owner_by_order_id(order_id)
-            except Exception:
-                owner = None
-
-            if not owner:
-                continue
-
-            bot_id = owner.get("bot_id")
-            symbol = owner.get("symbol")
-            direction = owner.get("direction")
-            if not bot_id or not symbol or not direction:
-                continue
-
-            # Only handle stop-loss here
-            if order_id != str(owner.get("sl_order_id") or ""):
-                continue
-
-            try:
-                exit_price = Decimal(str(ev.get("fill_price")))
-                exit_qty = Decimal(str(ev.get("fill_qty")))
-            except Exception:
-                continue
-            if exit_price <= 0 or exit_qty <= 0:
-                continue
-
-            entry_side = "BUY" if str(direction).upper() == "LONG" else "SELL"
-
-            try:
-                record_exit_fifo(
-                    bot_id=bot_id,
-                    symbol=str(symbol).upper(),
-                    entry_side=entry_side,
-                    exit_qty=exit_qty,
-                    exit_price=exit_price,
-                    reason="exchange_stop",
-                )
-            except Exception as e:
-                print(f"[PROTECTIVE] record_exit_fifo failed: {e}")
-                continue
-
-            # Clear protective metadata (order is done) and clear lock if flat
-            try:
-                clear_protective_orders(bot_id, str(symbol).upper(), str(direction).upper())
-            except Exception:
-                pass
-
-            try:
-                opens2 = get_bot_open_positions(bot_id)
-                rem = opens2.get((str(symbol).upper(), str(direction).upper()), {}).get("qty", Decimal("0"))
-                if rem <= 0:
-                    clear_lock_level_pct(bot_id, str(symbol).upper(), str(direction).upper())
-            except Exception:
-                pass
-
-            print(f"[PROTECTIVE] exchange stop filled: bot={bot_id} {direction} {symbol} qty={exit_qty} price={exit_price}")
-
-        except Exception:
-            pass
-
-
-def _ensure_fill_consumer_thread():
-    global _FILL_CONSUMER_STARTED
-    with _FILL_CONSUMER_LOCK:
-        if _FILL_CONSUMER_STARTED:
-            return
-        t = threading.Thread(target=_fills_consumer_loop, daemon=True, name="apex-fill-consumer")
-        t.start()
-        _FILL_CONSUMER_STARTED = True
-        print("[SYSTEM] fill consumer thread created")
-
 def _ensure_monitor_thread():
     """
     ✅ 关键：只在 ENABLE_WS=1 的进程里启动 WS + orders 线程
@@ -797,20 +552,18 @@ def _ensure_monitor_thread():
 
         init_db()
 
-        # REST order poller is useful in BOTH processes:
-        # - web: helps fill/avgPrice resolution even without WS
-        # - worker: backup path if WS drops
-        if str(os.getenv("ENABLE_REST_POLL", "1")).strip() == "1":
-            try:
-                start_order_rest_poller(poll_interval=float(os.getenv("REST_ORDER_POLL_INTERVAL", "5.0")))
-                print("[SYSTEM] REST order poller enabled (backup path)")
-            except Exception as e:
-                print("[SYSTEM] REST order poller failed to start:", e)
-
         if ENABLE_WS:
             start_private_ws()
             _ensure_risk_thread()
-            _ensure_fill_consumer_thread()
+
+            # ✅ Backup path: REST poll orders every N seconds (main path still WS)
+            if str(os.getenv("ENABLE_REST_POLL", "1")).strip() == "1":
+                try:
+                    start_order_rest_poller(poll_interval=float(os.getenv("REST_ORDER_POLL_INTERVAL", "5.0")))
+                    print("[SYSTEM] REST order poller enabled (backup path)")
+                except Exception as e:
+                    print("[SYSTEM] REST order poller failed to start:", e)
+
             print("[SYSTEM] WS enabled in this process (ENABLE_WS=1)")
         else:
             print("[SYSTEM] WS disabled in this process (ENABLE_WS=0)")
@@ -1437,27 +1190,8 @@ def tv_webhook():
             except Exception as e:
                 print("[PNL] record_entry error:", e)
 
+        # Ladder SL/lock state (bot-side only; no exchange protective orders)
         direction = "LONG" if side_raw == "BUY" else "SHORT"
-
-        # Exchange-native hard stop (Stop-Market / Trigger-Market) — bots: BOT1–5 & BOT11–15
-        # Uses **real fills** as anchor.
-        if use_sl and entry_price_dec is not None and final_qty > 0 and _bot_can_use_exchange_stop(bot_id):
-            try:
-                sl_pct_in = body.get("sl_percent")
-                sl_pct_dec = Decimal(str(sl_pct_in)) if sl_pct_in is not None else None
-            except Exception:
-                sl_pct_dec = None
-
-            _place_exchange_stop_market(
-                bot_id=bot_id,
-                symbol=symbol,
-                direction=direction,
-                qty=final_qty,
-                entry_price=entry_price_dec,
-                sl_percent=sl_pct_dec,
-            )
-
-        # Ladder SL/lock state (bot-side)
         if _bot_uses_ladder(bot_id, direction) and entry_price_dec is not None and final_qty > 0:
             try:
                 set_lock_level_pct(bot_id, symbol, direction, -LADDER_BASE_SL_PCT)
@@ -1591,12 +1325,6 @@ def tv_webhook():
             )
         except Exception as e:
             print("[PNL] record_exit_fifo error (strategy):", e)
-
-        # Cancel any exchange-native protective stop after a manual/TV exit.
-        try:
-            _cancel_exchange_protective(bot_id, symbol, direction_to_close)
-        except Exception:
-            pass
 
         try:
             clear_lock_level_pct(bot_id, symbol, direction_to_close)
