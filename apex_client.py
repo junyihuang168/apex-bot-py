@@ -200,8 +200,26 @@ def _snap_price(symbol: str, price: Decimal) -> Decimal:
 
 
 def get_market_price(symbol: str, side: str, size: NumberLike) -> str:
-    """Return worstPrice quote (string) for MARKET signature."""
+    """Return a numeric reference price for MARKET signature / sizing.
+
+    NOTE:
+    - This is ONLY used as a reference price to compute qty (budget / ref_price) and/or satisfy
+      SDK parameters for MARKET orders.
+    - It must NOT be used as the "real fill" price for PnL / stops. Those come from fills.
+    """
     client = get_client()
+
+    def _coerce_price(v) -> Optional[Decimal]:
+        if v is None:
+            return None
+        try:
+            d = Decimal(str(v))
+        except Exception:
+            return None
+        if d <= 0:
+            return None
+        return d
+
     methods = [
         "get_worst_price",
         "get_worst_price_v3",
@@ -209,6 +227,7 @@ def get_market_price(symbol: str, side: str, size: NumberLike) -> str:
         "getWorstPriceV3",
         "worst_price_v3",
     ]
+
     last_err = None
     for name in methods:
         if not hasattr(client, name):
@@ -216,48 +235,64 @@ def get_market_price(symbol: str, side: str, size: NumberLike) -> str:
         fn = getattr(client, name)
         try:
             res = _safe_call(fn, symbol=str(symbol).upper(), side=str(side).upper(), size=str(size))
+
+            # Common SDK shapes:
+            # 1) {"data": {"worstPrice": "..."}}
+            # 2) {"worstPrice": "..."}  (rare)
+            # 3) {"data": [...]}        (rare)
             if isinstance(res, dict):
                 data = res.get("data") if res.get("data") is not None else res
-                for k in ("worstPrice", "price", "worst_price"):
-                    v = data.get(k) if isinstance(data, dict) else None
-                    if v is not None:
-                        return str(v)
-            if res is not None:
-                return str(res)
+                candidates = []
+
+                if isinstance(data, dict):
+                    for k in ("worstPrice", "worst_price", "price"):
+                        if k in data:
+                            candidates.append(data.get(k))
+                elif isinstance(data, list):
+                    # try first element dict
+                    if data and isinstance(data[0], dict):
+                        for k in ("worstPrice", "worst_price", "price"):
+                            if k in data[0]:
+                                candidates.append(data[0].get(k))
+
+                # Also check top-level keys if present
+                for k in ("worstPrice", "worst_price", "price"):
+                    if k in res:
+                        candidates.append(res.get(k))
+
+                for c in candidates:
+                    d = _coerce_price(c)
+                    if d is not None:
+                        return str(d)
+
+                # If dict response but no numeric price found, treat as failure and try next method.
+                last_err = ValueError(f"no numeric price in response for {name}: {list(res.keys())}")
+                continue
+
+            # Non-dict response: validate it is numeric
+            d = _coerce_price(res)
+            if d is not None:
+                return str(d)
+
+            last_err = ValueError(f"non-numeric response for {name}: {res!r}")
+
         except Exception as e:
             last_err = e
 
-    # Fallback: call omni public endpoint directly (some SDK builds intermittently fail).
+    # Fallback: try mark/oracle/index price from positions.
     try:
-        base, _ = _get_base_and_network()
-        import requests  # local import to keep dependency surface minimal
-
-        url = f"{base}/api/v1/get-worst-price"
-        params = {
-            "symbol": str(symbol).upper().strip(),
-            "side": str(side).upper().strip(),
-            "size": str(size),
-        }
-        r = requests.get(url, params=params, timeout=5)
-        if r.status_code == 200:
-            try:
-                js = r.json()
-                data = js.get("data") if isinstance(js, dict) else None
-                if isinstance(data, dict):
-                    wp = data.get("worstPrice") or data.get("price")
-                    if wp is not None:
-                        return str(wp)
-                if isinstance(js, dict):
-                    wp = js.get("worstPrice") or js.get("price")
-                    if wp is not None:
-                        return str(wp)
-            except Exception:
-                # Non-JSON responses (HTML/ErrCode pages) happen; ignore.
-                pass
+        pos = get_open_position_for_symbol(symbol)
+        if isinstance(pos, dict):
+            mp = pos.get("markPrice") or pos.get("oraclePrice") or pos.get("indexPrice")
+            d = _coerce_price(mp)
+            if d is not None:
+                return str(d)
     except Exception:
         pass
 
-    # Fallback: try mark price from positions; last resort return "0".
+    if last_err:
+        print(f"[apex_client] get_market_price fallback used (last_err={last_err})")
+    return "0".
     try:
         pos = get_open_position_for_symbol(symbol)
         mp = None
@@ -335,127 +370,6 @@ def create_market_order(
         "size": qty,
         "worst_price": str(worst_price),
     }
-
-
-def create_trigger_order(
-    symbol: str,
-    side: str,
-    order_type: str,  # STOP_MARKET / TRIGGER_MARKET / TAKE_PROFIT_MARKET / STOP_LIMIT / TAKE_PROFIT_LIMIT
-    size: NumberLike,
-    trigger_price: NumberLike,
-    price: Optional[NumberLike] = None,
-    reduce_only: bool = True,
-    client_id: Optional[str] = None,
-    expiration_sec: Optional[int] = None,
-    trigger_price_type: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Create an exchange-native trigger stop.
-
-    Notes:
-    - Apex gateway/SDK variants differ slightly; this function tries to be conservative.
-    - Even for *_MARKET, some gateways still require a bounded `price`.
-    """
-    client = get_client()
-    sym = str(symbol).upper().strip()
-    side_u = str(side).upper().strip()
-    typ = str(order_type).upper().strip()
-
-    ts = int(time.time())
-    client_id = client_id or _random_client_id()
-
-    qty = str(size)
-
-    # Snap trigger price to tick size
-    try:
-        trig_dec = _snap_price(sym, Decimal(str(trigger_price)))
-        trigger_str = str(trig_dec)
-    except Exception:
-        trigger_str = str(trigger_price)
-
-    # Some builds validate scale of `price` even for market-trigger orders.
-    if price is None:
-        try:
-            price = get_market_price(sym, side_u, qty)
-        except Exception:
-            price = trigger_str
-
-    try:
-        price_dec = _snap_price(sym, Decimal(str(price)))
-        price_str = str(price_dec)
-    except Exception:
-        price_str = str(price)
-
-    params: Dict[str, Any] = {
-        "symbol": sym,
-        "side": side_u,
-        "type": typ,
-        "size": qty,
-        "price": price_str,
-        "triggerPrice": trigger_str,
-        "reduceOnly": bool(reduce_only),
-        # SDK variants accept either clientOrderId or clientId
-        "clientOrderId": str(client_id),
-    }
-
-    # Some variants use `clientId`
-    if "clientOrderId" not in inspect.signature(getattr(client, "create_order_v3")).parameters:
-        params.pop("clientOrderId", None)
-        params["clientId"] = str(client_id)
-
-    if expiration_sec is not None:
-        params["expiration"] = int(expiration_sec)
-    if trigger_price_type is not None:
-        params["triggerPriceType"] = str(trigger_price_type).upper()
-
-    res = _safe_call(getattr(client, "create_order_v3"), **params)
-
-    order_id = None
-    client_order_id = None
-    if isinstance(res, dict):
-        data = res.get("data") if isinstance(res.get("data"), dict) else res
-        order_id = data.get("orderId") or data.get("id")
-        client_order_id = data.get("clientOrderId") or data.get("clientId") or client_id
-    else:
-        try:
-            order_id = getattr(res, "orderId", None)
-        except Exception:
-            order_id = None
-        client_order_id = client_id
-
-    if order_id:
-        register_order_for_tracking(order_id=str(order_id), client_order_id=str(client_order_id), symbol=sym, expected_qty=qty)
-
-    return {
-        "raw": res,
-        "order_id": str(order_id) if order_id is not None else None,
-        "client_order_id": str(client_order_id) if client_order_id is not None else str(client_id),
-        "symbol": sym,
-        "side": side_u,
-        "size": qty,
-        "trigger_price": trigger_str,
-        "price": price_str,
-        "type": typ,
-    }
-
-
-def cancel_order(order_id: str) -> Dict[str, Any]:
-    client = get_client()
-    if not order_id:
-        return {"ok": False, "error": "missing order_id"}
-    candidates = ["cancel_order_v3", "cancelOrderV3", "cancel_order", "cancelOrder"]
-    last = None
-    for name in candidates:
-        if hasattr(client, name):
-            fn = getattr(client, name)
-            try:
-                return _safe_call(fn, orderId=str(order_id))
-            except Exception as e:
-                last = e
-                try:
-                    return _safe_call(fn, id=str(order_id))
-                except Exception as e2:
-                    last = e2
-    return {"ok": False, "error": f"cancel failed: {last!r}"}
 
 
 # -----------------------------------------------------------------------------
@@ -1054,13 +968,7 @@ def get_fill_summary(
       3) REST fills/trades by orderId (gap fill)
       4) REST order detail (last resort)
     """
-    # In production we typically run TWO processes:
-    # - web: handles webhook (no WS)
-    # - worker: runs WS (fills+orders) + REST poller
-    # Only start WS when ENABLE_WS=1.
-    if _env_bool("ENABLE_WS", False):
-        start_private_ws()
-
+    start_private_ws()
     if _env_bool("ENABLE_REST_POLL", True):
         # Ensure poller is running; it's idempotent.
         try:
