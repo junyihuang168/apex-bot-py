@@ -2,6 +2,7 @@ import os
 import time
 import random
 import inspect
+import re
 import threading
 import queue
 from collections import OrderedDict
@@ -107,25 +108,79 @@ def _safe_call(fn, **kwargs):
     """
     Call an SDK function in a cross-version compatible way.
 
-    - If we can introspect the signature and the function does NOT accept **kwargs,
-      we only pass parameters that exist in the signature.
-    - If the function accepts **kwargs (VAR_KEYWORD), we pass all non-None kwargs.
-    - We do NOT "fallback" to passing all kwargs after a failure, because that
-      re-introduces unsupported parameter names and causes TypeError loops.
+    Strategy:
+    1) Prefer signature-based filtering when available.
+    2) If a call fails with TypeError 'unexpected keyword argument', iteratively drop the
+       offending keyword(s) and retry a few times.
+    3) Some apexomni wrappers expect a single dict argument (e.g., data/payload/params/body),
+       so we try those shapes as a final fallback.
+
+    This is intentionally conservative: we never add new keys, only drop or re-wrap.
     """
     call_kwargs = {k: v for k, v in kwargs.items() if v is not None}
+
+    # ---- Attempt 1: signature-filtered keyword call (best case) ----
     try:
         sig = inspect.signature(fn)
         params = sig.parameters
         has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
         if has_var_kw:
             return fn(**call_kwargs)
+
         allowed = set(params.keys())
         filtered = {k: v for k, v in call_kwargs.items() if k in allowed}
         return fn(**filtered)
     except (ValueError, TypeError):
-        # Signature not available (C-extensions / dynamic wrappers): best effort
-        return fn(**call_kwargs)
+        # Signature not available or dynamic wrapper; continue to best-effort calls.
+        pass
+
+    # ---- Attempt 2: best-effort keyword call + iterative 'unexpected keyword' stripping ----
+    cur = dict(call_kwargs)
+    last_exc: Optional[Exception] = None
+
+    try:
+        return fn(**cur)
+    except TypeError as e:
+        last_exc = e
+        msg = str(e)
+
+        for _ in range(12):
+            m = re.search(r"unexpected keyword argument ['\"]([^'\"]+)['\"]", msg)
+            if not m:
+                break
+            bad = m.group(1)
+            if bad in cur:
+                cur.pop(bad, None)
+            try:
+                return fn(**cur)
+            except TypeError as e2:
+                last_exc = e2
+                msg = str(e2)
+                continue
+            except Exception as e2:
+                last_exc = e2
+                raise
+    except Exception as e:
+        last_exc = e
+
+    # ---- Attempt 3: dict-carrier fallbacks (some SDKs take a single dict) ----
+    for carrier in ("data", "payload", "params", "body", "request"):
+        try:
+            return fn(**{carrier: call_kwargs})
+        except TypeError as e:
+            last_exc = e
+        except Exception as e:
+            last_exc = e
+
+    # ---- Attempt 4: positional dict fallback ----
+    try:
+        return fn(call_kwargs)
+    except Exception as e:
+        last_exc = e
+
+    if last_exc:
+        raise last_exc
+    return fn(**call_kwargs)
 
 
 def _install_compat_shims(client: HttpPrivateSign) -> None:
@@ -325,6 +380,7 @@ def _create_order_v3_compat(client: HttpPrivateSign, *, symbol: str, side: str, 
     type_variants = [
         {"type": order_type},
         {"orderType": order_type},
+        {"order_type": order_type},
     ]
     size_variants = [
         {"size": size},
@@ -333,7 +389,15 @@ def _create_order_v3_compat(client: HttpPrivateSign, *, symbol: str, side: str, 
     price_variants = [
         {"price": price},
         {"limitPrice": price},
+        {"worstPrice": price},
+        {"worst_price": price},
     ]
+    tif_variants = [
+        {"timeInForce": "IOC"},
+        {"time_in_force": "IOC"},
+        {"tif": "IOC"},
+    ]
+
     reduce_variants = [
         {"reduceOnly": bool(reduce_only)},
         {"reduce_only": bool(reduce_only)},
@@ -352,25 +416,27 @@ def _create_order_v3_compat(client: HttpPrivateSign, *, symbol: str, side: str, 
     for t in type_variants:
         for s in size_variants:
             for p in price_variants:
-                for r in reduce_variants:
-                    for c in client_variants:
-                        payload = {}
-                        payload.update(base)
-                        payload.update(t)
-                        payload.update(s)
-                        payload.update(p)
-                        payload.update(r)
-                        payload.update(c)
-                        try:
-                            return _safe_call(getattr(client, "create_order_v3"), **payload)
-                        except TypeError as e:
-                            # Most common: unexpected keyword argument
-                            last_exc = e
-                            continue
-                        except Exception as e:
-                            last_exc = e
-                            continue
-
+                for tif in tif_variants:
+                    for r in reduce_variants:
+                        for c in client_variants:
+                            payload = {}
+                            payload.update(base)
+                            payload.update(t)
+                            payload.update(s)
+                            payload.update(p)
+                            payload.update(tif)
+                            payload.update(r)
+                            payload.update(c)
+                            try:
+                                return _safe_call(getattr(client, "create_order_v3"), **payload)
+                            except TypeError as e:
+                                # Most common: unexpected keyword argument
+                                last_exc = e
+                                continue
+                            except Exception as e:
+                                last_exc = e
+                                continue
+    
     if last_exc:
         raise last_exc
     raise RuntimeError("create_order_v3 failed with all compatible parameter variants")
