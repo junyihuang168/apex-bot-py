@@ -106,82 +106,77 @@ def _get_api_credentials() -> Dict[str, str]:
 
 def _safe_call(fn, **kwargs):
     """
-    Call an SDK function in a cross-version compatible way.
+    SDK 兼容调用封装（跨版本）。
 
-    Strategy:
-    1) Prefer signature-based filtering when available.
-    2) If a call fails with TypeError 'unexpected keyword argument', iteratively drop the
-       offending keyword(s) and retry a few times.
-    3) Some apexomni wrappers expect a single dict argument (e.g., data/payload/params/body),
-       so we try those shapes as a final fallback.
+    你现在的错误：
+      TypeError: ... missing 3 required positional arguments: 'side', 'type', and 'size'
 
-    This is intentionally conservative: we never add new keys, only drop or re-wrap.
+    典型原因是：我们用 inspect.signature 做“按签名过滤参数”时，把某些必填字段误过滤掉了，
+    导致真正调用时缺参。
+
+    解决策略：
+    - 优先尝试“按签名过滤”的调用（对稳定版本友好）
+    - 但如果出现 missing required positional arguments，则立刻回退到“不过滤的原始 kwargs”，
+      然后仅基于 "unexpected keyword argument 'X'" 逐个剔除不支持字段再重试。
     """
     call_kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
-    # ---- Attempt 1: signature-filtered keyword call (best case) ----
+    def _call_with_prune(f, kw):
+        cur = dict(kw)
+        last_exc = None
+        try:
+            return f(**cur)
+        except TypeError as e:
+            last_exc = e
+            msg = str(e)
+
+            # 缺必填参数：剪枝无意义，直接抛给上层做回退策略
+            if "missing" in msg and "required positional argument" in msg:
+                raise
+
+            for _ in range(16):
+                m = re.search(r"unexpected keyword argument ['\"]([^'\"]+)['\"]", msg)
+                if not m:
+                    break
+                bad = m.group(1)
+                cur.pop(bad, None)
+                try:
+                    return f(**cur)
+                except TypeError as e2:
+                    last_exc = e2
+                    msg = str(e2)
+                    if "missing" in msg and "required positional argument" in msg:
+                        raise
+                    continue
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("_safe_call failed")
+
+    # 1) 优先：能 introspect signature 时，先走签名过滤
     try:
         sig = inspect.signature(fn)
         params = sig.parameters
         has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+
         if has_var_kw:
-            return fn(**call_kwargs)
+            # 真正支持 **kwargs：直接调用 + 剪枝未知参数
+            return _call_with_prune(fn, call_kwargs)
 
         allowed = set(params.keys())
         filtered = {k: v for k, v in call_kwargs.items() if k in allowed}
-        return fn(**filtered)
-    except (ValueError, TypeError):
-        # Signature not available or dynamic wrapper; continue to best-effort calls.
-        pass
 
-    # ---- Attempt 2: best-effort keyword call + iterative 'unexpected keyword' stripping ----
-    cur = dict(call_kwargs)
-    last_exc: Optional[Exception] = None
-
-    try:
-        return fn(**cur)
-    except TypeError as e:
-        last_exc = e
-        msg = str(e)
-
-        for _ in range(12):
-            m = re.search(r"unexpected keyword argument ['\"]([^'\"]+)['\"]", msg)
-            if not m:
-                break
-            bad = m.group(1)
-            if bad in cur:
-                cur.pop(bad, None)
-            try:
-                return fn(**cur)
-            except TypeError as e2:
-                last_exc = e2
-                msg = str(e2)
-                continue
-            except Exception as e2:
-                last_exc = e2
-                raise
-    except Exception as e:
-        last_exc = e
-
-    # ---- Attempt 3: dict-carrier fallbacks (some SDKs take a single dict) ----
-    for carrier in ("data", "payload", "params", "body", "request"):
         try:
-            return fn(**{carrier: call_kwargs})
+            return _call_with_prune(fn, filtered)
         except TypeError as e:
-            last_exc = e
-        except Exception as e:
-            last_exc = e
+            msg = str(e)
+            # 关键修复：如果过滤后导致缺参，回退到不过滤版本
+            if "missing" in msg and "required positional argument" in msg:
+                return _call_with_prune(fn, call_kwargs)
+            raise
 
-    # ---- Attempt 4: positional dict fallback ----
-    try:
-        return fn(call_kwargs)
-    except Exception as e:
-        last_exc = e
-
-    if last_exc:
-        raise last_exc
-    return fn(**call_kwargs)
-
+    except (ValueError, TypeError):
+        # signature 不可用：直接调用 + 剪枝未知参数
+        return _call_with_prune(fn, call_kwargs)
 
 def _install_compat_shims(client: HttpPrivateSign) -> None:
     """Add method aliases for SDK naming differences (no behavior changes)."""
@@ -380,7 +375,6 @@ def _create_order_v3_compat(client: HttpPrivateSign, *, symbol: str, side: str, 
     type_variants = [
         {"type": order_type},
         {"orderType": order_type},
-        {"order_type": order_type},
     ]
     size_variants = [
         {"size": size},
@@ -389,15 +383,7 @@ def _create_order_v3_compat(client: HttpPrivateSign, *, symbol: str, side: str, 
     price_variants = [
         {"price": price},
         {"limitPrice": price},
-        {"worstPrice": price},
-        {"worst_price": price},
     ]
-    tif_variants = [
-        {"timeInForce": "IOC"},
-        {"time_in_force": "IOC"},
-        {"tif": "IOC"},
-    ]
-
     reduce_variants = [
         {"reduceOnly": bool(reduce_only)},
         {"reduce_only": bool(reduce_only)},
@@ -416,27 +402,25 @@ def _create_order_v3_compat(client: HttpPrivateSign, *, symbol: str, side: str, 
     for t in type_variants:
         for s in size_variants:
             for p in price_variants:
-                for tif in tif_variants:
-                    for r in reduce_variants:
-                        for c in client_variants:
-                            payload = {}
-                            payload.update(base)
-                            payload.update(t)
-                            payload.update(s)
-                            payload.update(p)
-                            payload.update(tif)
-                            payload.update(r)
-                            payload.update(c)
-                            try:
-                                return _safe_call(getattr(client, "create_order_v3"), **payload)
-                            except TypeError as e:
-                                # Most common: unexpected keyword argument
-                                last_exc = e
-                                continue
-                            except Exception as e:
-                                last_exc = e
-                                continue
-    
+                for r in reduce_variants:
+                    for c in client_variants:
+                        payload = {}
+                        payload.update(base)
+                        payload.update(t)
+                        payload.update(s)
+                        payload.update(p)
+                        payload.update(r)
+                        payload.update(c)
+                        try:
+                            return _safe_call(getattr(client, "create_order_v3"), **payload)
+                        except TypeError as e:
+                            # Most common: unexpected keyword argument
+                            last_exc = e
+                            continue
+                        except Exception as e:
+                            last_exc = e
+                            continue
+
     if last_exc:
         raise last_exc
     raise RuntimeError("create_order_v3 failed with all compatible parameter variants")
@@ -529,20 +513,74 @@ def create_trigger_order(
     except Exception:
         protective_price = str(trigger_price)
 
-    payload = {
+    # SDK alias matrix for STOP_MARKET / trigger orders.
+    base = {
         "symbol": sym,
         "side": side_u,
-        "type": "STOP_MARKET",
-        "size": str(qty),
-        "price": str(protective_price),
-        "triggerPrice": str(trigger_price),
-        "reduceOnly": bool(reduce_only),
     }
-    if client_order_id:
-        payload["clientOrderId"] = str(client_order_id)
 
-    register_order_for_tracking(payload.get("clientOrderId"), sym)
-    return _safe_call(client.create_order_v3, **payload)
+    type_variants = [
+        {"type": "STOP_MARKET"},
+        {"orderType": "STOP_MARKET"},
+    ]
+    size_variants = [
+        {"size": str(qty)},
+        {"qty": str(qty)},
+    ]
+    price_variants = [
+        {"price": str(protective_price)},
+        {"limitPrice": str(protective_price)},
+    ]
+    trigger_variants = [
+        {"triggerPrice": str(trigger_price)},
+        {"trigger_price": str(trigger_price)},
+    ]
+    reduce_variants = [
+        {"reduceOnly": bool(reduce_only)},
+        {"reduce_only": bool(reduce_only)},
+    ]
+    client_variants = [{},]
+    if client_order_id:
+        client_variants = [
+            {"clientOrderId": str(client_order_id)},
+            {"clientId": str(client_order_id)},
+            {"client_id": str(client_order_id)},
+        ]
+
+    last_exc: Optional[Exception] = None
+    for t in type_variants:
+        for s in size_variants:
+            for p in price_variants:
+                for trig in trigger_variants:
+                    for r in reduce_variants:
+                        for c in client_variants:
+                            payload: Dict[str, Any] = {}
+                            payload.update(base)
+                            payload.update(t)
+                            payload.update(s)
+                            payload.update(p)
+                            payload.update(trig)
+                            payload.update(r)
+                            payload.update(c)
+                            try:
+                                res = _safe_call(getattr(client, "create_order_v3"), **payload)
+                                # Track by orderId once we have it; client id is still useful for cancellation.
+                                try:
+                                    data = res.get("data") if isinstance(res, dict) else None
+                                    if isinstance(data, dict):
+                                        oid = data.get("orderId") or data.get("id")
+                                        if oid:
+                                            register_order_for_tracking(str(oid), str(client_order_id or ""), sym)
+                                except Exception:
+                                    pass
+                                return res
+                            except Exception as e:
+                                last_exc = e
+                                continue
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("create_trigger_order: create_order_v3 failed with all compatible parameter variants")
 
 def get_open_position_for_symbol(symbol: str) -> Dict[str, Any]:
     client = get_client()
