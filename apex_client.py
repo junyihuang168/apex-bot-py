@@ -113,9 +113,6 @@ def _safe_call(fn, **kwargs):
       2) Signature-filtering can accidentally drop required parameters on some wrapped methods.
          If we see "missing required positional arguments" after a filtered attempt, we retry
          with the original (unfiltered) kwargs and prune unsupported keywords instead.
-
-    NOTE: For methods that truly require positional arguments for some fields, higher-level
-    compatibility wrappers (e.g., _create_order_v3_compat) will handle positional fallbacks.
     """
     call_kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
@@ -166,41 +163,73 @@ def _safe_call(fn, **kwargs):
         return _call_with_prune(fn, call_kwargs)
 
 
+def _extract_data_dict(res: Any) -> Optional[Dict[str, Any]]:
+    """
+    Normalize common SDK responses to a dict payload.
+    Handles:
+      - {"data": {...}} / {"data": [..]}
+      - {...} direct dict
+      - object with .data
+    """
+    if res is None:
+        return None
+
+    if isinstance(res, dict):
+        d = res.get("data")
+        if isinstance(d, dict):
+            return d
+        if isinstance(d, list) and d and isinstance(d[0], dict):
+            return d[0]
+        return res
+
+    # object with attribute .data
+    try:
+        d = getattr(res, "data", None)
+        if isinstance(d, dict):
+            return d
+        if isinstance(d, list) and d and isinstance(d[0], dict):
+            return d[0]
+    except Exception:
+        pass
+
+    return None
+
+
 def _install_compat_shims(client: HttpPrivateSign) -> None:
     """
     Add method aliases for SDK naming differences (no behavior changes).
 
-    IMPORTANT FIX:
-    Your previous version only aliased in one direction (candidate -> canonical).
-    But your SDK is calling camelCase internally (e.g. accountV3) while exposing snake_case
-    (e.g. get_account_v3). That causes:
-        'HttpPrivateSign' object has no attribute 'accountV3'
-
-    We now alias BOTH directions:
-      - if canonical missing but candidate exists: canonical = candidate
-      - if candidate missing but canonical exists: candidate = canonical
+    IMPORTANT:
+    Do NOT alias `accountV3` to a callable method. In some SDK builds, `accountV3`
+    is expected to be a DICT cache (used internally like: self.accountV3.get(...)).
+    If we set it to a function, SDK will crash with:
+        'function' object has no attribute 'get'
     """
     aliases = {
         "configs_v3": ["configsV3"],
-        "get_account_v3": ["accountV3"],
         "create_order_v3": ["createOrderV3"],
         "cancel_order_v3": ["cancelOrderV3"],
         "cancel_order_by_client_id_v3": ["cancelOrderByClientOrderIdV3"],
         "get_order_v3": ["getOrderV3", "get_order_detail_v3", "getOrderDetailV3"],
         "get_open_orders_v3": ["openOrdersV3", "open_orders_v3"],
         "get_positions_v3": ["positionsV3", "get_open_positions_v3", "open_positions_v3"],
+        # account getter (callable) — keep it as a method, not as accountV3 attribute:
+        "get_account_v3": ["getAccountV3", "get_account", "getAccount", "account_v3"],
     }
 
-    # 1) candidate -> canonical (old behavior)
+    # 1) candidate -> canonical
     for canonical, candidates in aliases.items():
         if hasattr(client, canonical):
             continue
         for cand in candidates:
             if hasattr(client, cand):
-                setattr(client, canonical, getattr(client, cand))
+                try:
+                    setattr(client, canonical, getattr(client, cand))
+                except Exception:
+                    pass
                 break
 
-    # 2) canonical -> candidate (NEW; fixes accountV3 missing)
+    # 2) canonical -> candidate (safe direction)
     for canonical, candidates in aliases.items():
         if not hasattr(client, canonical):
             continue
@@ -210,6 +239,62 @@ def _install_compat_shims(client: HttpPrivateSign) -> None:
                     setattr(client, cand, getattr(client, canonical))
                 except Exception:
                     pass
+
+
+def _ensure_account_v3_cache(client: HttpPrivateSign) -> None:
+    """
+    Ensure client.accountV3 is a DICT cache if the SDK expects it.
+    This prevents: 'function' object has no attribute 'get'
+    """
+    try:
+        cur = getattr(client, "accountV3", None)
+        if isinstance(cur, dict):
+            return
+
+        # If accountV3 exists but is callable (method), preserve it elsewhere to avoid losing access.
+        if callable(cur) and not hasattr(client, "_accountV3_callable"):
+            try:
+                setattr(client, "_accountV3_callable", cur)
+            except Exception:
+                pass
+
+        # Try to fetch account info via a callable getter (best-effort).
+        call_candidates = []
+
+        if hasattr(client, "get_account_v3") and callable(getattr(client, "get_account_v3")):
+            call_candidates.append(getattr(client, "get_account_v3"))
+
+        if hasattr(client, "_accountV3_callable") and callable(getattr(client, "_accountV3_callable")):
+            call_candidates.append(getattr(client, "_accountV3_callable"))
+
+        # Some builds expose getAccountV3 / accountV3 as callable getters:
+        for n in ("getAccountV3", "accountV3"):
+            if hasattr(client, n) and callable(getattr(client, n)):
+                call_candidates.append(getattr(client, n))
+
+        for fn in call_candidates:
+            try:
+                res = _safe_call(fn)
+                d = _extract_data_dict(res)
+                if isinstance(d, dict) and d:
+                    # Install dict cache at client.accountV3 for SDK internals.
+                    try:
+                        setattr(client, "accountV3", d)
+                    except Exception:
+                        pass
+                    return
+            except Exception:
+                continue
+
+        # If we cannot fetch, last-resort set empty dict to avoid attribute crash.
+        try:
+            setattr(client, "accountV3", {})
+        except Exception:
+            pass
+
+    except Exception:
+        # Do not crash get_client on best-effort cache setup.
+        pass
 
 
 def get_client() -> HttpPrivateSign:
@@ -230,17 +315,20 @@ def get_client() -> HttpPrivateSign:
         api_key_credentials=api_creds,
     )
 
-    # Install shims first so configs_v3/configsV3 are both available.
+    # Install shims first so snake/camel are both available where safe.
     _install_compat_shims(client)
 
     # Best-effort: initialize v3 configs (some SDK builds rely on it for v3 helpers)
     try:
-        if hasattr(client, "configs_v3"):
+        if hasattr(client, "configs_v3") and callable(getattr(client, "configs_v3")):
             _safe_call(getattr(client, "configs_v3"))
-        elif hasattr(client, "configsV3"):
+        elif hasattr(client, "configsV3") and callable(getattr(client, "configsV3")):
             _safe_call(getattr(client, "configsV3"))
     except Exception as e:
         print(f"[apex_client][WARN] configs_v3 init failed (continuing): {e}")
+
+    # CRITICAL: ensure accountV3 cache is a dict (SDK internal usage)
+    _ensure_account_v3_cache(client)
 
     _CLIENT = client
     return client
@@ -249,7 +337,6 @@ def get_client() -> HttpPrivateSign:
 # -----------------------------------------------------------------------------
 # Symbol helpers
 # -----------------------------------------------------------------------------
-
 
 def _get_symbol_rules(symbol: str) -> Dict[str, Any]:
     s = format_symbol(symbol)
@@ -289,14 +376,8 @@ def _snap_price(symbol: str, price: Decimal) -> Decimal:
 # This function returns a conservative price bound (worst price).
 # -----------------------------------------------------------------------------
 
-
 def get_reference_price(symbol: str) -> Decimal:
-    """Public ticker-based reference price (no auth).
-
-    We prefer indexPrice (used by ApeX for market order bound rules), then markPrice, then lastPrice.
-    The public ticker endpoint sometimes expects `crossSymbolName` without dashes (e.g., BTCUSDT),
-    but we also try the dashed form as a fallback (e.g., BTC-USDT).
-    """
+    """Public ticker-based reference price (no auth)."""
     base_url, _ = _get_base_and_network()
     sym_dash = format_symbol(symbol)
     candidates = [sym_dash.replace("-", ""), sym_dash]
@@ -317,6 +398,9 @@ def get_reference_price(symbol: str) -> Decimal:
             else:
                 raise ValueError(f"unexpected ticker payload: keys={list(j.keys())}")
 
+            if not isinstance(item, dict):
+                raise ValueError("ticker item is not dict")
+
             for k in ("indexPrice", "markPrice", "lastPrice", "price"):
                 v = item.get(k)
                 if v is None or v == "":
@@ -331,14 +415,12 @@ def get_reference_price(symbol: str) -> Decimal:
 
 
 def get_market_price(symbol: str, side: str, size: str) -> str:
-    """Price used only as a 'reference/worse' bound for signing market orders.
-
-    Primary path: use public ticker index price + buffer (robust, no 'args invalid' issues).
-    Fallback path: call private worst-price endpoint(s).
-    """
+    """Price used only as a 'reference/worse' bound for signing market orders."""
     side_u = (side or "").upper()
     if side_u not in ("BUY", "SELL"):
         side_u = "BUY"
+
+    last_err = None
 
     try:
         ref = get_reference_price(symbol)
@@ -366,11 +448,12 @@ def get_market_price(symbol: str, side: str, size: str) -> str:
                 r = fn(symbol=format_symbol(symbol), side=side_u, size=str(size))
                 if isinstance(r, dict):
                     data = r.get("data") or r
-                    for k in ("price", "worstPrice", "worst_price"):
-                        if k in data and data[k]:
-                            p = _snap_price(symbol, Decimal(str(data[k])))
-                            return str(p)
-                    last_err = f"no numeric price in response for {getattr(fn,'__name__','fn')}: {list(r.keys())}"
+                    if isinstance(data, dict):
+                        for k in ("price", "worstPrice", "worst_price"):
+                            if k in data and data[k]:
+                                p = _snap_price(symbol, Decimal(str(data[k])))
+                                return str(p)
+                        last_err = f"no numeric price in response for {getattr(fn,'__name__','fn')}: {list(r.keys())}"
                 else:
                     p = _snap_price(symbol, Decimal(str(r)))
                     return str(p)
@@ -387,18 +470,25 @@ def _random_client_id() -> str:
     return str(int(float(str(random.random())[2:])))
 
 
-def _create_order_v3_compat(client: HttpPrivateSign, *, symbol: str, side: str, order_type: str,
-                           size: str, price: str, reduce_only: bool, client_id: Optional[str]) -> Dict[str, Any]:
+def _create_order_v3_compat(
+    client: HttpPrivateSign,
+    *,
+    symbol: str,
+    side: str,
+    order_type: str,
+    size: str,
+    price: str,
+    reduce_only: bool,
+    client_id: Optional[str],
+) -> Any:
     """
     SDK parameter names differ across apexomni versions.
 
-    Some versions accept keyword args like orderType/size/price.
-    Other versions require positional arguments for side/type/size (and sometimes symbol/price).
-    We therefore:
-      - Try a matrix of common keyword aliases first (via _safe_call).
-      - If we encounter TypeError indicating missing required positional args, we retry with
-        positional call patterns (with keyword pruning for optional fields).
+    NOTE:
+    We also ensure accountV3 cache is dict before sending order (some SDK builds require it).
     """
+    _ensure_account_v3_cache(client)
+
     base = {
         "symbol": symbol,
         "side": side,
@@ -424,12 +514,12 @@ def _create_order_v3_compat(client: HttpPrivateSign, *, symbol: str, side: str, 
         {"timeInForce": "IOC"},
         {"time_in_force": "IOC"},
         {"tif": "IOC"},
-        {},  # allow no TIF (some builds don't need it)
+        {},
     ]
     reduce_variants = [
         {"reduceOnly": bool(reduce_only)},
         {"reduce_only": bool(reduce_only)},
-        {},  # allow omission (some builds default false)
+        {},
     ]
 
     client_variants = []
@@ -463,7 +553,6 @@ def _create_order_v3_compat(client: HttpPrivateSign, *, symbol: str, side: str, 
         raise RuntimeError("_call_positional_with_prune failed")
 
     def _try_positional(f, payload: Dict[str, Any]):
-        # Extract canonical values
         sym = payload.get("symbol", symbol)
         sd = payload.get("side", side)
         ty = payload.get("type") or payload.get("orderType") or payload.get("order_type")
@@ -473,21 +562,18 @@ def _create_order_v3_compat(client: HttpPrivateSign, *, symbol: str, side: str, 
         if ty is None or sz is None:
             raise TypeError("positional fallback missing type/size")
 
-        # Build kwargs for optional fields (remove ones we will pass positionally)
         kw = dict(payload)
-        # always remove common fields to avoid duplicates
-        for k in ("symbol", "side", "type", "orderType", "order_type", "size", "qty", "quantity", "price", "limitPrice", "worstPrice", "worst_price"):
+        for k in (
+            "symbol", "side", "type", "orderType", "order_type",
+            "size", "qty", "quantity",
+            "price", "limitPrice", "worstPrice", "worst_price",
+        ):
             kw.pop(k, None)
 
         patterns = []
-
-        # Most common: create_order_v3(side, type, size, **kw)
         patterns.append(([sd, ty, sz], kw))
-
-        # Some: create_order_v3(symbol, side, type, size, **kw)
         patterns.append(([sym, sd, ty, sz], kw))
 
-        # Some include price as positional after size
         if px is not None:
             patterns.append(([sd, ty, sz, px], kw))
             patterns.append(([sym, sd, ty, sz, px], kw))
@@ -525,8 +611,9 @@ def _create_order_v3_compat(client: HttpPrivateSign, *, symbol: str, side: str, 
                             except TypeError as e:
                                 last_exc = e
                                 msg = str(e)
-                                # If the SDK requires positional args, try positional patterns
-                                if ("missing" in msg and "required positional argument" in msg) or ("unexpected keyword argument" in msg and ("'type'" in msg or "'size'" in msg)):
+                                if ("missing" in msg and "required positional argument" in msg) or (
+                                    "unexpected keyword argument" in msg and ("'type'" in msg or "'size'" in msg)
+                                ):
                                     try:
                                         return _try_positional(fn, payload)
                                     except Exception as e2:
@@ -554,12 +641,11 @@ def create_market_order(
     side_u = str(side).upper().strip()
     qty = str(size)
 
-    # Apex: market orders still need a signed price bound
     worst_price = get_market_price(sym, side_u, qty)
 
     client_id = client_id or _random_client_id()
 
-    res = _create_order_v3_compat(
+    raw_res = _create_order_v3_compat(
         client,
         symbol=sym,
         side=side_u,
@@ -570,25 +656,32 @@ def create_market_order(
         client_id=str(client_id) if client_id else None,
     )
 
+    # Robust parse
+    data = _extract_data_dict(raw_res)
     order_id = None
     client_order_id = None
-    if isinstance(res, dict):
-        data = res.get("data") if isinstance(res.get("data"), dict) else res
+
+    if isinstance(data, dict):
         order_id = data.get("orderId") or data.get("id")
         client_order_id = data.get("clientOrderId") or data.get("clientId") or client_id
     else:
-        # Some SDKs return raw object
+        # object response
         try:
-            order_id = getattr(res, "orderId", None)
+            order_id = getattr(raw_res, "orderId", None) or getattr(raw_res, "id", None)
         except Exception:
             order_id = None
         client_order_id = client_id
 
     if order_id:
-        register_order_for_tracking(order_id=str(order_id), client_order_id=str(client_order_id), symbol=sym, expected_qty=qty)
+        register_order_for_tracking(
+            order_id=str(order_id),
+            client_order_id=str(client_order_id) if client_order_id is not None else None,
+            symbol=sym,
+            expected_qty=qty,
+        )
 
     return {
-        "raw": res,
+        "raw": raw_res,
         "order_id": str(order_id) if order_id is not None else None,
         "client_order_id": str(client_order_id) if client_order_id is not None else str(client_id),
         "symbol": sym,
@@ -602,7 +695,6 @@ def create_market_order(
 # Positions
 # -----------------------------------------------------------------------------
 
-
 def create_trigger_order(
     symbol: str,
     side: str,
@@ -611,25 +703,15 @@ def create_trigger_order(
     reduce_only: bool = True,
     client_order_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Create an exchange-native Stop-Market (Trigger-Market) order.
-
-    Notes:
-    - For STOP_MARKET orders, ApeX still requires a `price` field for protection.
-      We use `get_market_price()` as a best-effort bound; if that fails, we fall back
-      to the trigger price itself.
-    - `side` should be the execution side (SELL closes a LONG, BUY closes a SHORT).
-    """
     client = get_client()
     sym = format_symbol(symbol)
     side_u = str(side).upper().strip()
 
-    # Best-effort protective price (market-protection). If unavailable, use trigger price.
     try:
         protective_price = get_market_price(sym, side_u, qty)
     except Exception:
         protective_price = str(trigger_price)
 
-    # SDK alias matrix for STOP_MARKET / trigger orders.
     base = {
         "symbol": sym,
         "side": side_u,
@@ -655,7 +737,7 @@ def create_trigger_order(
         {"reduceOnly": bool(reduce_only)},
         {"reduce_only": bool(reduce_only)},
     ]
-    client_variants = [{},]
+    client_variants = [{}]
     if client_order_id:
         client_variants = [
             {"clientOrderId": str(client_order_id)},
@@ -680,15 +762,11 @@ def create_trigger_order(
                             payload.update(c)
                             try:
                                 res = _safe_call(getattr(client, "create_order_v3"), **payload)
-                                # Track by orderId once we have it; client id is still useful for cancellation.
-                                try:
-                                    data = res.get("data") if isinstance(res, dict) else None
-                                    if isinstance(data, dict):
-                                        oid = data.get("orderId") or data.get("id")
-                                        if oid:
-                                            register_order_for_tracking(str(oid), str(client_order_id or ""), sym)
-                                except Exception:
-                                    pass
+                                data = _extract_data_dict(res)
+                                if isinstance(data, dict):
+                                    oid = data.get("orderId") or data.get("id")
+                                    if oid:
+                                        register_order_for_tracking(str(oid), str(client_order_id or ""), sym)
                                 return res
                             except Exception as e:
                                 last_exc = e
@@ -733,7 +811,6 @@ def get_open_position_for_symbol(symbol: str) -> Dict[str, Any]:
 # -----------------------------------------------------------------------------
 # WS parsing: orders + fills
 # -----------------------------------------------------------------------------
-
 
 def _walk_collect(root: Any, predicate) -> Iterable[Dict[str, Any]]:
     out: list[Dict[str, Any]] = []
@@ -793,7 +870,6 @@ def _parse_fill(x: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     ts = _pick(d, "ts", "timestamp", "createdAt", "time")
     try:
         ts_f = float(ts) if ts is not None else time.time()
-        # Some APIs use ms
         if ts_f > 10_000_000_000:
             ts_f = ts_f / 1000.0
     except Exception:
@@ -853,7 +929,6 @@ def _dedupe_add(key: str, ts: float) -> bool:
     ttl = float(os.getenv("FILL_DEDUPE_TTL_SEC", "3600"))
     max_items = int(os.getenv("FILL_DEDUPE_MAX", "50000"))
 
-    # prune old
     while _FILL_DEDUPE:
         k0, t0 = next(iter(_FILL_DEDUPE.items()))
         if ts - t0 <= ttl and len(_FILL_DEDUPE) <= max_items:
@@ -900,7 +975,6 @@ def _apply_fill(fill: Dict[str, Any]) -> None:
     if fill.get("client_order_id"):
         agg["client_order_id"] = fill.get("client_order_id")
 
-    # optional event queue
     try:
         _FILL_Q.put_nowait({"type": "fill", **fill})
     except Exception:
@@ -968,9 +1042,7 @@ def start_private_ws() -> None:
             if not isinstance(contents, dict):
                 return
 
-            # ----- fills -----
             def is_fill(d: Dict[str, Any]) -> bool:
-                # heuristics: must have orderId + (price) + (size)
                 if not any(k in d for k in ("orderId", "order_id")):
                     return False
                 if not any(k in d for k in ("fillPrice", "matchFillPrice", "price", "tradePrice")):
@@ -996,7 +1068,6 @@ def start_private_ws() -> None:
                         continue
                     _apply_fill(fill)
 
-            # ----- orders -----
             def is_order(d: Dict[str, Any]) -> bool:
                 return any(k in d for k in ("orderId", "clientOrderId", "status", "cumFilledSize", "avgPrice"))
 
@@ -1021,7 +1092,6 @@ def start_private_ws() -> None:
                         "ts": time.time(),
                     })
 
-                    # cumulative fields (best effort)
                     if upd.get("cum_qty") is not None:
                         st["cum_qty"] = Decimal(str(upd["cum_qty"]))
                     if upd.get("avg_px") is not None:
@@ -1030,7 +1100,6 @@ def start_private_ws() -> None:
                         st["expected_qty"] = upd.get("expected_qty")
                     _ORDER_STATE[oid] = st
 
-                    # If we have cumQty+avg but no fills, we can backfill agg (lower priority)
                     agg = _FILL_AGG.get(oid)
                     if (agg is None or Decimal(str(agg.get("qty") or "0")) <= 0) and st.get("cum_qty") and st.get("avg_px"):
                         cum_qty = Decimal(str(st.get("cum_qty") or "0"))
@@ -1083,7 +1152,6 @@ def pop_fill_event(timeout: float = 0.5) -> Optional[dict]:
 # -----------------------------------------------------------------------------
 # REST fallback: orders + fills/trades
 # -----------------------------------------------------------------------------
-
 
 def _rest_fetch_order(order_id: str) -> Optional[Dict[str, Any]]:
     client = get_client()
@@ -1161,19 +1229,16 @@ def start_order_rest_poller(poll_interval: float = 5.0) -> None:
         while True:
             try:
                 now = time.time()
-                # only poll recently-touched orders
                 order_ids = list(_ORDER_STATE.keys())
                 for oid in order_ids:
                     st = _ORDER_STATE.get(oid) or {}
                     if now - float(st.get("ts") or 0) < gap_sec:
                         continue
 
-                    # If we already have fills and order is terminal, no need.
                     agg = _FILL_AGG.get(oid)
                     if agg and Decimal(str(agg.get("qty") or "0")) > 0 and str(st.get("status") or "").upper() in {"FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED"}:
                         continue
 
-                    # 1) refresh order detail
                     od = _rest_fetch_order(oid)
                     if isinstance(od, dict):
                         d = od.get("data") if isinstance(od.get("data"), dict) else od
@@ -1192,7 +1257,6 @@ def start_order_rest_poller(poll_interval: float = 5.0) -> None:
                                     st["avg_px"] = Decimal(str(upd.get("avg_px")))
                                 _ORDER_STATE[oid] = st
 
-                    # 2) fills fallback (truth source)
                     agg_qty = Decimal(str((agg or {}).get("qty") or "0"))
                     need_fills = (agg is None) or (agg_qty <= 0)
                     if need_fills:
@@ -1211,7 +1275,6 @@ def start_order_rest_poller(poll_interval: float = 5.0) -> None:
                                 fill["raw_source"] = "rest"
                                 _apply_fill(fill)
 
-                    # If REST still can't get fills, but order has cum+avg, backfill.
                     agg2 = _FILL_AGG.get(oid)
                     if (agg2 is None or Decimal(str(agg2.get("qty") or "0")) <= 0) and st.get("cum_qty") and st.get("avg_px"):
                         cum_qty = Decimal(str(st.get("cum_qty") or "0"))
@@ -1240,7 +1303,6 @@ def start_order_rest_poller(poll_interval: float = 5.0) -> None:
 # Public fill summary API used by app.py
 # -----------------------------------------------------------------------------
 
-
 def _agg_summary(order_id: Optional[str], client_order_id: Optional[str]) -> Optional[Dict[str, Any]]:
     if order_id:
         agg = _FILL_AGG.get(str(order_id))
@@ -1256,7 +1318,6 @@ def _agg_summary(order_id: Optional[str], client_order_id: Optional[str]) -> Opt
                     "fee": agg.get("fee"),
                     "source": agg.get("source"),
                 }
-    # clientOrderId fallback: scan a small subset (best effort)
     if client_order_id:
         cid = str(client_order_id)
         for oid, agg in list(_FILL_AGG.items())[-200:]:
@@ -1282,17 +1343,8 @@ def get_fill_summary(
     max_wait_sec: float = 25.0,
     poll_interval: float = 0.25,
 ) -> Dict[str, Any]:
-    """Return authoritative fill summary.
-
-    Priority:
-      1) WS fills aggregation
-      2) WS orders (cum+avg) (backup)
-      3) REST fills/trades by orderId (gap fill)
-      4) REST order detail (last resort)
-    """
     start_private_ws()
     if _env_bool("ENABLE_REST_POLL", True):
-        # Ensure poller is running; it's idempotent.
         try:
             start_order_rest_poller(poll_interval=float(os.getenv("REST_ORDER_POLL_INTERVAL", "5.0")))
         except Exception:
@@ -1304,7 +1356,6 @@ def get_fill_summary(
         summ = _agg_summary(order_id, client_order_id)
         if summ:
             last_source = summ.get("source")
-            # If order is terminal or we've waited enough, return.
             st = _ORDER_STATE.get(str(summ.get("order_id"))) if summ.get("order_id") else None
             status = str((st or {}).get("status") or "").upper()
             if status in {"FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED"}:
@@ -1317,7 +1368,6 @@ def get_fill_summary(
                     "fee": str(summ.get("fee")) if summ.get("fee") is not None else None,
                     "source": str(summ.get("source") or ""),
                 }
-            # Non-terminal: still allow return if qty>0 and waited enough.
             if time.time() - t0 >= max_wait_sec:
                 return {
                     "symbol": format_symbol(symbol),
@@ -1333,7 +1383,6 @@ def get_fill_summary(
             break
         time.sleep(max(0.05, poll_interval))
 
-    # Last resort: try REST order detail -> cum+avg
     if order_id:
         od = _rest_fetch_order(str(order_id))
         if isinstance(od, dict):
@@ -1363,7 +1412,6 @@ def format_symbol(symbol: str) -> str:
     s = str(symbol).upper().replace("/", "-").replace("_", "-").strip()
     if "-" in s:
         return s
-    # Best-effort split for common quotes (fallback to raw if unknown)
     for quote in ("USDT", "USDC", "USD", "BTC", "ETH"):
         if s.endswith(quote) and len(s) > len(quote):
             return f"{s[:-len(quote)]}-{quote}"
