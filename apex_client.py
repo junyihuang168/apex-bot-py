@@ -167,7 +167,19 @@ def _safe_call(fn, **kwargs):
 
 
 def _install_compat_shims(client: HttpPrivateSign) -> None:
-    """Add method aliases for SDK naming differences (no behavior changes)."""
+    """
+    Add method aliases for SDK naming differences (no behavior changes).
+
+    IMPORTANT FIX:
+    Your previous version only aliased in one direction (candidate -> canonical).
+    But your SDK is calling camelCase internally (e.g. accountV3) while exposing snake_case
+    (e.g. get_account_v3). That causes:
+        'HttpPrivateSign' object has no attribute 'accountV3'
+
+    We now alias BOTH directions:
+      - if canonical missing but candidate exists: canonical = candidate
+      - if candidate missing but canonical exists: candidate = canonical
+    """
     aliases = {
         "configs_v3": ["configsV3"],
         "get_account_v3": ["accountV3"],
@@ -178,6 +190,8 @@ def _install_compat_shims(client: HttpPrivateSign) -> None:
         "get_open_orders_v3": ["openOrdersV3", "open_orders_v3"],
         "get_positions_v3": ["positionsV3", "get_open_positions_v3", "open_positions_v3"],
     }
+
+    # 1) candidate -> canonical (old behavior)
     for canonical, candidates in aliases.items():
         if hasattr(client, canonical):
             continue
@@ -185,6 +199,17 @@ def _install_compat_shims(client: HttpPrivateSign) -> None:
             if hasattr(client, cand):
                 setattr(client, canonical, getattr(client, cand))
                 break
+
+    # 2) canonical -> candidate (NEW; fixes accountV3 missing)
+    for canonical, candidates in aliases.items():
+        if not hasattr(client, canonical):
+            continue
+        for cand in candidates:
+            if not hasattr(client, cand):
+                try:
+                    setattr(client, cand, getattr(client, canonical))
+                except Exception:
+                    pass
 
 
 def get_client() -> HttpPrivateSign:
@@ -204,7 +229,19 @@ def get_client() -> HttpPrivateSign:
         zk_l2Key=zk_l2,
         api_key_credentials=api_creds,
     )
+
+    # Install shims first so configs_v3/configsV3 are both available.
     _install_compat_shims(client)
+
+    # Best-effort: initialize v3 configs (some SDK builds rely on it for v3 helpers)
+    try:
+        if hasattr(client, "configs_v3"):
+            _safe_call(getattr(client, "configs_v3"))
+        elif hasattr(client, "configsV3"):
+            _safe_call(getattr(client, "configsV3"))
+    except Exception as e:
+        print(f"[apex_client][WARN] configs_v3 init failed (continuing): {e}")
+
     _CLIENT = client
     return client
 
@@ -292,6 +329,7 @@ def get_reference_price(symbol: str) -> Decimal:
 
     raise ValueError(f"ticker lookup failed for {sym_dash} (last_err={last_err})")
 
+
 def get_market_price(symbol: str, side: str, size: str) -> str:
     """Price used only as a 'reference/worse' bound for signing market orders.
 
@@ -344,9 +382,9 @@ def get_market_price(symbol: str, side: str, size: str) -> str:
     print(f"[apex_client] get_market_price fallback used (last_err={last_err})")
     return "0"
 
+
 def _random_client_id() -> str:
     return str(int(float(str(random.random())[2:])))
-
 
 
 def _create_order_v3_compat(client: HttpPrivateSign, *, symbol: str, side: str, order_type: str,
@@ -659,6 +697,7 @@ def create_trigger_order(
     if last_exc:
         raise last_exc
     raise RuntimeError("create_trigger_order: create_order_v3 failed with all compatible parameter variants")
+
 
 def get_open_position_for_symbol(symbol: str) -> Dict[str, Any]:
     client = get_client()
@@ -1312,7 +1351,10 @@ def get_fill_summary(
                         "source": "rest_order_last",
                     }
 
-    raise RuntimeError(f"fill_summary timeout; last_source={last_source}")# ──────────────────────────────────────────────────────────────
+    raise RuntimeError(f"fill_summary timeout; last_source={last_source}")
+
+
+# ──────────────────────────────────────────────────────────────
 # SYMBOL NORMALIZATION
 # ──────────────────────────────────────────────────────────────
 
@@ -1327,8 +1369,7 @@ def format_symbol(symbol: str) -> str:
             return f"{s[:-len(quote)]}-{quote}"
     return s
 
+
 def format_symbol_for_ticker(symbol: str) -> str:
     """Normalize to public ticker crossSymbolName (e.g., 'BTCUSDT')."""
     return re.sub(r"[^A-Z0-9]", "", format_symbol(symbol))
-
-
