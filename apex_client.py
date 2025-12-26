@@ -106,60 +106,47 @@ def _get_api_credentials() -> Dict[str, str]:
 
 def _safe_call(fn, **kwargs):
     """
-    SDK 兼容调用封装（跨版本）。
+    Call an SDK function in a cross-version compatible way.
 
-    你现在的错误：
-      TypeError: ... missing 3 required positional arguments: 'side', 'type', and 'size'
+    This wrapper solves two common ApeX SDK drift issues:
+      1) Unexpected keyword argument 'X'  -> we auto-prune X and retry.
+      2) Signature-filtering can accidentally drop required parameters on some wrapped methods.
+         If we see "missing required positional arguments" after a filtered attempt, we retry
+         with the original (unfiltered) kwargs and prune unsupported keywords instead.
 
-    典型原因是：我们用 inspect.signature 做“按签名过滤参数”时，把某些必填字段误过滤掉了，
-    导致真正调用时缺参。
-
-    解决策略：
-    - 优先尝试“按签名过滤”的调用（对稳定版本友好）
-    - 但如果出现 missing required positional arguments，则立刻回退到“不过滤的原始 kwargs”，
-      然后仅基于 "unexpected keyword argument 'X'" 逐个剔除不支持字段再重试。
+    NOTE: For methods that truly require positional arguments for some fields, higher-level
+    compatibility wrappers (e.g., _create_order_v3_compat) will handle positional fallbacks.
     """
     call_kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
-    def _call_with_prune(f, kw):
-        cur = dict(kw)
-        last_exc = None
-        try:
-            return f(**cur)
-        except TypeError as e:
-            last_exc = e
-            msg = str(e)
+    def _call_with_prune(f, payload: Dict[str, Any]):
+        p = dict(payload)
+        last = None
+        for _ in range(12):
+            try:
+                return f(**p)
+            except TypeError as e:
+                last = e
+                msg = str(e)
 
-            # 缺必填参数：剪枝无意义，直接抛给上层做回退策略
-            if "missing" in msg and "required positional argument" in msg:
-                raise
-
-            for _ in range(16):
+                # Only prune on "unexpected keyword argument".
                 m = re.search(r"unexpected keyword argument ['\"]([^'\"]+)['\"]", msg)
-                if not m:
-                    break
-                bad = m.group(1)
-                cur.pop(bad, None)
-                try:
-                    return f(**cur)
-                except TypeError as e2:
-                    last_exc = e2
-                    msg = str(e2)
-                    if "missing" in msg and "required positional argument" in msg:
-                        raise
-                    continue
-        if last_exc:
-            raise last_exc
-        raise RuntimeError("_safe_call failed")
+                if m:
+                    bad = m.group(1)
+                    if bad in p:
+                        p.pop(bad, None)
+                        continue
+                raise
+        if last:
+            raise last
+        raise RuntimeError("_safe_call: call failed")
 
-    # 1) 优先：能 introspect signature 时，先走签名过滤
     try:
         sig = inspect.signature(fn)
         params = sig.parameters
         has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
         if has_var_kw:
-            # 真正支持 **kwargs：直接调用 + 剪枝未知参数
             return _call_with_prune(fn, call_kwargs)
 
         allowed = set(params.keys())
@@ -169,14 +156,15 @@ def _safe_call(fn, **kwargs):
             return _call_with_prune(fn, filtered)
         except TypeError as e:
             msg = str(e)
-            # 关键修复：如果过滤后导致缺参，回退到不过滤版本
-            if "missing" in msg and "required positional argument" in msg:
+            # Critical: if filtering caused missing required args, retry unfiltered.
+            if ("missing" in msg) and ("required positional argument" in msg):
                 return _call_with_prune(fn, call_kwargs)
             raise
 
     except (ValueError, TypeError):
-        # signature 不可用：直接调用 + 剪枝未知参数
+        # Signature not available (C-extensions / dynamic wrappers): prune on error.
         return _call_with_prune(fn, call_kwargs)
+
 
 def _install_compat_shims(client: HttpPrivateSign) -> None:
     """Add method aliases for SDK naming differences (no behavior changes)."""
@@ -365,7 +353,13 @@ def _create_order_v3_compat(client: HttpPrivateSign, *, symbol: str, side: str, 
                            size: str, price: str, reduce_only: bool, client_id: Optional[str]) -> Dict[str, Any]:
     """
     SDK parameter names differ across apexomni versions.
-    Try a small matrix of common parameter aliases and return the first successful response.
+
+    Some versions accept keyword args like orderType/size/price.
+    Other versions require positional arguments for side/type/size (and sometimes symbol/price).
+    We therefore:
+      - Try a matrix of common keyword aliases first (via _safe_call).
+      - If we encounter TypeError indicating missing required positional args, we retry with
+        positional call patterns (with keyword pruning for optional fields).
     """
     base = {
         "symbol": symbol,
@@ -375,19 +369,31 @@ def _create_order_v3_compat(client: HttpPrivateSign, *, symbol: str, side: str, 
     type_variants = [
         {"type": order_type},
         {"orderType": order_type},
+        {"order_type": order_type},
     ]
     size_variants = [
         {"size": size},
         {"qty": size},
+        {"quantity": size},
     ]
     price_variants = [
         {"price": price},
         {"limitPrice": price},
+        {"worstPrice": price},
+        {"worst_price": price},
+    ]
+    tif_variants = [
+        {"timeInForce": "IOC"},
+        {"time_in_force": "IOC"},
+        {"tif": "IOC"},
+        {},  # allow no TIF (some builds don't need it)
     ]
     reduce_variants = [
         {"reduceOnly": bool(reduce_only)},
         {"reduce_only": bool(reduce_only)},
+        {},  # allow omission (some builds default false)
     ]
+
     client_variants = []
     if client_id:
         client_variants = [
@@ -398,28 +404,100 @@ def _create_order_v3_compat(client: HttpPrivateSign, *, symbol: str, side: str, 
     else:
         client_variants = [{}]
 
+    def _call_positional_with_prune(f, args, kw_payload: Dict[str, Any]):
+        p = dict(kw_payload)
+        last = None
+        for _ in range(12):
+            try:
+                return f(*args, **p)
+            except TypeError as e:
+                last = e
+                msg = str(e)
+                m = re.search(r"unexpected keyword argument ['\"]([^'\"]+)['\"]", msg)
+                if m:
+                    bad = m.group(1)
+                    if bad in p:
+                        p.pop(bad, None)
+                        continue
+                raise
+        if last:
+            raise last
+        raise RuntimeError("_call_positional_with_prune failed")
+
+    def _try_positional(f, payload: Dict[str, Any]):
+        # Extract canonical values
+        sym = payload.get("symbol", symbol)
+        sd = payload.get("side", side)
+        ty = payload.get("type") or payload.get("orderType") or payload.get("order_type")
+        sz = payload.get("size") or payload.get("qty") or payload.get("quantity")
+        px = payload.get("price") or payload.get("limitPrice") or payload.get("worstPrice") or payload.get("worst_price")
+
+        if ty is None or sz is None:
+            raise TypeError("positional fallback missing type/size")
+
+        # Build kwargs for optional fields (remove ones we will pass positionally)
+        kw = dict(payload)
+        # always remove common fields to avoid duplicates
+        for k in ("symbol", "side", "type", "orderType", "order_type", "size", "qty", "quantity", "price", "limitPrice", "worstPrice", "worst_price"):
+            kw.pop(k, None)
+
+        patterns = []
+
+        # Most common: create_order_v3(side, type, size, **kw)
+        patterns.append(([sd, ty, sz], kw))
+
+        # Some: create_order_v3(symbol, side, type, size, **kw)
+        patterns.append(([sym, sd, ty, sz], kw))
+
+        # Some include price as positional after size
+        if px is not None:
+            patterns.append(([sd, ty, sz, px], kw))
+            patterns.append(([sym, sd, ty, sz, px], kw))
+
+        last_e = None
+        for args, kwp in patterns:
+            try:
+                return _call_positional_with_prune(f, args, kwp)
+            except Exception as e:
+                last_e = e
+                continue
+        if last_e:
+            raise last_e
+        raise RuntimeError("positional patterns all failed")
+
     last_exc = None
+    fn = getattr(client, "create_order_v3")
+
     for t in type_variants:
         for s in size_variants:
             for p in price_variants:
-                for r in reduce_variants:
-                    for c in client_variants:
-                        payload = {}
-                        payload.update(base)
-                        payload.update(t)
-                        payload.update(s)
-                        payload.update(p)
-                        payload.update(r)
-                        payload.update(c)
-                        try:
-                            return _safe_call(getattr(client, "create_order_v3"), **payload)
-                        except TypeError as e:
-                            # Most common: unexpected keyword argument
-                            last_exc = e
-                            continue
-                        except Exception as e:
-                            last_exc = e
-                            continue
+                for tif in tif_variants:
+                    for r in reduce_variants:
+                        for c in client_variants:
+                            payload = {}
+                            payload.update(base)
+                            payload.update(t)
+                            payload.update(s)
+                            payload.update(p)
+                            payload.update(tif)
+                            payload.update(r)
+                            payload.update(c)
+                            try:
+                                return _safe_call(fn, **payload)
+                            except TypeError as e:
+                                last_exc = e
+                                msg = str(e)
+                                # If the SDK requires positional args, try positional patterns
+                                if ("missing" in msg and "required positional argument" in msg) or ("unexpected keyword argument" in msg and ("'type'" in msg or "'size'" in msg)):
+                                    try:
+                                        return _try_positional(fn, payload)
+                                    except Exception as e2:
+                                        last_exc = e2
+                                        continue
+                                continue
+                            except Exception as e:
+                                last_exc = e
+                                continue
 
     if last_exc:
         raise last_exc
