@@ -154,7 +154,7 @@ def _safe_call(fn, **kwargs):
         except TypeError as e:
             msg = str(e)
             # Critical: if filtering caused missing required args, retry unfiltered.
-            if ("missing" in msg) and ("required positional argument" in msg):
+            if ("missing" in msg) and (("required positional argument" in msg) or ("required positional arguments" in msg)):
                 return _call_with_prune(fn, call_kwargs)
             raise
 
@@ -642,7 +642,7 @@ def _create_order_v3_compat(
                             except TypeError as e:
                                 last_exc = e
                                 msg = str(e)
-                                if ("missing" in msg and "required positional argument" in msg) or (
+                                if ("missing" in msg and (("required positional argument" in msg) or ("required positional arguments" in msg))) or (
                                     "unexpected keyword argument" in msg and ("'type'" in msg or "'size'" in msg)
                                 ):
                                     try:
@@ -791,91 +791,91 @@ def create_trigger_order(
                             payload.update(trig)
                             payload.update(r)
                             payload.update(c)
-	                            try:
-	                                res = _safe_call(getattr(client, "create_order_v3"), **payload)
-	                                data = _extract_data_dict(res)
-	                                if isinstance(data, dict):
-	                                    oid = data.get("orderId") or data.get("id")
-	                                    if oid:
-	                                        register_order_for_tracking(str(oid), str(client_order_id or ""), sym)
-	                                return res
-	                            except Exception as e:
-	                                # Some SDK builds require positional args (notably: type + size). Try a broader
-	                                # positional fallback before giving up.
-	                                last_exc = e
-	
-	                                try:
-	                                    if isinstance(e, TypeError) and ("missing" in str(e)) and ("required positional argument" in str(e)):
-	                                        fn = getattr(client, "create_order_v3")
-	
-	                                        ty = payload.get("type") or payload.get("orderType") or payload.get("order_type")
-	                                        sz = payload.get("size") or payload.get("qty") or payload.get("quantity")
-	                                        px = payload.get("price") or payload.get("limitPrice") or payload.get("worstPrice") or payload.get("worst_price")
-	
-	                                        if ty is None or sz is None:
-	                                            raise e
-	
-	                                        TYPE_KEYS = ("type", "orderType", "order_type")
-	                                        SIZE_KEYS = ("size", "qty", "quantity")
-	                                        PRICE_KEYS = ("price", "limitPrice", "worstPrice", "worst_price")
-	                                        SIDE_KEYS = ("side",)
-	                                        SYM_KEYS = ("symbol",)
-	
-	                                        def _call_positional_with_prune(f, args, kw_payload: Dict[str, Any]):
-	                                            p = dict(kw_payload)
-	                                            last = None
-	                                            for _ in range(12):
-	                                                try:
-	                                                    return f(*args, **p)
-	                                                except TypeError as te:
-	                                                    last = te
-	                                                    msg = str(te)
-	                                                    m = re.search(r"unexpected keyword argument ['\"]([^'\"]+)['\"]", msg)
-	                                                    if m:
-	                                                        bad = m.group(1)
-	                                                        p.pop(bad, None)
-	                                                        continue
-	                                                    raise
-	                                            if last:
-	                                                raise last
-	                                            raise RuntimeError("positional prune failed")
-	
-	                                        def _kw_without(remove_keys: Tuple[str, ...]):
-	                                            kw = dict(payload)
-	                                            for k in remove_keys:
-	                                                kw.pop(k, None)
-	                                            return kw
-	
-	                                        patterns = [
-	                                            ([ty, sz], TYPE_KEYS + SIZE_KEYS),
-	                                            ([ty, sz, px] if px is not None else None, TYPE_KEYS + SIZE_KEYS + PRICE_KEYS),
-	                                            ([side_u, ty, sz], SIDE_KEYS + TYPE_KEYS + SIZE_KEYS),
-	                                            ([side_u, ty, sz, px] if px is not None else None, SIDE_KEYS + TYPE_KEYS + SIZE_KEYS + PRICE_KEYS),
-	                                            ([sym, side_u, ty, sz], SYM_KEYS + SIDE_KEYS + TYPE_KEYS + SIZE_KEYS),
-	                                            ([sym, side_u, ty, sz, px] if px is not None else None, SYM_KEYS + SIDE_KEYS + TYPE_KEYS + SIZE_KEYS + PRICE_KEYS),
-	                                            ([sym, ty, sz], SYM_KEYS + TYPE_KEYS + SIZE_KEYS),
-	                                            ([sym, ty, sz, px] if px is not None else None, SYM_KEYS + TYPE_KEYS + SIZE_KEYS + PRICE_KEYS),
-	                                        ]
-	
-	                                        for args, remove in patterns:
-	                                            if args is None:
-	                                                continue
-	                                            try:
-	                                                res2 = _call_positional_with_prune(fn, args, _kw_without(remove))
-	                                                data2 = _extract_data_dict(res2)
-	                                                if isinstance(data2, dict):
-	                                                    oid2 = data2.get("orderId") or data2.get("id")
-	                                                    if oid2:
-	                                                        register_order_for_tracking(str(oid2), str(client_order_id or ""), sym)
-	                                                return res2
-	                                            except Exception as e2:
-	                                                last_exc = e2
-	                                                continue
-	                                except Exception:
-	                                    # Keep the original exception semantics.
-	                                    pass
+                            try:
+                                res = _safe_call(getattr(client, "create_order_v3"), **payload)
+                                data = _extract_data_dict(res)
+                                if isinstance(data, dict):
+                                    oid = data.get("orderId") or data.get("id")
+                                    if oid:
+                                        register_order_for_tracking(str(oid), str(client_order_id or ""), sym)
+                                return res
+                            except Exception as e:
+                                # Some SDK builds require positional args (notably: type + size). Try a broader
+                                # positional fallback before giving up.
+                                last_exc = e
 
-	                                continue
+                                try:
+                                    if isinstance(e, TypeError) and ("missing" in str(e)) and ("required positional argument" in str(e)):
+                                        fn = getattr(client, "create_order_v3")
+
+                                        ty = payload.get("type") or payload.get("orderType") or payload.get("order_type")
+                                        sz = payload.get("size") or payload.get("qty") or payload.get("quantity")
+                                        px = payload.get("price") or payload.get("limitPrice") or payload.get("worstPrice") or payload.get("worst_price")
+
+                                        if ty is None or sz is None:
+                                            raise e
+
+                                        TYPE_KEYS = ("type", "orderType", "order_type")
+                                        SIZE_KEYS = ("size", "qty", "quantity")
+                                        PRICE_KEYS = ("price", "limitPrice", "worstPrice", "worst_price")
+                                        SIDE_KEYS = ("side",)
+                                        SYM_KEYS = ("symbol",)
+
+                                        def _call_positional_with_prune(f, args, kw_payload: Dict[str, Any]):
+                                            p = dict(kw_payload)
+                                            last = None
+                                            for _ in range(12):
+                                                try:
+                                                    return f(*args, **p)
+                                                except TypeError as te:
+                                                    last = te
+                                                    msg = str(te)
+                                                    m = re.search(r"unexpected keyword argument ['\"]([^'\"]+)['\"]", msg)
+                                                    if m:
+                                                        bad = m.group(1)
+                                                        p.pop(bad, None)
+                                                        continue
+                                                    raise
+                                            if last:
+                                                raise last
+                                            raise RuntimeError("positional prune failed")
+
+                                        def _kw_without(remove_keys: Tuple[str, ...]):
+                                            kw = dict(payload)
+                                            for k in remove_keys:
+                                                kw.pop(k, None)
+                                            return kw
+
+                                        patterns = [
+                                            ([ty, sz], TYPE_KEYS + SIZE_KEYS),
+                                            ([ty, sz, px] if px is not None else None, TYPE_KEYS + SIZE_KEYS + PRICE_KEYS),
+                                            ([side_u, ty, sz], SIDE_KEYS + TYPE_KEYS + SIZE_KEYS),
+                                            ([side_u, ty, sz, px] if px is not None else None, SIDE_KEYS + TYPE_KEYS + SIZE_KEYS + PRICE_KEYS),
+                                            ([sym, side_u, ty, sz], SYM_KEYS + SIDE_KEYS + TYPE_KEYS + SIZE_KEYS),
+                                            ([sym, side_u, ty, sz, px] if px is not None else None, SYM_KEYS + SIDE_KEYS + TYPE_KEYS + SIZE_KEYS + PRICE_KEYS),
+                                            ([sym, ty, sz], SYM_KEYS + TYPE_KEYS + SIZE_KEYS),
+                                            ([sym, ty, sz, px] if px is not None else None, SYM_KEYS + TYPE_KEYS + SIZE_KEYS + PRICE_KEYS),
+                                        ]
+
+                                        for args, remove in patterns:
+                                            if args is None:
+                                                continue
+                                            try:
+                                                res2 = _call_positional_with_prune(fn, args, _kw_without(remove))
+                                                data2 = _extract_data_dict(res2)
+                                                if isinstance(data2, dict):
+                                                    oid2 = data2.get("orderId") or data2.get("id")
+                                                    if oid2:
+                                                        register_order_for_tracking(str(oid2), str(client_order_id or ""), sym)
+                                                return res2
+                                            except Exception as e2:
+                                                last_exc = e2
+                                                continue
+                                except Exception:
+                                    # Keep the original exception semantics.
+                                    pass
+
+                                continue
 
     if last_exc:
         raise last_exc
