@@ -212,15 +212,46 @@ def _bot_uses_ladder(bot_id: str, direction: str) -> bool:
 
 
 def _get_mark_price(symbol: str) -> Optional[Decimal]:
-    """Best-effort mark/index/oracle price from account positions (no worstPrice quote)."""
+    """Best-effort mark/index/oracle/last price for risk checks.
+
+    Notes:
+    - Different apexomni builds return different field names in the position payload.
+    - For ladder SL/TS we only need a reasonable realtime reference price.
+    - If the private position payload doesn't include a mark-like price, we fall back to
+      the public ticker reference price.
+    """
     try:
         pos = get_open_position_for_symbol(symbol)
-        if not isinstance(pos, dict):
-            return None
-        mp = pos.get("markPrice") or pos.get("oraclePrice")
-        if mp is None:
-            return None
-        return Decimal(str(mp))
+        if isinstance(pos, dict):
+            # Common variants seen across builds
+            for k in (
+                "markPrice",
+                "mark_price",
+                "oraclePrice",
+                "oracle_price",
+                "indexPrice",
+                "index_price",
+                "lastPrice",
+                "last_price",
+                "price",
+            ):
+                v = pos.get(k)
+                if v is None or v == "":
+                    continue
+                try:
+                    dv = Decimal(str(v))
+                    if dv > 0:
+                        return dv
+                except Exception:
+                    continue
+    except Exception:
+        # We'll still try public fallback below.
+        pass
+
+    # Public fallback (no auth): index/mark/last from ticker.
+    try:
+        ref = get_reference_price(symbol)
+        return ref if ref > 0 else None
     except Exception:
         return None
 
