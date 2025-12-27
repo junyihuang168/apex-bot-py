@@ -106,56 +106,77 @@ def _get_api_credentials() -> Dict[str, str]:
 
 def _safe_call(fn, **kwargs):
     """
-    Call an SDK function in a cross-version compatible way.
+    SDK 兼容调用封装（跨版本）。
 
-    - If we can introspect the signature and the function does NOT accept **kwargs,
-      we only pass parameters that exist in the signature.
-    - If the function accepts **kwargs (VAR_KEYWORD), we pass all non-None kwargs.
-    - We do NOT "fallback" to passing all kwargs after a failure, because that
-      re-introduces unsupported parameter names and causes TypeError loops.
+    你现在的错误：
+      TypeError: ... missing 3 required positional arguments: 'side', 'type', and 'size'
+
+    典型原因是：我们用 inspect.signature 做“按签名过滤参数”时，把某些必填字段误过滤掉了，
+    导致真正调用时缺参。
+
+    解决策略：
+    - 优先尝试“按签名过滤”的调用（对稳定版本友好）
+    - 但如果出现 missing required positional arguments，则立刻回退到“不过滤的原始 kwargs”，
+      然后仅基于 "unexpected keyword argument 'X'" 逐个剔除不支持字段再重试。
     """
     call_kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
-    # Some apexomni builds wrap methods in a way that breaks signature introspection.
-    # In that case, a naive fn(**call_kwargs) will frequently throw:
-    #   TypeError: ... got an unexpected keyword argument '...'
-    # We therefore:
-    #   (1) Try signature-based filtering when available.
-    #   (2) If signature is unavailable, or the call still fails, auto-prune unsupported
-    #       keyword arguments based on the exception message.
+    def _call_with_prune(f, kw):
+        cur = dict(kw)
+        last_exc = None
+        try:
+            return f(**cur)
+        except TypeError as e:
+            last_exc = e
+            msg = str(e)
 
-    def _call_with_prune(f, payload: Dict[str, Any]):
-        p = dict(payload)
-        last = None
-        for _ in range(12):
-            try:
-                return f(**p)
-            except TypeError as e:
-                last = e
-                m = re.search(r"unexpected keyword argument '([^']+)'", str(e))
-                if m:
-                    bad = m.group(1)
-                    if bad in p:
-                        p.pop(bad, None)
-                        continue
+            # 缺必填参数：剪枝无意义，直接抛给上层做回退策略
+            if "missing" in msg and "required positional argument" in msg:
                 raise
-        if last:
-            raise last
-        raise RuntimeError("_safe_call: call failed")
 
+            for _ in range(16):
+                m = re.search(r"unexpected keyword argument ['\"]([^'\"]+)['\"]", msg)
+                if not m:
+                    break
+                bad = m.group(1)
+                cur.pop(bad, None)
+                try:
+                    return f(**cur)
+                except TypeError as e2:
+                    last_exc = e2
+                    msg = str(e2)
+                    if "missing" in msg and "required positional argument" in msg:
+                        raise
+                    continue
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("_safe_call failed")
+
+    # 1) 优先：能 introspect signature 时，先走签名过滤
     try:
         sig = inspect.signature(fn)
         params = sig.parameters
         has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+
         if has_var_kw:
+            # 真正支持 **kwargs：直接调用 + 剪枝未知参数
             return _call_with_prune(fn, call_kwargs)
+
         allowed = set(params.keys())
         filtered = {k: v for k, v in call_kwargs.items() if k in allowed}
-        return _call_with_prune(fn, filtered)
-    except (ValueError, TypeError):
-        # Signature not available (C-extensions / dynamic wrappers): prune on error.
-        return _call_with_prune(fn, call_kwargs)
 
+        try:
+            return _call_with_prune(fn, filtered)
+        except TypeError as e:
+            msg = str(e)
+            # 关键修复：如果过滤后导致缺参，回退到不过滤版本
+            if "missing" in msg and "required positional argument" in msg:
+                return _call_with_prune(fn, call_kwargs)
+            raise
+
+    except (ValueError, TypeError):
+        # signature 不可用：直接调用 + 剪枝未知参数
+        return _call_with_prune(fn, call_kwargs)
 
 def _install_compat_shims(client: HttpPrivateSign) -> None:
     """Add method aliases for SDK naming differences (no behavior changes)."""
@@ -564,7 +585,6 @@ def create_trigger_order(
 def get_open_position_for_symbol(symbol: str) -> Dict[str, Any]:
     client = get_client()
     sym = format_symbol(symbol)
-    sym_nodash = sym.replace("-", "")
 
     methods = [
         "get_positions_v3",
@@ -586,13 +606,7 @@ def get_open_position_for_symbol(symbol: str) -> Dict[str, Any]:
                 for p in data:
                     if not isinstance(p, dict):
                         continue
-                    ps = str(p.get("symbol") or p.get("market") or "").upper().strip()
-                    if not ps:
-                        continue
-                    ps_norm = ps.replace("/", "-").replace("_", "-")
-                    ps_nodash = ps_norm.replace("-", "")
-                    # Some payloads use BTCUSDT vs BTC-USDT; treat them as the same.
-                    if ps_norm == sym or ps_nodash == sym_nodash:
+                    if str(p.get("symbol") or p.get("market") or "").upper().strip() == sym:
                         return p
         except Exception:
             continue
