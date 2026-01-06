@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import random
 import inspect
 import re
@@ -7,9 +8,15 @@ import threading
 import queue
 from collections import OrderedDict
 from decimal import Decimal, ROUND_DOWN
-from typing import Any, Dict, Optional, Tuple, Union, Iterable
+from typing import Any, Dict, Optional, Tuple, Union, Iterable, Set, List
 
 import requests
+
+# Public WS client (top-of-book)
+try:
+    import websocket  # websocket-client
+except Exception:
+    websocket = None
 
 from apexomni.http_private_sign import HttpPrivateSign
 from apexomni.constants import (
@@ -68,6 +75,38 @@ _ORDER_STATE: Dict[str, Dict[str, Any]] = {}
 _FILL_Q: "queue.Queue[dict]" = queue.Queue(maxsize=20000)
 
 
+# -----------------------------------------------------------------------------
+# Public WS (L1 / top-of-book)
+#
+# Purpose:
+# - Provide best bid / best ask (BBO) for bot-side risk checks.
+# - Keep a long-lived connection with ping/pong, reconnect, and resubscribe.
+# - Subscribe to: orderBook25.H.{symbol}
+#
+# Notes:
+# - This does NOT replace any private/fill logic; it is an additional market-data feed.
+# - We intentionally keep only a small in-memory book (25 levels) per topic.
+# -----------------------------------------------------------------------------
+
+_PUB_WS_STARTED = False
+_PUB_WS_LOCK = threading.Lock()
+
+_PUB_WS_THREAD: Optional[threading.Thread] = None
+_PUB_WS_APP: Any = None
+
+_PUB_WS_SEND_Q: "queue.Queue[dict]" = queue.Queue(maxsize=5000)
+_PUB_WS_DESIRED_TOPICS: Set[str] = set()
+_PUB_WS_TOPICS_LOCK = threading.Lock()
+
+_PUB_LAST_MSG_TS = 0.0
+_PUB_LAST_PONG_TS = 0.0
+
+_BOOKS_BY_TOPIC: Dict[str, Dict[str, Any]] = {}
+
+_L1_LOCK = threading.Lock()
+_L1_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
 # REST poller
 _REST_POLL_STARTED = False
 _REST_POLL_LOCK = threading.Lock()
@@ -93,6 +132,30 @@ def _get_ws_endpoint() -> Optional[str]:
     if env_name in {"main", "mainnet", "prod", "production"}:
         use_mainnet = True
     return APEX_OMNI_WS_MAIN if use_mainnet else APEX_OMNI_WS_TEST
+
+
+def _get_public_ws_endpoint() -> str:
+    """Public market-data WS endpoint.
+
+    The ApeX Omni public quote WS is separate from the private WS endpoint used by the SDK.
+    We allow overriding via env for maximum compatibility.
+    """
+    override = str(os.getenv("APEX_PUBLIC_WS_URL", "")).strip()
+    if override:
+        return override
+
+    use_mainnet = _env_bool("APEX_USE_MAINNET", False)
+    env_name = str(os.getenv("APEX_ENV", "")).lower()
+    if env_name in {"main", "mainnet", "prod", "production"}:
+        use_mainnet = True
+
+    # Defaults based on ApeX Omni docs/examples.
+    # If these ever change, set APEX_PUBLIC_WS_URL explicitly.
+    return (
+        "wss://quote.omni.apex.exchange/realtime_public"
+        if use_mainnet
+        else "wss://quote-qa.omni.apex.exchange/realtime_public"
+    )
 
 
 def _get_api_credentials() -> Dict[str, str]:
@@ -1526,3 +1589,313 @@ def format_symbol(symbol: str) -> str:
 def format_symbol_for_ticker(symbol: str) -> str:
     """Normalize to public ticker crossSymbolName (e.g., 'BTCUSDT')."""
     return re.sub(r"[^A-Z0-9]", "", format_symbol(symbol))
+
+
+# ──────────────────────────────────────────────────────────────
+# PUBLIC WS (L1) HELPERS
+# ──────────────────────────────────────────────────────────────
+
+_KNOWN_QUOTES: Tuple[str, ...] = ("USDT", "USDC", "USD", "BTC", "ETH")
+
+
+def _canon_symbol_from_ws_symbol(raw: str) -> str:
+    """Convert WS topic symbol into canonical 'BASE-QUOTE' if possible."""
+    s = str(raw or "").upper().replace("/", "-").replace("_", "-").strip()
+    if "-" in s:
+        return format_symbol(s)
+    for q in _KNOWN_QUOTES:
+        if s.endswith(q) and len(s) > len(q):
+            return f"{s[:-len(q)]}-{q}"
+    return s
+
+
+def _topics_for_symbol(symbol: str, limit: int = 25, speed: str = "H") -> List[str]:
+    """Return one or more candidate topics for a symbol.
+
+    We subscribe to the canonical dash symbol and (optionally) the no-dash variant to
+    tolerate exchange/topic format drift.
+    """
+    lim = 25 if int(limit) != 200 else 200
+    spd = str(speed or "H").upper()
+    if spd not in {"H", "M"}:
+        spd = "H"
+
+    sym_dash = format_symbol(symbol)
+    sym_nodash = format_symbol_for_ticker(symbol)
+
+    topics = [f"orderBook{lim}.{spd}.{sym_dash}"]
+
+    # Default on: subscribe nodash too for compatibility.
+    if _env_bool("PUBLIC_WS_SUBSCRIBE_NODASH", True) and sym_nodash and sym_nodash != sym_dash:
+        topics.append(f"orderBook{lim}.{spd}.{sym_nodash}")
+    return topics
+
+
+def get_l1_bid_ask(symbol: str) -> Tuple[Optional[Decimal], Optional[Decimal], float]:
+    """Return (best_bid, best_ask, ts) from public WS cache."""
+    sym = format_symbol(symbol)
+    with _L1_LOCK:
+        row = _L1_CACHE.get(sym)
+        if not row:
+            return None, None, 0.0
+        return row.get("bid"), row.get("ask"), float(row.get("ts") or 0.0)
+
+
+def ensure_public_depth_subscription(symbol: str, limit: int = 25, speed: str = "H") -> None:
+    """Ensure the public WS is running and subscribed to orderBook topics for this symbol."""
+    start_public_ws()
+    topics = _topics_for_symbol(symbol, limit=limit, speed=speed)
+    new_topics: List[str] = []
+    with _PUB_WS_TOPICS_LOCK:
+        for t in topics:
+            if t not in _PUB_WS_DESIRED_TOPICS:
+                _PUB_WS_DESIRED_TOPICS.add(t)
+                new_topics.append(t)
+
+    # If WS is already connected, request subscribe immediately.
+    for t in new_topics:
+        try:
+            _PUB_WS_SEND_Q.put_nowait({"op": "subscribe", "args": [t]})
+        except Exception:
+            pass
+
+
+def start_public_ws() -> None:
+    """Idempotent starter for the public market-data WS."""
+    global _PUB_WS_STARTED, _PUB_WS_THREAD
+    with _PUB_WS_LOCK:
+        if _PUB_WS_STARTED:
+            return
+        _PUB_WS_STARTED = True
+
+    if websocket is None:
+        print("[apex_client][PUBWS] websocket-client unavailable; public WS disabled")
+        return
+
+    url = _get_public_ws_endpoint()
+
+    # Tunables
+    ping_interval = float(os.getenv("PUBLIC_WS_PING_SEC", "15"))
+    pong_timeout = float(os.getenv("PUBLIC_WS_PONG_TIMEOUT_SEC", "10"))
+    idle_reconnect = float(os.getenv("PUBLIC_WS_IDLE_RECONNECT_SEC", "45"))
+
+    def _parse_levels(val: Any) -> List[Tuple[Decimal, Decimal]]:
+        out: List[Tuple[Decimal, Decimal]] = []
+        if not val:
+            return out
+        if isinstance(val, dict):
+            # Some feeds use {price: size}
+            for pk, sv in val.items():
+                try:
+                    p = Decimal(str(pk))
+                    s = Decimal(str(sv))
+                    out.append((p, s))
+                except Exception:
+                    continue
+            return out
+        if isinstance(val, list):
+            for row in val:
+                if not isinstance(row, (list, tuple)) or len(row) < 2:
+                    continue
+                try:
+                    p = Decimal(str(row[0]))
+                    s = Decimal(str(row[1]))
+                    out.append((p, s))
+                except Exception:
+                    continue
+        return out
+
+    def _update_book(topic: str, payload: Dict[str, Any]) -> None:
+        # Extract symbol from topic: orderBook25.H.BTC-USDT
+        parts = str(topic).split(".")
+        ws_sym = parts[-1] if parts else ""
+        canon = _canon_symbol_from_ws_symbol(ws_sym)
+
+        book = _BOOKS_BY_TOPIC.get(topic)
+        if book is None:
+            book = {"bids": {}, "asks": {}, "u": None}
+            _BOOKS_BY_TOPIC[topic] = book
+
+        # Determine whether snapshot or delta
+        mtype = str(payload.get("type") or payload.get("action") or "").lower()
+        is_snapshot = mtype in {"snapshot", "partial", "init"} or payload.get("snapshot") is True
+
+        # Locate data container
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+
+        # Update id (optional)
+        u = data.get("u") if isinstance(data, dict) else None
+        if u is None and isinstance(payload.get("u"), (int, str)):
+            u = payload.get("u")
+        try:
+            u_int = int(u) if u is not None and str(u).strip() != "" else None
+        except Exception:
+            u_int = None
+
+        # Basic monotonic check: if u regresses, ignore this update.
+        prev_u = book.get("u")
+        if u_int is not None and isinstance(prev_u, int) and u_int <= prev_u:
+            return
+
+        bids_val = None
+        asks_val = None
+        if isinstance(data, dict):
+            # Common variants: bids/asks, b/a
+            bids_val = data.get("bids") if "bids" in data else data.get("b")
+            asks_val = data.get("asks") if "asks" in data else data.get("a")
+
+        bids = _parse_levels(bids_val)
+        asks = _parse_levels(asks_val)
+
+        # Snapshot replaces; delta applies
+        if is_snapshot:
+            book["bids"] = {}
+            book["asks"] = {}
+
+        # Apply updates
+        for p, s in bids:
+            if s <= 0:
+                book["bids"].pop(p, None)
+            else:
+                book["bids"][p] = s
+        for p, s in asks:
+            if s <= 0:
+                book["asks"].pop(p, None)
+            else:
+                book["asks"][p] = s
+
+        if u_int is not None:
+            book["u"] = u_int
+
+        # Compute BBO
+        try:
+            best_bid = max(book["bids"].keys()) if book["bids"] else None
+            best_ask = min(book["asks"].keys()) if book["asks"] else None
+        except Exception:
+            best_bid, best_ask = None, None
+
+        if best_bid is None or best_ask is None:
+            # Don't overwrite cache with empties.
+            return
+
+        now = time.time()
+        with _L1_LOCK:
+            _L1_CACHE[canon] = {
+                "bid": best_bid,
+                "ask": best_ask,
+                "ts": now,
+                "topic": topic,
+                "u": book.get("u"),
+            }
+
+    def _run_forever() -> None:
+        global _PUB_WS_APP, _PUB_LAST_MSG_TS, _PUB_LAST_PONG_TS
+        backoff = 1.0
+
+        def _on_open(wsapp):
+            nonlocal backoff
+            print(f"[apex_client][PUBWS] connected: {url}")
+            backoff = 1.0
+            # Subscribe desired topics
+            with _PUB_WS_TOPICS_LOCK:
+                topics = list(_PUB_WS_DESIRED_TOPICS)
+            if topics:
+                try:
+                    wsapp.send(json.dumps({"op": "subscribe", "args": topics}))
+                    print(f"[apex_client][PUBWS] subscribed {len(topics)} topics")
+                except Exception as e:
+                    print("[apex_client][PUBWS] subscribe on_open failed:", e)
+
+        def _on_message(wsapp, message: str):
+            nonlocal backoff
+            try:
+                _PUB_LAST_MSG_TS = time.time()
+                msg = json.loads(message) if isinstance(message, str) else message
+                if not isinstance(msg, dict):
+                    return
+
+                op = str(msg.get("op") or "").lower()
+                if op == "pong":
+                    _PUB_LAST_PONG_TS = time.time()
+                    return
+
+                topic = msg.get("topic") or msg.get("stream") or msg.get("channel")
+                if topic:
+                    _update_book(str(topic), msg)
+            except Exception:
+                # ignore parse errors (do not kill connection)
+                return
+
+        def _on_error(wsapp, error):
+            print("[apex_client][PUBWS] error:", error)
+
+        def _on_close(wsapp, status_code, msg):
+            print(f"[apex_client][PUBWS] closed: code={status_code} msg={msg}")
+
+        while True:
+            try:
+                _PUB_LAST_MSG_TS = time.time()
+                _PUB_LAST_PONG_TS = time.time()
+                _PUB_WS_APP = websocket.WebSocketApp(
+                    url,
+                    on_open=_on_open,
+                    on_message=_on_message,
+                    on_error=_on_error,
+                    on_close=_on_close,
+                )
+
+                # Sender + heartbeat loop
+                def _heartbeat_and_sender():
+                    while True:
+                        # Flush outbound subscribe commands
+                        try:
+                            cmd = _PUB_WS_SEND_Q.get(timeout=0.5)
+                            if cmd and isinstance(cmd, dict):
+                                try:
+                                    _PUB_WS_APP.send(json.dumps(cmd))
+                                except Exception:
+                                    return
+                        except Exception:
+                            pass
+
+                        now = time.time()
+
+                        # Ping
+                        if ping_interval > 0 and now - _PUB_LAST_PONG_TS >= ping_interval:
+                            try:
+                                _PUB_WS_APP.send(json.dumps({"op": "ping"}))
+                            except Exception:
+                                return
+
+                        # Pong timeout
+                        if pong_timeout > 0 and now - _PUB_LAST_PONG_TS > (ping_interval + pong_timeout):
+                            try:
+                                _PUB_WS_APP.close()
+                            except Exception:
+                                pass
+                            return
+
+                        # Idle reconnect (socket might be "open" but not receiving)
+                        if idle_reconnect > 0 and now - _PUB_LAST_MSG_TS > idle_reconnect:
+                            try:
+                                _PUB_WS_APP.close()
+                            except Exception:
+                                pass
+                            return
+
+                threading.Thread(target=_heartbeat_and_sender, daemon=True, name="apex-public-ws-heartbeat").start()
+                _PUB_WS_APP.run_forever(ping_interval=0, ping_timeout=None)
+
+            except Exception as e:
+                print(f"[apex_client][PUBWS] reconnect: {e} (sleep {backoff}s)")
+                time.sleep(backoff)
+                backoff = min(backoff * 2.0, 30.0)
+                continue
+
+            # run_forever returned -> reconnect
+            print(f"[apex_client][PUBWS] reconnecting (sleep {backoff}s)")
+            time.sleep(backoff)
+            backoff = min(backoff * 2.0, 30.0)
+
+    _PUB_WS_THREAD = threading.Thread(target=_run_forever, daemon=True, name="apex-public-ws")
+    _PUB_WS_THREAD.start()
