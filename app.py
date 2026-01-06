@@ -10,6 +10,9 @@ from apex_client import (
     create_market_order,
     get_market_price,
     get_reference_price,
+    get_l1_bid_ask,
+    ensure_public_depth_subscription,
+    start_public_ws,
     get_fill_summary,
     get_open_position_for_symbol,
     _get_symbol_rules,
@@ -177,6 +180,11 @@ LADDER_LEVELS_RAW = os.getenv("LADDER_LEVELS", _DEFAULT_LADDER_LEVELS)
 # Risk poll interval (seconds)
 RISK_POLL_INTERVAL = float(os.getenv("RISK_POLL_INTERVAL", "1.0"))
 
+# L1 (best bid/ask) settings for ladder risk checks
+L1_STALE_SEC = float(os.getenv("L1_STALE_SEC", "2.0"))
+L1_FALLBACK_TO_MARK = str(os.getenv("L1_FALLBACK_TO_MARK", "1")).strip() == "1"
+
+
 
 def _parse_ladder_levels(s: str):
     out = []
@@ -254,6 +262,46 @@ def _get_mark_price(symbol: str) -> Optional[Decimal]:
         return ref if ref > 0 else None
     except Exception:
         return None
+
+
+def _get_l1_risk_price(symbol: str, direction: str) -> Tuple[Optional[Decimal], str, Optional[Decimal], Optional[Decimal]]:
+    """Return (ref_price, source, best_bid, best_ask).
+
+    For ladder risk checks:
+      - LONG  uses best_bid
+      - SHORT uses best_ask
+
+    If L1 is unavailable or stale, we optionally fall back to mark/ticker reference.
+    """
+    sym = str(symbol).upper().strip()
+    dir_u = str(direction or "").upper().strip()
+
+    # Ensure subscription exists (idempotent). Public WS is started in worker.
+    try:
+        ensure_public_depth_subscription(sym, limit=25, speed="H")
+    except Exception:
+        pass
+
+    bid, ask, ts = None, None, 0.0
+    try:
+        bid, ask, ts = get_l1_bid_ask(sym)
+    except Exception:
+        bid, ask, ts = None, None, 0.0
+
+    now = time.time()
+    if bid is not None and ask is not None and bid > 0 and ask > 0 and (now - float(ts)) <= L1_STALE_SEC:
+        if dir_u == "LONG":
+            return bid, "L1_BID", bid, ask
+        return ask, "L1_ASK", bid, ask
+
+    if L1_FALLBACK_TO_MARK:
+        m = _get_mark_price(sym)
+        if m is not None and m > 0:
+            remember_bid = bid if (bid is not None and bid > 0) else None
+            remember_ask = ask if (ask is not None and ask > 0) else None
+            return m, "MARK_FALLBACK", remember_bid, remember_ask
+
+    return None, "NO_PRICE", bid, ask
 
 
 def _compute_profit_pct(direction: str, entry: Decimal, mark: Decimal) -> Decimal:
@@ -537,20 +585,21 @@ def _risk_loop():
                     if qty <= 0 or entry <= 0:
                         continue
 
-                    mark = _get_mark_price(symbol)
-                    if mark is None or mark <= 0:
+                    ref_price, ref_src, best_bid, best_ask = _get_l1_risk_price(symbol, direction)
+                    if ref_price is None or ref_price <= 0:
                         continue
 
-                    profit_pct = _compute_profit_pct(direction, entry, mark)
+                    profit_pct = _compute_profit_pct(direction, entry, ref_price)
                     lock_pct = _maybe_raise_lock(bot_id, symbol, direction, profit_pct)
                     stop_price = _compute_stop_price(direction, entry, Decimal(str(lock_pct)))
 
-                    if _ladder_should_stop(direction, mark, stop_price):
+                    if _ladder_should_stop(direction, ref_price, stop_price):
                         if not _exit_guard_allow(bot_id, symbol):
                             continue
                         print(
                             f"[LADDER] STOP bot={bot_id} {direction} {symbol} qty={qty} "
-                            f"entry={entry} mark={mark} profit%={profit_pct:.4f} lock%={lock_pct} stop={stop_price}"
+                            f"entry={entry} ref={ref_price} src={ref_src} "
+                            f"bid={best_bid} ask={best_ask} profit%={profit_pct:.4f} lock%={lock_pct} stop={stop_price}"
                         )
                         _ladder_close_position(bot_id, symbol, direction, qty, reason="ladder_stop")
 
@@ -585,6 +634,12 @@ def _ensure_monitor_thread():
 
         if ENABLE_WS:
             start_private_ws()
+            # Public WS for L1 bid/ask (orderBook25.H.*) used by ladder risk checks.
+            # Safe to call multiple times.
+            try:
+                start_public_ws()
+            except Exception as e:
+                print("[SYSTEM] public WS failed to start:", e)
             _ensure_risk_thread()
 
             # ✅ Backup path: REST poll orders every N seconds (main path still WS)
@@ -655,6 +710,8 @@ def api_pnl():
                 "qty": str(qty),
                 "weighted_entry": str(wentry),
                 "mark_price": str(px),
+                "l1_bid": str(get_l1_bid_ask(symbol)[0]) if get_l1_bid_ask(symbol)[0] is not None else None,
+                "l1_ask": str(get_l1_bid_ask(symbol)[1]) if get_l1_bid_ask(symbol)[1] is not None else None,
             })
 
         base.update({
