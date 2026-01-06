@@ -13,6 +13,11 @@ def main():
     os.environ.setdefault("ENABLE_REST_POLL", "1")
     os.environ.setdefault("ENABLE_EXCHANGE_PROTECTIVE", "0")  # bot-side stops only
 
+    # Public WS (L1) defaults (used by ladder risk checks)
+    os.environ.setdefault("L1_FALLBACK_TO_MARK", "1")
+    os.environ.setdefault("L1_STALE_SEC", os.getenv("L1_STALE_SEC", "2.0"))
+    os.environ.setdefault("PUBLIC_WS_PING_SEC", os.getenv("PUBLIC_WS_PING_SEC", "15"))
+
     init_db()
 
     try:
