@@ -43,6 +43,7 @@ DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "")
 
 # ✅ 只让 worker 进程启用 WS/Fills（supervisord.conf 里给 worker 设置 ENABLE_WS="1"，web 设置 "0"）
 ENABLE_WS = str(os.getenv("ENABLE_WS", "0")).strip() == "1"
+ENABLE_RISK_LOOP = str(os.getenv("ENABLE_RISK_LOOP", "0")).strip() == "1"  # run ladder risk loop in this process
 
 # 退出互斥窗口（秒）：防止重复平仓
 EXIT_COOLDOWN_SEC = float(os.getenv("EXIT_COOLDOWN_SEC", "2.0"))
@@ -179,6 +180,9 @@ LADDER_LEVELS_RAW = os.getenv("LADDER_LEVELS", _DEFAULT_LADDER_LEVELS)
 
 # Risk poll interval (seconds)
 RISK_POLL_INTERVAL = float(os.getenv("RISK_POLL_INTERVAL", "1.0"))
+LADDER_DEBUG = str(os.getenv("LADDER_DEBUG", "0")).strip() == "1"
+LADDER_DEBUG_EVERY_SEC = float(os.getenv("LADDER_DEBUG_EVERY_SEC", "10.0"))
+_LADDER_STATUS_TS = {}  # key -> last print ts
 
 # L1 (best bid/ask) settings for ladder risk checks
 L1_STALE_SEC = float(os.getenv("L1_STALE_SEC", "2.0"))
@@ -468,6 +472,9 @@ def _maybe_raise_lock(bot_id: str, symbol: str, direction: str, profit_pct: Deci
     if desired is not None and desired > cur:
         try:
             set_lock_level_pct(bot_id, symbol, direction, desired)
+            print(
+                f"[LADDER] RAISE_LOCK bot={bot_id} {direction} {symbol} profit%={profit_pct:.4f} lock% {cur} -> {desired}"
+            )
             return desired
         except Exception:
             return cur
@@ -593,6 +600,21 @@ def _risk_loop():
                     lock_pct = _maybe_raise_lock(bot_id, symbol, direction, profit_pct)
                     stop_price = _compute_stop_price(direction, entry, Decimal(str(lock_pct)))
 
+                    if LADDER_DEBUG:
+                        try:
+                            key = f"{bot_id}:{direction}:{symbol}"
+                            now = time.time()
+                            last = _LADDER_STATUS_TS.get(key, 0.0)
+                            if now - last >= LADDER_DEBUG_EVERY_SEC:
+                                _LADDER_STATUS_TS[key] = now
+                                print(
+                                    f"[LADDER] STATUS bot={bot_id} {direction} {symbol} qty={qty} "
+                                    f"entry={entry} ref={ref_price} src={ref_src} "
+                                    f"bid={best_bid} ask={best_ask} profit%={profit_pct:.4f} lock%={lock_pct} stop={stop_price}"
+                                )
+                        except Exception:
+                            pass
+
                     if _ladder_should_stop(direction, ref_price, stop_price):
                         if not _exit_guard_allow(bot_id, symbol):
                             continue
@@ -634,14 +656,6 @@ def _ensure_monitor_thread():
 
         if ENABLE_WS:
             start_private_ws()
-            # Public WS for L1 bid/ask (orderBook25.H.*) used by ladder risk checks.
-            # Safe to call multiple times.
-            try:
-                start_public_ws()
-            except Exception as e:
-                print("[SYSTEM] public WS failed to start:", e)
-            _ensure_risk_thread()
-
             # ✅ Backup path: REST poll orders every N seconds (main path still WS)
             if str(os.getenv("ENABLE_REST_POLL", "1")).strip() == "1":
                 try:
@@ -653,6 +667,19 @@ def _ensure_monitor_thread():
             print("[SYSTEM] WS enabled in this process (ENABLE_WS=1)")
         else:
             print("[SYSTEM] WS disabled in this process (ENABLE_WS=0)")
+
+        # Ladder risk loop (bot-side trailing stop) is controlled independently of private WS.
+        if ENABLE_RISK_LOOP:
+            # Public WS for L1 bid/ask (orderBook25.H.*) used by ladder risk checks.
+            # Safe to call multiple times.
+            try:
+                start_public_ws()
+            except Exception as e:
+                print("[SYSTEM] public WS failed to start:", e)
+            _ensure_risk_thread()
+            print("[SYSTEM] ladder risk enabled in this process (ENABLE_RISK_LOOP=1)")
+        else:
+            print("[SYSTEM] ladder risk disabled in this process (ENABLE_RISK_LOOP=0)")
 
         _MONITOR_THREAD_STARTED = True
         print("[SYSTEM] monitor/ws threads ready")
