@@ -443,6 +443,9 @@ def get_bot_summary(bot_id: str) -> Dict[str, Any]:
 # Lock level persistence（保留兼容）
 # ---------------------------
 def get_lock_level_pct(bot_id: str, symbol: str, direction: str) -> Decimal:
+    bot_id = str(bot_id).upper().strip()
+    symbol = str(symbol).upper().strip()
+    direction = str(direction).upper().strip()
     conn = _connect()
     cur = conn.cursor()
     cur.execute("""
@@ -460,6 +463,9 @@ def get_lock_level_pct(bot_id: str, symbol: str, direction: str) -> Decimal:
 
 
 def set_lock_level_pct(bot_id: str, symbol: str, direction: str, lock_level_pct: Decimal):
+    bot_id = str(bot_id).upper().strip()
+    symbol = str(symbol).upper().strip()
+    direction = str(direction).upper().strip()
     lvl = _d(lock_level_pct)
 
     def _w(conn: sqlite3.Connection):
@@ -476,6 +482,9 @@ def set_lock_level_pct(bot_id: str, symbol: str, direction: str, lock_level_pct:
 
 
 def clear_lock_level_pct(bot_id: str, symbol: str, direction: str):
+    bot_id = str(bot_id).upper().strip()
+    symbol = str(symbol).upper().strip()
+    direction = str(direction).upper().strip()
     def _w(conn: sqlite3.Connection):
         cur = conn.cursor()
         cur.execute("""
