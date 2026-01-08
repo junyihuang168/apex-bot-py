@@ -1792,21 +1792,6 @@ def start_public_ws() -> None:
 
         now = time.time()
 
-                        # Periodic re-subscribe (keeps topics alive across transient WS issues)
-                        if resubscribe_sec > 0:
-                            try:
-                                with _PUB_WS_TOPICS_LOCK:
-                                    topics_now = list(_PUB_WS_DESIRED_TOPICS)
-                                if topics_now and (time.time() - _PUB_WS_LAST_SUB_TS) >= resubscribe_sec:
-                                    try:
-                                        _PUB_WS_APP.send(json.dumps({"op": "subscribe", "args": topics_now}))
-                                        _PUB_WS_ACTIVE_TOPICS.update(set(topics_now))
-                                        _PUB_WS_LAST_SUB_TS = time.time()
-                                    except Exception:
-                                        return
-                            except Exception:
-                                pass
-
         with _L1_LOCK:
             _L1_CACHE[canon] = {
                 "bid": best_bid,
