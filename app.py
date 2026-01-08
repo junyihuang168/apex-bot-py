@@ -563,11 +563,12 @@ def _ladder_close_position(bot_id: str, symbol: str, direction: str, qty: Decima
 def _risk_loop():
     print(f"[LADDER] risk loop started (interval={RISK_POLL_INTERVAL}s)")
     while True:
-        try:
-            # bots that have ladder enabled
-            bots = sorted({*_parse_bot_list(','.join(LADDER_LONG_BOTS)), *_parse_bot_list(','.join(LADDER_SHORT_BOTS))})
-        except Exception:
-            bots = list(LADDER_LONG_BOTS | LADDER_SHORT_BOTS)
+        # bots that have ladder enabled
+        bots = sorted(LADDER_LONG_BOTS | LADDER_SHORT_BOTS)
+        # Safety: if env vars were accidentally set to empty, fall back to defaults unless explicitly allowed.
+        if (not bots) and str(os.getenv("ALLOW_EMPTY_LADDER_BOTS", "0")).strip() != "1":
+            bots = sorted(_ALLOWED_LONG_TPSL | _ALLOWED_SHORT_TPSL)
+            print(f"[LADDER] WARNING: ladder bot list empty; falling back to defaults: {bots}")
 
         for bot_id in bots:
             try:
@@ -640,6 +641,10 @@ def _ensure_risk_thread():
         t.start()
         _RISK_THREAD_STARTED = True
         print("[LADDER] risk thread created")
+        try:
+            print(f"[LADDER] config long_bots={sorted(LADDER_LONG_BOTS)} short_bots={sorted(LADDER_SHORT_BOTS)} base_sl={LADDER_BASE_SL_PCT}% levels={LADDER_LEVELS_RAW} l1_stale={L1_STALE_SEC}s fallback_to_mark={L1_FALLBACK_TO_MARK}")
+        except Exception:
+            pass
 
 def _ensure_monitor_thread():
     """
@@ -656,6 +661,14 @@ def _ensure_monitor_thread():
 
         if ENABLE_WS:
             start_private_ws()
+            # Public market-data WS (L1 bid/ask)
+            if str(os.getenv("ENABLE_PUBLIC_WS", "1")).strip() == "1":
+                try:
+                    start_public_ws()
+                    print("[SYSTEM] Public WS enabled (L1)")
+                except Exception as e:
+                    print("[SYSTEM] Public WS failed to start:", e)
+
             # ✅ Backup path: REST poll orders every N seconds (main path still WS)
             if str(os.getenv("ENABLE_REST_POLL", "1")).strip() == "1":
                 try:
@@ -1097,6 +1110,12 @@ def tv_webhook():
     if not symbol:
         return "missing symbol", 400
     symbol = str(symbol).upper().strip()
+
+    # Ensure public L1 subscription early (so bid/ask is ready for risk loop)
+    try:
+        ensure_public_depth_subscription(symbol, limit=25, speed="H")
+    except Exception as e:
+        print(f"[WEBHOOK] public depth subscribe failed for {symbol}: {e}")
 
     bot_id = _canon_bot_id(body.get("bot_id", "BOT_1"))
     side_raw = str(body.get("side", "")).upper().strip()
