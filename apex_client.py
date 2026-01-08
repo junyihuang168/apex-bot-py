@@ -94,6 +94,11 @@ _PUB_WS_LOCK = threading.Lock()
 _PUB_WS_THREAD: Optional[threading.Thread] = None
 _PUB_WS_APP: Any = None
 
+_PUB_WS_CONNECTED = False
+_PUB_WS_CONN_TS = 0.0
+_PUB_WS_LAST_SUB_TS = 0.0
+_PUB_WS_ACTIVE_TOPICS: Set[str] = set()
+
 _PUB_WS_SEND_Q: "queue.Queue[dict]" = queue.Queue(maxsize=5000)
 _PUB_WS_DESIRED_TOPICS: Set[str] = set()
 _PUB_WS_TOPICS_LOCK = threading.Lock()
@@ -1653,6 +1658,11 @@ def ensure_public_depth_subscription(symbol: str, limit: int = 25, speed: str = 
                 new_topics.append(t)
 
     # If WS is already connected, request subscribe immediately.
+    if new_topics and _env_bool("PUBLIC_WS_LOG_SUBS", False):
+        try:
+            print(f"[apex_client][PUBWS] want topics for {format_symbol(symbol)}: {new_topics}")
+        except Exception:
+            pass
     for t in new_topics:
         try:
             _PUB_WS_SEND_Q.put_nowait({"op": "subscribe", "args": [t]})
@@ -1678,6 +1688,8 @@ def start_public_ws() -> None:
     ping_interval = float(os.getenv("PUBLIC_WS_PING_SEC", "15"))
     pong_timeout = float(os.getenv("PUBLIC_WS_PONG_TIMEOUT_SEC", "10"))
     idle_reconnect = float(os.getenv("PUBLIC_WS_IDLE_RECONNECT_SEC", "45"))
+    resubscribe_sec = float(os.getenv("PUBLIC_WS_RESUBSCRIBE_SEC", "60"))
+    idle_close_without_topics = _env_bool("PUBLIC_WS_IDLE_CLOSE_WITHOUT_TOPICS", False)
 
     def _parse_levels(val: Any) -> List[Tuple[Decimal, Decimal]]:
         out: List[Tuple[Decimal, Decimal]] = []
@@ -1779,6 +1791,22 @@ def start_public_ws() -> None:
             return
 
         now = time.time()
+
+                        # Periodic re-subscribe (keeps topics alive across transient WS issues)
+                        if resubscribe_sec > 0:
+                            try:
+                                with _PUB_WS_TOPICS_LOCK:
+                                    topics_now = list(_PUB_WS_DESIRED_TOPICS)
+                                if topics_now and (time.time() - _PUB_WS_LAST_SUB_TS) >= resubscribe_sec:
+                                    try:
+                                        _PUB_WS_APP.send(json.dumps({"op": "subscribe", "args": topics_now}))
+                                        _PUB_WS_ACTIVE_TOPICS.update(set(topics_now))
+                                        _PUB_WS_LAST_SUB_TS = time.time()
+                                    except Exception:
+                                        return
+                            except Exception:
+                                pass
+
         with _L1_LOCK:
             _L1_CACHE[canon] = {
                 "bid": best_bid,
@@ -1793,8 +1821,12 @@ def start_public_ws() -> None:
         backoff = 1.0
 
         def _on_open(wsapp):
+            global _PUB_WS_CONNECTED, _PUB_WS_CONN_TS, _PUB_WS_ACTIVE_TOPICS, _PUB_WS_LAST_SUB_TS
             nonlocal backoff
             print(f"[apex_client][PUBWS] connected: {url}")
+            _PUB_WS_CONNECTED = True
+            _PUB_WS_CONN_TS = time.time()
+            _PUB_WS_ACTIVE_TOPICS = set()
             backoff = 1.0
             # Subscribe desired topics
             with _PUB_WS_TOPICS_LOCK:
@@ -1802,6 +1834,8 @@ def start_public_ws() -> None:
             if topics:
                 try:
                     wsapp.send(json.dumps({"op": "subscribe", "args": topics}))
+                    _PUB_WS_ACTIVE_TOPICS.update(set(topics))
+                    _PUB_WS_LAST_SUB_TS = time.time()
                     print(f"[apex_client][PUBWS] subscribed {len(topics)} topics")
                 except Exception as e:
                     print("[apex_client][PUBWS] subscribe on_open failed:", e)
@@ -1860,6 +1894,22 @@ def start_public_ws() -> None:
 
                         now = time.time()
 
+                        # Periodic re-subscribe (keeps topics alive across transient WS issues)
+                        if resubscribe_sec > 0:
+                            try:
+                                with _PUB_WS_TOPICS_LOCK:
+                                    topics_now = list(_PUB_WS_DESIRED_TOPICS)
+                                if topics_now and (time.time() - _PUB_WS_LAST_SUB_TS) >= resubscribe_sec:
+                                    try:
+                                        _PUB_WS_APP.send(json.dumps({"op": "subscribe", "args": topics_now}))
+                                        _PUB_WS_ACTIVE_TOPICS.update(set(topics_now))
+                                        _PUB_WS_LAST_SUB_TS = time.time()
+                                    except Exception:
+                                        return
+                            except Exception:
+                                pass
+
+
                         # Ping
                         if ping_interval > 0 and now - _PUB_LAST_PONG_TS >= ping_interval:
                             try:
@@ -1876,7 +1926,15 @@ def start_public_ws() -> None:
                             return
 
                         # Idle reconnect (socket might be "open" but not receiving)
-                        if idle_reconnect > 0 and now - _PUB_LAST_MSG_TS > idle_reconnect:
+                        with _PUB_WS_TOPICS_LOCK:
+                            has_topics = bool(_PUB_WS_DESIRED_TOPICS)
+                        if idle_close_without_topics and (not has_topics) and idle_reconnect > 0 and now - _PUB_LAST_MSG_TS > idle_reconnect:
+                            try:
+                                _PUB_WS_APP.close()
+                            except Exception:
+                                pass
+                            return
+                        if idle_reconnect > 0 and has_topics and now - _PUB_LAST_MSG_TS > idle_reconnect:
                             try:
                                 _PUB_WS_APP.close()
                             except Exception:
