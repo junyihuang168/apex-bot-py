@@ -1685,9 +1685,12 @@ def start_public_ws() -> None:
     url = _get_public_ws_endpoint()
 
     # Tunables
-    ping_interval = float(os.getenv("PUBLIC_WS_PING_SEC", "15"))
-    pong_timeout = float(os.getenv("PUBLIC_WS_PONG_TIMEOUT_SEC", "10"))
-    idle_reconnect = float(os.getenv("PUBLIC_WS_IDLE_RECONNECT_SEC", "45"))
+    # NOTE: Many quote WS implementations rely on websocket-level ping frames, not app-level JSON {"op":"ping"}.
+    # We therefore DISABLE app-level ping by default to avoid being disconnected for sending an unknown message.
+    # If you confirm the server expects JSON ping/pong, set PUBLIC_WS_PING_SEC > 0.
+    ping_interval = float(os.getenv("PUBLIC_WS_PING_SEC", "0"))
+    pong_timeout = float(os.getenv("PUBLIC_WS_PONG_TIMEOUT_SEC", "0"))
+    idle_reconnect = float(os.getenv("PUBLIC_WS_IDLE_RECONNECT_SEC", "120"))
     resubscribe_sec = float(os.getenv("PUBLIC_WS_RESUBSCRIBE_SEC", "60"))
     idle_close_without_topics = _env_bool("PUBLIC_WS_IDLE_CLOSE_WITHOUT_TOPICS", False)
 
@@ -1826,17 +1829,79 @@ def start_public_ws() -> None:
                     print("[apex_client][PUBWS] subscribe on_open failed:", e)
 
         def _on_message(wsapp, message: str):
+            """Handle messages from the public quote WS.
+
+            Important: update global timestamps so idle/pong logic works.
+            The exchange may also send application-level pings that must be
+            replied to, otherwise the server will close the socket.
+            """
+            global _PUB_LAST_MSG_TS, _PUB_LAST_PONG_TS
             nonlocal backoff
             try:
-                _PUB_LAST_MSG_TS = time.time()
+                now_ts = time.time()
+                _PUB_LAST_MSG_TS = now_ts
+
+                # websocket-client may pass bytes
+                if isinstance(message, (bytes, bytearray)):
+                    try:
+                        message = message.decode("utf-8", errors="ignore")
+                    except Exception:
+                        return
+
+                # Some exchanges send plain "ping" / "pong" strings
+                if isinstance(message, str):
+                    m = message.strip().lower()
+                    if m == "pong":
+                        _PUB_LAST_PONG_TS = now_ts
+                        return
+                    if m == "ping":
+                        try:
+                            wsapp.send("pong")
+                        except Exception:
+                            pass
+                        _PUB_LAST_PONG_TS = now_ts
+                        return
+
                 msg = json.loads(message) if isinstance(message, str) else message
                 if not isinstance(msg, dict):
                     return
 
-                op = str(msg.get("op") or "").lower()
-                if op == "pong":
-                    _PUB_LAST_PONG_TS = time.time()
+                # Application-level ping/pong (multiple protocol variants)
+                op = str(msg.get("op") or msg.get("event") or "").lower()
+                if op in {"pong", "pongs"}:
+                    _PUB_LAST_PONG_TS = now_ts
                     return
+
+                if op == "ping":
+                    # Reply in the most common formats.
+                    try:
+                        wsapp.send(json.dumps({"op": "pong"}))
+                    except Exception:
+                        pass
+                    try:
+                        # Some servers expect echo timestamp/id
+                        if "ts" in msg:
+                            wsapp.send(json.dumps({"pong": msg.get("ts")}))
+                    except Exception:
+                        pass
+                    _PUB_LAST_PONG_TS = now_ts
+                    return
+
+                if "ping" in msg and isinstance(msg.get("ping"), (int, float, str)):
+                    try:
+                        wsapp.send(json.dumps({"pong": msg.get("ping")}))
+                    except Exception:
+                        pass
+                    _PUB_LAST_PONG_TS = now_ts
+                    return
+
+                # Error / info events (do not silently ignore)
+                ev = str(msg.get("event") or msg.get("type") or "").lower()
+                if ev == "error" or msg.get("code"):
+                    try:
+                        print(f"[apex_client][PUBWS] server msg: {msg}")
+                    except Exception:
+                        pass
 
                 topic = msg.get("topic") or msg.get("stream") or msg.get("channel")
                 if topic:
@@ -1849,6 +1914,8 @@ def start_public_ws() -> None:
             print("[apex_client][PUBWS] error:", error)
 
         def _on_close(wsapp, status_code, msg):
+            global _PUB_WS_CONNECTED
+            _PUB_WS_CONNECTED = False
             print(f"[apex_client][PUBWS] closed: code={status_code} msg={msg}")
 
         while True:
@@ -1895,15 +1962,15 @@ def start_public_ws() -> None:
                                 pass
 
 
-                        # Ping
+                        # App-level ping (optional)
                         if ping_interval > 0 and now - _PUB_LAST_PONG_TS >= ping_interval:
                             try:
                                 _PUB_WS_APP.send(json.dumps({"op": "ping"}))
                             except Exception:
                                 return
 
-                        # Pong timeout
-                        if pong_timeout > 0 and now - _PUB_LAST_PONG_TS > (ping_interval + pong_timeout):
+                        # App-level pong timeout (only meaningful if we are sending/expecting app-level pong)
+                        if ping_interval > 0 and pong_timeout > 0 and now - _PUB_LAST_PONG_TS > (ping_interval + pong_timeout):
                             try:
                                 _PUB_WS_APP.close()
                             except Exception:
@@ -1927,7 +1994,16 @@ def start_public_ws() -> None:
                             return
 
                 threading.Thread(target=_heartbeat_and_sender, daemon=True, name="apex-public-ws-heartbeat").start()
-                _PUB_WS_APP.run_forever(ping_interval=0, ping_timeout=None)
+
+                # Also enable websocket-level ping frames (in addition to app-level ping/pong above).
+                # This improves compatibility across different quote WS implementations.
+                ws_ping_interval = float(os.getenv("PUBLIC_WS_WS_PING_INTERVAL", "20"))
+                ws_ping_timeout = float(os.getenv("PUBLIC_WS_WS_PING_TIMEOUT", "10"))
+                _PUB_WS_APP.run_forever(
+                    ping_interval=ws_ping_interval if ws_ping_interval > 0 else 0,
+                    ping_timeout=ws_ping_timeout if ws_ping_timeout > 0 else None,
+                    ping_payload="ping",
+                )
 
             except Exception as e:
                 print(f"[apex_client][PUBWS] reconnect: {e} (sleep {backoff}s)")
