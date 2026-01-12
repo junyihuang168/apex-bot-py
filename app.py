@@ -1,7 +1,7 @@
 import os
 import time
 import threading
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import Dict, Tuple, Optional, Set, Any, List
 
 from flask import Flask, request, jsonify, Response
@@ -188,6 +188,23 @@ _LADDER_STATUS_TS = {}  # key -> last print ts
 L1_STALE_SEC = float(os.getenv("L1_STALE_SEC", "2.0"))
 L1_FALLBACK_TO_MARK = str(os.getenv("L1_FALLBACK_TO_MARK", "1")).strip() == "1"
 
+# Entry sizing (no leverage by default):
+# - Orders are placed by quantity. Quantity must satisfy stepSize/minQty.
+# - For low-price symbols with large minQty, a small notional may be infeasible.
+#   If ENTRY_AUTO_UPSIZE_TO_MIN_QTY=1, we will upsize to the minimum tradable qty.
+ENTRY_AUTO_UPSIZE_TO_MIN_QTY = str(os.getenv("ENTRY_AUTO_UPSIZE_TO_MIN_QTY", "1")).strip() == "1"
+# Hard cap for upsized notional (USDT). 0 = no cap.
+ENTRY_MAX_NOTIONAL_USDT = Decimal(os.getenv("ENTRY_MAX_NOTIONAL_USDT", "0"))
+# Safety margin used when reporting minimum required notional.
+ENTRY_MIN_NOTIONAL_MARGIN_PCT = Decimal(os.getenv("ENTRY_MIN_NOTIONAL_MARGIN_PCT", "0.03"))
+
+
+# Ticker fallback cache for risk checks (prevents 'NO_PRICE' when public WS is unstable)
+RISK_TICKER_REFRESH_SEC = float(os.getenv("RISK_TICKER_REFRESH_SEC", "0.75"))
+RISK_TICKER_STALE_SEC = float(os.getenv("RISK_TICKER_STALE_SEC", "30.0"))
+_RISK_TICKER_CACHE: Dict[str, Tuple[Decimal, float]] = {}  # symbol -> (price, ts)
+_RISK_TICKER_LOCK = threading.Lock()
+
 
 
 def _parse_ladder_levels(s: str):
@@ -271,11 +288,18 @@ def _get_mark_price(symbol: str) -> Optional[Decimal]:
 def _get_l1_risk_price(symbol: str, direction: str) -> Tuple[Optional[Decimal], str, Optional[Decimal], Optional[Decimal]]:
     """Return (ref_price, source, best_bid, best_ask).
 
-    For ladder risk checks:
-      - LONG  uses best_bid
-      - SHORT uses best_ask
+    Ladder risk checks use:
+      - LONG  -> best_bid
+      - SHORT -> best_ask
 
-    If L1 is unavailable or stale, we optionally fall back to mark/ticker reference.
+    Priority order:
+      1) Fresh L1 (public WS)
+      2) Cached ticker/mark (fast, avoids NO_PRICE)
+      3) Live ticker (REST)
+      4) Mark/position-derived (private REST)
+      5) Last cached price within RISK_TICKER_STALE_SEC
+
+    This makes risk management resilient when the public WS connection is flaky.
     """
     sym = str(symbol).upper().strip()
     dir_u = str(direction or "").upper().strip()
@@ -298,12 +322,42 @@ def _get_l1_risk_price(symbol: str, direction: str) -> Tuple[Optional[Decimal], 
             return bid, "L1_BID", bid, ask
         return ask, "L1_ASK", bid, ask
 
+    # 2) Use cached ticker if still fresh enough (prevents blocking on REST during spikes)
+    with _RISK_TICKER_LOCK:
+        cached = _RISK_TICKER_CACHE.get(sym)
+    if cached:
+        cpx, cts = cached
+        if cpx is not None and cpx > 0 and (now - float(cts)) <= RISK_TICKER_REFRESH_SEC:
+            if dir_u == "LONG":
+                return cpx, "TICKER_CACHE", bid, ask
+            return cpx, "TICKER_CACHE", bid, ask
+
+    # 3) Live ticker (REST)
+    try:
+        ref = get_reference_price(sym)
+        if ref is not None and ref > 0:
+            with _RISK_TICKER_LOCK:
+                _RISK_TICKER_CACHE[sym] = (ref, now)
+            return ref, "TICKER_REST", bid, ask
+    except Exception:
+        pass
+
+    # 4) Mark/position-derived (private REST), optional
     if L1_FALLBACK_TO_MARK:
-        m = _get_mark_price(sym)
-        if m is not None and m > 0:
-            remember_bid = bid if (bid is not None and bid > 0) else None
-            remember_ask = ask if (ask is not None and ask > 0) else None
-            return m, "MARK_FALLBACK", remember_bid, remember_ask
+        try:
+            m = _get_mark_price(sym)
+            if m is not None and m > 0:
+                with _RISK_TICKER_LOCK:
+                    _RISK_TICKER_CACHE[sym] = (m, now)
+                return m, "MARK_FALLBACK", bid, ask
+        except Exception:
+            pass
+
+    # 5) Last cached (stale) within tolerance
+    if cached:
+        cpx, cts = cached
+        if cpx is not None and cpx > 0 and (now - float(cts)) <= RISK_TICKER_STALE_SEC:
+            return cpx, "TICKER_CACHE_STALE", bid, ask
 
     return None, "NO_PRICE", bid, ask
 
@@ -372,31 +426,68 @@ def _extract_budget_usdt(body: dict) -> Decimal:
 def _compute_entry_qty(symbol: str, side: str, size_usdt: Any) -> Decimal:
     """Compute order size (contract qty) from a USDT notional.
 
-    Uses a reference price derived from:
-      1) webhook `price` (if present elsewhere in handler; see `_extract_ref_price_from_payload`)
-      2) public ticker markPrice (crossSymbolName) via `get_market_price()`
+    Notes:
+      - ApeX places orders by *quantity*. Quantity must satisfy stepSize/minQty.
+      - For very low-price symbols, minQty can be large. If the requested notional
+        is too small, we can optionally upsize to the minimum tradable quantity.
+
+    Reference price source:
+      - `get_market_price()` (prefers L1 when available; otherwise mark/ticker fallback)
     """
     sym = str(symbol).upper().strip()
     side_u = str(side).upper().strip()
 
     rules = _get_symbol_rules(sym)
-    min_qty = rules["min_qty"]
+    step = Decimal(str(rules.get("step_size") or "1"))
+    min_qty = Decimal(str(rules.get("min_qty") or "0"))
 
     budget_usdt = _to_decimal(size_usdt, default=Decimal("0"))
     if budget_usdt <= 0:
         raise ValueError(f"invalid size_usdt: {size_usdt}")
 
-    # Get reference price (string) and coerce to Decimal safely
+    # Reference price (bid/ask preferred when L1 is available inside get_market_price)
     ref_price_str = get_market_price(sym, side_u, str(min_qty))
     ref_price_dec = _to_decimal(ref_price_str, default=Decimal("0"))
     if ref_price_dec <= 0:
         raise RuntimeError(f"invalid reference price for qty compute: {ref_price_str}")
 
-    qty = budget_usdt / ref_price_dec
-    qty = _snap_quantity(sym, qty)
-    if qty < min_qty:
-        qty = min_qty
-    return qty
+    # Floor to step (exchange-style)
+    qty_raw = budget_usdt / ref_price_dec
+    qty_floor = (qty_raw // step) * step
+    qty_floor = qty_floor.quantize(step, rounding=ROUND_DOWN)
+
+    if qty_floor >= min_qty and qty_floor > 0:
+        return qty_floor
+
+    # Too small: compute minimum tradable qty (ceil minQty to step)
+    if min_qty <= 0:
+        raise ValueError(f"symbol rules invalid: min_qty={min_qty} step={step}")
+
+    min_steps = (min_qty / step).to_integral_value(rounding=ROUND_UP)
+    qty_min = (min_steps * step).quantize(step, rounding=ROUND_DOWN)
+
+    est_notional = (qty_min * ref_price_dec).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+    min_needed = (est_notional * (Decimal("1") + ENTRY_MIN_NOTIONAL_MARGIN_PCT)).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+
+    if not ENTRY_AUTO_UPSIZE_TO_MIN_QTY:
+        raise ValueError(
+            f"budget too small for {sym}: budget={budget_usdt} < min_needed~{min_needed} "
+            f"(minQty={min_qty}, step={step}, ref={ref_price_dec})"
+        )
+
+    if ENTRY_MAX_NOTIONAL_USDT > 0 and est_notional > ENTRY_MAX_NOTIONAL_USDT:
+        raise ValueError(
+            f"budget too small for {sym}: min_notional~{min_needed} exceeds cap "
+            f"ENTRY_MAX_NOTIONAL_USDT={ENTRY_MAX_NOTIONAL_USDT}"
+        )
+
+    print(
+        f"[ENTRY] upsize_to_minQty symbol={sym} side={side_u} "
+        f"budget={budget_usdt} -> qty={qty_min} est_notional={est_notional} "
+        f"(minQty={min_qty} step={step} ref={ref_price_dec})"
+    )
+    return qty_min
+
 
 def _order_status_and_reason(order: dict):
     data = (order or {}).get("data", {}) or {}
@@ -563,12 +654,11 @@ def _ladder_close_position(bot_id: str, symbol: str, direction: str, qty: Decima
 def _risk_loop():
     print(f"[LADDER] risk loop started (interval={RISK_POLL_INTERVAL}s)")
     while True:
-        # bots that have ladder enabled
-        bots = sorted(LADDER_LONG_BOTS | LADDER_SHORT_BOTS)
-        # Safety: if env vars were accidentally set to empty, fall back to defaults unless explicitly allowed.
-        if (not bots) and str(os.getenv("ALLOW_EMPTY_LADDER_BOTS", "0")).strip() != "1":
-            bots = sorted(_ALLOWED_LONG_TPSL | _ALLOWED_SHORT_TPSL)
-            print(f"[LADDER] WARNING: ladder bot list empty; falling back to defaults: {bots}")
+        try:
+            # bots that have ladder enabled
+            bots = sorted({*_parse_bot_list(','.join(LADDER_LONG_BOTS)), *_parse_bot_list(','.join(LADDER_SHORT_BOTS))})
+        except Exception:
+            bots = list(LADDER_LONG_BOTS | LADDER_SHORT_BOTS)
 
         for bot_id in bots:
             try:
@@ -641,10 +731,6 @@ def _ensure_risk_thread():
         t.start()
         _RISK_THREAD_STARTED = True
         print("[LADDER] risk thread created")
-        try:
-            print(f"[LADDER] config long_bots={sorted(LADDER_LONG_BOTS)} short_bots={sorted(LADDER_SHORT_BOTS)} base_sl={LADDER_BASE_SL_PCT}% levels={LADDER_LEVELS_RAW} l1_stale={L1_STALE_SEC}s fallback_to_mark={L1_FALLBACK_TO_MARK}")
-        except Exception:
-            pass
 
 def _ensure_monitor_thread():
     """
@@ -661,14 +747,6 @@ def _ensure_monitor_thread():
 
         if ENABLE_WS:
             start_private_ws()
-            # Public market-data WS (L1 bid/ask)
-            if str(os.getenv("ENABLE_PUBLIC_WS", "1")).strip() == "1":
-                try:
-                    start_public_ws()
-                    print("[SYSTEM] Public WS enabled (L1)")
-                except Exception as e:
-                    print("[SYSTEM] Public WS failed to start:", e)
-
             # ✅ Backup path: REST poll orders every N seconds (main path still WS)
             if str(os.getenv("ENABLE_REST_POLL", "1")).strip() == "1":
                 try:
@@ -1111,12 +1189,6 @@ def tv_webhook():
         return "missing symbol", 400
     symbol = str(symbol).upper().strip()
 
-    # Ensure public L1 subscription early (so bid/ask is ready for risk loop)
-    try:
-        ensure_public_depth_subscription(symbol, limit=25, speed="H")
-    except Exception as e:
-        print(f"[WEBHOOK] public depth subscribe failed for {symbol}: {e}")
-
     bot_id = _canon_bot_id(body.get("bot_id", "BOT_1"))
     side_raw = str(body.get("side", "")).upper().strip()
     signal_type_raw = str(body.get("signal_type", "")).lower().strip()
@@ -1194,14 +1266,26 @@ def tv_webhook():
             print("[ENTRY] budget error:", e)
             return str(e), 400
 
+        # Optional leverage support (default 1x). If you later decide to use leverage,
+        # treat `position_size_usdt` as *margin*, so effective notional = margin * leverage.
         try:
-            snapped_qty = _compute_entry_qty(symbol, side_raw, budget)
+            leverage_raw = body.get("leverage", 1)
+            leverage = int(float(str(leverage_raw)))
+        except Exception:
+            leverage = 1
+        if leverage <= 0:
+            leverage = 1
+
+        effective_notional = budget * Decimal(str(leverage))
+
+        try:
+            snapped_qty = _compute_entry_qty(symbol, side_raw, effective_notional)
         except Exception as e:
             print("[ENTRY] qty compute error:", e)
             return "qty compute error", 500
 
         size_str = str(snapped_qty)
-        print(f"[ENTRY] bot={bot_id} symbol={symbol} side={side_raw} budget={budget} -> qty={size_str} sig={sig_id}")
+        print(f"[ENTRY] bot={bot_id} symbol={symbol} side={side_raw} margin={budget} lev={leverage} notional={effective_notional} -> qty={size_str} sig={sig_id}")
 
         # Deterministic numeric clientId for attribution: BBB + ts + 01 (ENTRY)
         bnum = _bot_num(bot_id)
