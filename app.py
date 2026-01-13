@@ -406,18 +406,28 @@ def _exit_guard_allow(bot_id: str, symbol: str) -> bool:
 # 预算提取
 # ----------------------------
 def _extract_budget_usdt(body: dict) -> Decimal:
+    """Extract requested USDT size from webhook body.
+
+    Backward/forward compatible with multiple field names seen in different
+    TradingView/ApeX webhook formats.
+    """
     size_field = (
         body.get("position_size_usdt")
         or body.get("size_usdt")
+        or body.get("qty_usdt")          # your current payload
+        or body.get("budget_usdt")
+        or body.get("usdt")
         or body.get("size")
+        or body.get("qty")               # last resort (some send qty as USDT by mistake)
     )
     if size_field is None:
-        raise ValueError("missing position_size_usdt / size_usdt / size")
+        raise ValueError("missing position_size_usdt / size_usdt / qty_usdt / budget_usdt / size")
 
     budget = Decimal(str(size_field))
     if budget <= 0:
         raise ValueError("size_usdt must be > 0")
     return budget
+
 
 
 # ----------------------------
