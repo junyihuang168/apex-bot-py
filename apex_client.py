@@ -797,45 +797,96 @@ def create_market_order(
 def create_trigger_order(
     symbol: str,
     side: str,
-    qty: str,
+    size: str,
     trigger_price: str,
     reduce_only: bool = True,
     client_order_id: Optional[str] = None,
+    order_type: str = "STOP_MARKET",
+    time_in_force: Optional[str] = None,
+    price: Optional[str] = None,
+    trigger_price_type: Optional[str] = "LAST",
+    trigger_direction: Optional[Any] = None,
 ) -> Dict[str, Any]:
+    """Create a trigger order (STOP/TAKE_PROFIT, etc.) via create_order_v3.
+
+    Notes:
+      - We intentionally support multiple SDK parameter spellings.
+      - trigger_price_type defaults to LAST (per your plan A).
+      - For STOP_MARKET we set a protective limit/worst price if SDK requires it.
+    """
     client = get_client()
     sym = format_symbol(symbol)
     side_u = str(side).upper().strip()
 
-    try:
-        protective_price = get_market_price(sym, side_u, qty)
-    except Exception:
-        protective_price = str(trigger_price)
+    # Some SDK builds require a price field even for STOP_MARKET. Use a conservative market-price-derived
+    # protective price if caller didn't provide one.
+    protective_price = None
+    if price is not None and str(price).strip() != "":
+        protective_price = str(price)
+    else:
+        try:
+            protective_price = str(get_market_price(sym, side_u, str(size)))
+        except Exception:
+            protective_price = str(trigger_price)
 
-    base = {
+    base: Dict[str, Any] = {
         "symbol": sym,
         "side": side_u,
     }
 
+    ot = str(order_type or "STOP_MARKET").upper().strip()
     type_variants = [
-        {"type": "STOP_MARKET"},
-        {"orderType": "STOP_MARKET"},
+        {"type": ot},
+        {"orderType": ot},
+        {"order_type": ot},
     ]
+
     size_variants = [
-        {"size": str(qty)},
-        {"qty": str(qty)},
+        {"size": str(size)},
+        {"qty": str(size)},
+        {"quantity": str(size)},
     ]
+
+    # Prefer explicit price if caller provided; otherwise protective price.
     price_variants = [
         {"price": str(protective_price)},
         {"limitPrice": str(protective_price)},
-    ]
+        {"worstPrice": str(protective_price)},
+        {"worst_price": str(protective_price)},
+    ] if protective_price is not None else [{}]
+
     trigger_variants = [
         {"triggerPrice": str(trigger_price)},
         {"trigger_price": str(trigger_price)},
     ]
+
+    trigger_type_variants = [{}]
+    if trigger_price_type:
+        tpt = str(trigger_price_type).upper().strip()
+        trigger_type_variants = [
+            {"triggerPriceType": tpt},
+            {"trigger_price_type": tpt},
+        ]
+
+    trigger_dir_variants = [{}]
+    if trigger_direction is not None:
+        trigger_dir_variants = [
+            {"triggerDirection": trigger_direction},
+            {"trigger_direction": trigger_direction},
+        ]
+
+    tif_variants = [{}]
+    if time_in_force:
+        tif_variants = [
+            {"timeInForce": str(time_in_force).upper().strip()},
+            {"time_in_force": str(time_in_force).upper().strip()},
+        ]
+
     reduce_variants = [
         {"reduceOnly": bool(reduce_only)},
         {"reduce_only": bool(reduce_only)},
     ]
+
     client_variants = [{}]
     if client_order_id:
         client_variants = [
@@ -950,6 +1001,92 @@ def create_trigger_order(
     raise RuntimeError("create_trigger_order: create_order_v3 failed with all compatible parameter variants")
 
 
+
+
+
+def cancel_order_v3(order_id: str, client_order_id: Optional[str] = None) -> Dict[str, Any]:
+    """Best-effort cancel for v3 orders.
+
+    - Prefer cancel by orderId when available.
+    - Fallback to cancel by clientOrderId if supported.
+
+    Returns raw response dict (may contain data).
+    """
+    client = get_client()
+    oid = str(order_id or '').strip()
+    cid = str(client_order_id or '').strip()
+    last_exc = None
+
+    # Try cancel by orderId
+    for name in ("cancel_order_v3", "cancelOrderV3", "cancel_order", "cancelOrder"):
+        if not oid:
+            break
+        if not hasattr(client, name):
+            continue
+        fn = getattr(client, name)
+        # Try common signatures
+        for args, kwargs in (
+            ([oid], {}),
+            ([], {"orderId": oid}),
+            ([], {"id": oid}),
+            ([], {"order_id": oid}),
+        ):
+            try:
+                return _safe_call(fn, *args, **kwargs)
+            except TypeError as te:
+                last_exc = te
+                continue
+            except Exception as e:
+                last_exc = e
+                break
+
+    # Try cancel by clientOrderId
+    for name in ("cancel_order_by_client_order_id_v3", "cancelOrderByClientOrderIdV3", "cancel_by_client_order_id_v3"):
+        if not cid:
+            break
+        if not hasattr(client, name):
+            continue
+        fn = getattr(client, name)
+        for args, kwargs in (
+            ([cid], {}),
+            ([], {"clientOrderId": cid}),
+            ([], {"clientId": cid}),
+            ([], {"client_order_id": cid}),
+        ):
+            try:
+                return _safe_call(fn, *args, **kwargs)
+            except TypeError as te:
+                last_exc = te
+                continue
+            except Exception as e:
+                last_exc = e
+                break
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("cancel_order_v3: no supported cancel method found on client")
+
+
+def create_stop_market_order(
+    symbol: str,
+    side: str,
+    size: str,
+    trigger_price: str,
+    reduce_only: bool = True,
+    client_order_id: Optional[str] = None,
+    trigger_price_type: str = "LAST",
+) -> Dict[str, Any]:
+    """Convenience wrapper for exchange-native stop-market (trigger) orders."""
+    return create_trigger_order(
+        symbol=symbol,
+        side=side,
+        size=size,
+        trigger_price=trigger_price,
+        reduce_only=reduce_only,
+        client_order_id=client_order_id,
+        order_type="STOP_MARKET",
+        trigger_price_type=trigger_price_type,
+    )
 def get_open_position_for_symbol(symbol: str) -> Dict[str, Any]:
     client = get_client()
     sym = format_symbol(symbol)
