@@ -1389,6 +1389,109 @@ def _rest_fetch_fills_by_order(order_id: str, symbol: Optional[str] = None) -> O
     return None
 
 
+def _rest_fetch_fills_by_client_order_id(client_order_id: str, symbol: Optional[str] = None) -> Optional[list]:
+    # Best-effort REST fills/trades lookup by clientOrderId across SDK versions.
+    client = get_client()
+    cid = str(client_order_id)
+
+    method_names = [
+        'get_fills_v3',
+        'fills_v3',
+        'get_user_fills_v3',
+        'get_trades_v3',
+        'get_user_trades_v3',
+        'trade_history_v3',
+        'get_trade_history_v3',
+        'get_fill_history_v3',
+        'fill_history_v3',
+    ]
+
+    for name in method_names:
+        if not hasattr(client, name):
+            continue
+        fn = getattr(client, name)
+        # Try common parameter spellings
+        for kwargs in (
+            {'clientOrderId': cid, 'symbol': (symbol or None)},
+            {'client_order_id': cid, 'symbol': (symbol or None)},
+            {'clientId': cid, 'symbol': (symbol or None)},
+            {'client_id': cid, 'symbol': (symbol or None)},
+        ):
+            try:
+                res = _safe_call(fn, **kwargs)
+            except Exception:
+                continue
+
+            if res is None:
+                continue
+
+            data = res
+            if isinstance(res, dict):
+                data = res.get('data') if res.get('data') is not None else (res.get('list') or res.get('fills') or res.get('trades') or res)
+            if isinstance(data, dict) and 'list' in data:
+                data = data['list']
+            if isinstance(data, list):
+                return data
+
+    return None
+
+
+def _rest_fetch_recent_fills(symbol: Optional[str] = None, limit: int = 100) -> Optional[list]:
+    # REST recent fills/trades (no orderId filter). Used when the API does not support orderId query.
+    client = get_client()
+    lim = int(limit)
+    if lim <= 0:
+        lim = 100
+
+    method_names = [
+        'get_fills_v3',
+        'fills_v3',
+        'get_user_fills_v3',
+        'get_trades_v3',
+        'get_user_trades_v3',
+        'trade_history_v3',
+        'get_trade_history_v3',
+        'get_fill_history_v3',
+        'fill_history_v3',
+    ]
+
+    # Try a few common paging args
+    paging_variants = [
+        {'limit': lim},
+        {'pageSize': lim},
+        {'page_size': lim},
+        {'size': lim},
+        {},
+    ]
+
+    for name in method_names:
+        if not hasattr(client, name):
+            continue
+        fn = getattr(client, name)
+        for pv in paging_variants:
+            kwargs = dict(pv)
+            if symbol:
+                kwargs['symbol'] = symbol
+            try:
+                res = _safe_call(fn, **kwargs)
+            except Exception:
+                continue
+
+            if res is None:
+                continue
+
+            data = res
+            if isinstance(res, dict):
+                data = res.get('data') if res.get('data') is not None else (res.get('list') or res.get('fills') or res.get('trades') or res)
+            if isinstance(data, dict) and 'list' in data:
+                data = data['list']
+            if isinstance(data, list):
+                return data
+
+    return None
+
+
+
 def start_order_rest_poller(poll_interval: float = 5.0) -> None:
     """Background REST reconciliation to fill WS gaps (orders+fills)."""
     global _REST_POLL_STARTED
@@ -1557,6 +1660,43 @@ def get_fill_summary(
         time.sleep(max(0.05, poll_interval))
 
     if order_id:
+        # REST fallback #1: direct fills/trades by orderId
+        try:
+            fills = _rest_fetch_fills_by_order(str(order_id), symbol=symbol)
+            if isinstance(fills, list) and fills:
+                qty_sum = Decimal("0")
+                notional = Decimal("0")
+                fee_sum = Decimal("0")
+                fee_seen = False
+                for f in fills:
+                    parsed = _parse_fill(f) if isinstance(f, dict) else None
+                    if not parsed:
+                        continue
+                    q = Decimal(str(parsed.get("qty") or "0"))
+                    p = Decimal(str(parsed.get("price") or "0"))
+                    if q > 0 and p > 0:
+                        qty_sum += q
+                        notional += (q * p)
+                        if parsed.get("fee") is not None:
+                            try:
+                                fee_sum += Decimal(str(parsed.get("fee")))
+                                fee_seen = True
+                            except Exception:
+                                pass
+                if qty_sum > 0 and notional > 0:
+                    return {
+                        "symbol": format_symbol(symbol),
+                        "order_id": str(order_id),
+                        "client_order_id": client_order_id,
+                        "filled_qty": str(qty_sum),
+                        "avg_fill_price": str(notional / qty_sum),
+                        "fee": str(fee_sum) if fee_seen else None,
+                        "source": "rest_fills_by_order",
+                    }
+        except Exception:
+            pass
+
+        # REST fallback #2: order detail (avgPx/cumQty)
         od = _rest_fetch_order(str(order_id))
         if isinstance(od, dict):
             d = od.get("data") if isinstance(od.get("data"), dict) else od
@@ -1572,6 +1712,62 @@ def get_fill_summary(
                         "fee": None,
                         "source": "rest_order_last",
                     }
+
+    
+
+    # REST fallback #3: if orderId filter is unsupported or order_id is missing,
+    # scan recent fills and match by client_order_id.
+    if client_order_id:
+        try:
+            # First try API-level clientOrderId filter if supported
+            fills = _rest_fetch_fills_by_client_order_id(str(client_order_id), symbol=symbol)
+            if not fills:
+                fills = _rest_fetch_recent_fills(symbol=symbol, limit=int(os.getenv('REST_RECENT_FILLS_LIMIT', '120')))
+
+            if isinstance(fills, list) and fills:
+                want_cid = str(client_order_id)
+                matched = []
+                for f in fills:
+                    if not isinstance(f, dict):
+                        continue
+                    parsed = _parse_fill(f)
+                    if not parsed:
+                        continue
+                    if str(parsed.get('client_order_id') or '') != want_cid:
+                        continue
+                    matched.append(parsed)
+
+                if matched:
+                    qty_sum = Decimal('0')
+                    notional = Decimal('0')
+                    fee_sum = Decimal('0')
+                    fee_seen = False
+                    order_id_derived = matched[0].get('order_id')
+                    for parsed in matched:
+                        q = Decimal(str(parsed.get('qty') or '0'))
+                        p = Decimal(str(parsed.get('price') or '0'))
+                        if q > 0 and p > 0:
+                            qty_sum += q
+                            notional += (q * p)
+                        if parsed.get('fee') is not None:
+                            try:
+                                fee_sum += Decimal(str(parsed.get('fee')))
+                                fee_seen = True
+                            except Exception:
+                                pass
+
+                    if qty_sum > 0 and notional > 0:
+                        return {
+                            'symbol': format_symbol(symbol),
+                            'order_id': str(order_id_derived) if order_id_derived is not None else str(order_id or ''),
+                            'client_order_id': want_cid,
+                            'filled_qty': str(qty_sum),
+                            'avg_fill_price': str(notional / qty_sum),
+                            'fee': str(fee_sum) if fee_seen else None,
+                            'source': 'rest_recent_fills_scan',
+                        }
+        except Exception:
+            pass
 
     raise RuntimeError(f"fill_summary timeout; last_source={last_source}")
 
