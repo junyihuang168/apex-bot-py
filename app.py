@@ -8,6 +8,8 @@ from flask import Flask, request, jsonify, Response
 
 from apex_client import (
     create_market_order,
+    create_stop_market_order,
+    cancel_order_v3,
     get_market_price,
     get_reference_price,
     get_l1_bid_ask,
@@ -23,6 +25,9 @@ from apex_client import (
 
 from pnl_store import (
     init_db,
+    upsert_protective_orders,
+    get_protective_orders,
+    clear_protective_orders,
     record_entry,
     record_exit_fifo,
     list_bots_with_activity,
@@ -44,6 +49,12 @@ DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "")
 # ✅ 只让 worker 进程启用 WS/Fills（supervisord.conf 里给 worker 设置 ENABLE_WS="1"，web 设置 "0"）
 ENABLE_WS = str(os.getenv("ENABLE_WS", "0")).strip() == "1"
 ENABLE_RISK_LOOP = str(os.getenv("ENABLE_RISK_LOOP", "0")).strip() == "1"  # run ladder risk loop in this process
+ENABLE_EXCHANGE_STOP = str(os.getenv("ENABLE_EXCHANGE_STOP", "1")).strip() == "1"  # plan A: exchange-native stop
+ENABLE_BOT_SIDE_LADDER_CLOSE = str(os.getenv("ENABLE_BOT_SIDE_LADDER_CLOSE", "0")).strip() == "1"
+RISK_PRICE_SOURCE = str(os.getenv("RISK_PRICE_SOURCE", "LAST")).strip().upper()  # LAST | BIDASK
+STOP_TRIGGER_PRICE_TYPE = str(os.getenv("STOP_TRIGGER_PRICE_TYPE", "LAST")).strip().upper()  # LAST | MARK | INDEX
+STOP_REPLACE_MIN_GAP_SEC = float(os.getenv("STOP_REPLACE_MIN_GAP_SEC", "0.8"))
+STOP_PRICE_EPS_PCT = Decimal(str(os.getenv("STOP_PRICE_EPS_PCT", "0.01")))  # 0.01% threshold for replace
 
 # 退出互斥窗口（秒）：防止重复平仓
 EXIT_COOLDOWN_SEC = float(os.getenv("EXIT_COOLDOWN_SEC", "2.0"))
@@ -53,7 +64,7 @@ REMOTE_FALLBACK_SYMBOLS = {
     s.strip().upper() for s in os.getenv("REMOTE_FALLBACK_SYMBOLS", "").split(",") if s.strip()
 }
 
-# ✅ 说明：本版本不在交易所挂真实 TP/SL 单；仅使用真实 fills 进行记账，并由机器人在后台按规则触发平仓。
+# ✅ 说明：Plan A：Ladder 使用交易所原生 STOP-MARKET（reduceOnly）挂单；触发价类型默认 LAST。机器人仅负责“收紧止损”（撤单改单）与对账记账。
 
 # 本地 cache（仅辅助）
 BOT_POSITIONS: Dict[Tuple[str, str], dict] = {}
@@ -309,7 +320,6 @@ def _get_l1_risk_price(symbol: str, direction: str) -> Tuple[Optional[Decimal], 
         ensure_public_depth_subscription(sym, limit=25, speed="H")
     except Exception:
         pass
-
     bid, ask, ts = None, None, 0.0
     try:
         bid, ask, ts = get_l1_bid_ask(sym)
@@ -317,10 +327,13 @@ def _get_l1_risk_price(symbol: str, direction: str) -> Tuple[Optional[Decimal], 
         bid, ask, ts = None, None, 0.0
 
     now = time.time()
-    if bid is not None and ask is not None and bid > 0 and ask > 0 and (now - float(ts)) <= L1_STALE_SEC:
-        if dir_u == "LONG":
-            return bid, "L1_BID", bid, ask
-        return ask, "L1_ASK", bid, ask
+
+    # 1) Fresh L1 (public WS) if configured
+    if RISK_PRICE_SOURCE in ("BIDASK", "BID_ASK", "BA"):
+        if bid is not None and ask is not None and bid > 0 and ask > 0 and (now - float(ts)) <= L1_STALE_SEC:
+            if dir_u == "LONG":
+                return bid, "L1_BID", bid, ask
+            return ask, "L1_ASK", bid, ask
 
     # 2) Use cached ticker if still fresh enough (prevents blocking on REST during spikes)
     with _RISK_TICKER_LOCK:
@@ -661,6 +674,447 @@ def _ladder_close_position(bot_id: str, symbol: str, direction: str, qty: Decima
         pass
 
 
+
+
+# ----------------------------
+# ✅ Exchange-native stop (Plan A)
+# ----------------------------
+_STOP_LAST_REPLACE_TS: Dict[Tuple[str, str, str], float] = {}  # (bot,symbol,direction) -> ts
+
+
+def _stop_should_replace(direction: str, old_price: Optional[Decimal], new_price: Decimal) -> bool:
+    if new_price <= 0:
+        return False
+    if old_price is None or old_price <= 0:
+        return True
+    # Replace only when stop tightens meaningfully
+    d = str(direction).upper()
+    eps = (old_price * (STOP_PRICE_EPS_PCT / Decimal('100'))).copy_abs()
+    if d == 'LONG':
+        return new_price > (old_price + eps)
+    else:
+        return new_price < (old_price - eps)
+
+
+def _ladder_cancel_exchange_stop(bot_id: str, symbol: str, direction: str):
+    try:
+        cur = get_protective_orders(bot_id, symbol, direction) or {}
+    except Exception:
+        cur = {}
+
+    oid = str(cur.get('sl_order_id') or '')
+    cid = str(cur.get('sl_client_id') or '')
+
+    if oid or cid:
+        try:
+            cancel_order_v3(order_id=oid, client_order_id=cid)
+            print(f"[STOP] cancel ok bot={bot_id} {direction} {symbol} orderId={oid} clientId={cid}")
+        except Exception as e:
+            print(f"[STOP] cancel warn bot={bot_id} {direction} {symbol} orderId={oid} clientId={cid} err={e}")
+
+    try:
+        clear_protective_orders(bot_id, symbol, direction)
+    except Exception:
+        pass
+
+
+def _ladder_upsert_exchange_stop(bot_id: str, symbol: str, direction: str, qty: Decimal, stop_price: Decimal):
+    if not ENABLE_EXCHANGE_STOP:
+        return
+    if qty <= 0 or stop_price <= 0:
+        return
+
+    key = (_canon_bot_id(bot_id), str(symbol).upper().strip(), str(direction).upper().strip())
+    now = time.time()
+    last_ts = _STOP_LAST_REPLACE_TS.get(key, 0.0)
+    if (now - last_ts) < STOP_REPLACE_MIN_GAP_SEC:
+        return
+
+    # Read current stored stop
+    try:
+        cur = get_protective_orders(bot_id, symbol, direction) or {}
+    except Exception:
+        cur = {}
+
+    old_price = None
+    try:
+        old_price = _to_decimal(cur.get('sl_price'), default=Decimal('0'))
+    except Exception:
+        old_price = None
+
+    if not _stop_should_replace(direction, old_price, stop_price):
+        return
+
+    # Cancel old first
+    old_oid = str(cur.get('sl_order_id') or '')
+    old_cid = str(cur.get('sl_client_id') or '')
+    if old_oid or old_cid:
+        try:
+            cancel_order_v3(order_id=old_oid, client_order_id=old_cid)
+        except Exception:
+            pass
+
+    exit_side = 'SELL' if str(direction).upper() == 'LONG' else 'BUY'
+
+    # Deterministic numeric clientId: BBB + ts + 91 (STOP)
+    bnum = _bot_num(bot_id)
+    ts_now = int(time.time())
+    stop_client_id = f"{bnum:03d}{ts_now}91"
+
+    try:
+        o = create_stop_market_order(
+            symbol=symbol,
+            side=exit_side,
+            size=str(qty),
+            trigger_price=str(stop_price),
+            reduce_only=True,
+            client_id=stop_client_id,
+            trigger_price_type=STOP_TRIGGER_PRICE_TYPE,
+        )
+    except Exception as e:
+        print(f"[STOP] create error bot={bot_id} {direction} {symbol} qty={qty} stop={stop_price} err={e}")
+        return
+
+    # Normalize ids
+    oid = o.get('order_id') or (o.get('data') or {}).get('orderId') if isinstance(o, dict) else None
+    cid = o.get('client_order_id') or stop_client_id
+
+    try:
+        upsert_protective_orders(
+            bot_id=bot_id,
+            symbol=symbol,
+            direction=direction,
+            sl_order_id=str(oid) if oid else None,
+            tp_order_id=None,
+            sl_client_id=str(cid) if cid else None,
+            tp_client_id=None,
+            sl_price=stop_price,
+            tp_price=None,
+            is_active=True,
+        )
+    except Exception as e:
+        print(f"[STOP] store warn bot={bot_id} {direction} {symbol}: {e}")
+
+    _STOP_LAST_REPLACE_TS[key] = now
+    print(f"[STOP] upsert ok bot={bot_id} {direction} {symbol} qty={qty} stop={stop_price} type={STOP_TRIGGER_PRICE_TYPE} orderId={oid} clientId={cid}")
+
+
+def _ladder_reconcile_if_exchange_flat(bot_id: str, symbol: str, direction: str):
+    """If local DB thinks position open but exchange position is flat, reconcile by recording an exit using stop order fills."""
+    # Check exchange
+    try:
+        remote = get_open_position_for_symbol(symbol) or {}
+    except Exception:
+        remote = {}
+
+    # Extract size; some payloads use strings
+    rsz = _to_decimal(remote.get('size') or remote.get('positionSize') or remote.get('posSize') or remote.get('qty') or '0')
+    if rsz is None:
+        rsz = Decimal('0')
+    if rsz.copy_abs() > 0:
+        return  # still open on exchange
+
+    # Local open?
+    opens = get_bot_open_positions(bot_id)
+    v = opens.get((symbol, direction))
+    if not v:
+        return
+
+    local_qty = _to_decimal(v.get('qty'), default=Decimal('0'))
+    if local_qty is None or local_qty <= 0:
+        return
+
+    # Try to use stored stop order id to fetch true fills
+    try:
+        cur = get_protective_orders(bot_id, symbol, direction) or {}
+    except Exception:
+        cur = {}
+    oid = str(cur.get('sl_order_id') or '')
+    cid = str(cur.get('sl_client_id') or '')
+
+    exit_price = None
+    exit_qty = None
+    if oid or cid:
+        try:
+            fill = get_fill_summary(
+                symbol=symbol,
+                order_id=oid if oid else None,
+                client_order_id=cid if cid else None,
+                max_wait_sec=float(os.getenv('FILL_MAX_WAIT_SEC', '25.0')),
+                poll_interval=float(os.getenv('FILL_POLL_INTERVAL', '0.25')),
+            )
+            exit_price = Decimal(str(fill['avg_fill_price']))
+            exit_qty = Decimal(str(fill['filled_qty']))
+        except Exception as e:
+            print(f"[STOP][RECON] fill fetch failed bot={bot_id} {direction} {symbol} oid={oid} cid={cid} err={e}")
+
+    if exit_price is None or exit_price <= 0:
+        # last-resort: use reference price; still record to avoid phantom local positions
+        try:
+            exit_price = Decimal(str(get_reference_price(symbol)))
+        except Exception:
+            exit_price = Decimal('0')
+    if exit_qty is None or exit_qty <= 0:
+        exit_qty = local_qty
+
+    entry_side = 'BUY' if direction == 'LONG' else 'SELL'
+    try:
+        record_exit_fifo(
+            bot_id=bot_id,
+            symbol=symbol,
+            entry_side=entry_side,
+            exit_qty=exit_qty,
+            exit_price=exit_price,
+            reason='exchange_stop_reconcile',
+        )
+    except Exception as e:
+        print(f"[STOP][RECON] record_exit_fifo failed: {e}")
+
+    try:
+        clear_lock_level_pct(bot_id, symbol, direction)
+    except Exception:
+        pass
+
+    try:
+        clear_protective_orders(bot_id, symbol, direction)
+    except Exception:
+        pass
+
+    # local cache
+    try:
+        key_local = (bot_id, symbol)
+        if key_local in BOT_POSITIONS:
+            BOT_POSITIONS[key_local]['qty'] = Decimal('0')
+            BOT_POSITIONS[key_local]['entry_price'] = None
+    except Exception:
+        pass
+
+    print(f"[STOP][RECON] done bot={bot_id} {direction} {symbol} qty={exit_qty} px={exit_price}")
+
+
+
+# ----------------------------
+# ✅ Exchange-native STOP (Plan A) management for ladder
+# ----------------------------
+_STOP_LAST_REPLACE_TS: Dict[Tuple[str, str, str], float] = {}  # (bot_id,symbol,direction) -> last replace ts
+
+
+def _stop_need_replace(direction: str, old_px: Optional[Decimal], new_px: Decimal) -> bool:
+    if old_px is None or old_px <= 0:
+        return True
+    if new_px <= 0:
+        return False
+    d = str(direction).upper()
+    # Only tighten: LONG moves UP, SHORT moves DOWN
+    if d == "LONG":
+        if new_px <= old_px:
+            return False
+        # require meaningful move
+        return (new_px - old_px) / old_px * Decimal("100") >= STOP_PRICE_EPS_PCT
+    else:
+        if new_px >= old_px:
+            return False
+        return (old_px - new_px) / old_px * Decimal("100") >= STOP_PRICE_EPS_PCT
+
+
+def _parse_exchange_pos_size(pos: dict) -> Decimal:
+    if not pos or not isinstance(pos, dict):
+        return Decimal("0")
+    for k in ("size", "positionSize", "posSize", "positionQty", "qty", "volume"):  # best-effort
+        v = pos.get(k)
+        if v is None or v == "":
+            continue
+        try:
+            return abs(Decimal(str(v)))
+        except Exception:
+            continue
+    return Decimal("0")
+
+
+def _ladder_cancel_exchange_stop(bot_id: str, symbol: str, direction: str):
+    try:
+        po = get_protective_orders(bot_id, symbol, direction) or {}
+    except Exception:
+        po = {}
+
+    oid = po.get("sl_order_id")
+    cid = po.get("sl_client_id")
+    if oid or cid:
+        try:
+            cancel_order_v3(order_id=str(oid) if oid else None, client_order_id=str(cid) if cid else None)
+            print(f"[STOP] cancel ok bot={bot_id} {direction} {symbol} order_id={oid} client_id={cid}")
+        except Exception as e:
+            print(f"[STOP] cancel error bot={bot_id} {direction} {symbol} order_id={oid} client_id={cid}: {e}")
+
+    try:
+        clear_protective_orders(bot_id, symbol, direction)
+    except Exception:
+        pass
+
+
+def _ladder_upsert_exchange_stop(bot_id: str, symbol: str, direction: str, qty: Decimal, stop_price: Decimal):
+    if not ENABLE_EXCHANGE_STOP:
+        return
+    if qty <= 0 or stop_price <= 0:
+        return
+
+    key = (_canon_bot_id(bot_id), str(symbol).upper().strip(), str(direction).upper().strip())
+    now = time.time()
+    last_ts = _STOP_LAST_REPLACE_TS.get(key, 0.0)
+    if now - last_ts < STOP_REPLACE_MIN_GAP_SEC:
+        return
+
+    # existing
+    try:
+        po = get_protective_orders(bot_id, symbol, direction) or {}
+    except Exception:
+        po = {}
+
+    old_px = None
+    try:
+        if po.get("sl_price") is not None:
+            old_px = Decimal(str(po.get("sl_price")))
+    except Exception:
+        old_px = None
+
+    if not _stop_need_replace(direction, old_px, stop_price):
+        return
+
+    # Cancel old first (best-effort)
+    oid_old = po.get("sl_order_id")
+    cid_old = po.get("sl_client_id")
+    if oid_old or cid_old:
+        try:
+            cancel_order_v3(order_id=str(oid_old) if oid_old else None, client_order_id=str(cid_old) if cid_old else None)
+        except Exception:
+            pass
+
+    exit_side = "SELL" if str(direction).upper() == "LONG" else "BUY"
+    bnum = _bot_num(bot_id)
+    ts_now = int(time.time())
+    # 91 = exchange stop (ladder)
+    sl_client_id = f"{bnum:03d}{ts_now}91"
+
+    try:
+        res = create_stop_market_order(
+            symbol=symbol,
+            side=exit_side,
+            size=str(qty),
+            trigger_price=str(stop_price),
+            reduce_only=True,
+            client_id=sl_client_id,
+            trigger_price_type=STOP_TRIGGER_PRICE_TYPE,
+        )
+        oid_new = res.get("order_id") or (res.get("data") or {}).get("orderId") if isinstance(res, dict) else None
+        cid_new = res.get("client_order_id") or sl_client_id
+
+        # persist
+        try:
+            upsert_protective_orders(
+                bot_id=bot_id,
+                symbol=symbol,
+                direction=direction,
+                sl_order_id=str(oid_new) if oid_new else None,
+                tp_order_id=None,
+                sl_client_id=str(cid_new) if cid_new else sl_client_id,
+                tp_client_id=None,
+                sl_price=stop_price,
+                tp_price=None,
+                is_active=True,
+            )
+        except Exception as e:
+            print(f"[STOP] persist error bot={bot_id} {direction} {symbol}: {e}")
+
+        _STOP_LAST_REPLACE_TS[key] = now
+        print(f"[STOP] upsert bot={bot_id} {direction} {symbol} qty={qty} stop={stop_price} tpt={STOP_TRIGGER_PRICE_TYPE} old={old_px} order_id={oid_new}")
+    except Exception as e:
+        print(f"[STOP] place error bot={bot_id} {direction} {symbol} qty={qty} stop={stop_price}: {e}")
+
+
+def _ladder_reconcile_if_exchange_flat(bot_id: str, symbol: str, direction: str, local_qty: Decimal, entry_side: str):
+    """If DB shows an open position but exchange position is flat, record an exit (best effort).
+
+    This is critical for exchange-native stop orders: the exchange will close the position without a webhook,
+    so we must reconcile and write exits to pnl_store; otherwise the risk loop will keep thinking there is a position.
+    """
+    if local_qty <= 0:
+        return
+    try:
+        pos = get_open_position_for_symbol(symbol)
+    except Exception:
+        pos = {}
+    ex_qty = _parse_exchange_pos_size(pos)
+    if ex_qty > 0:
+        return
+
+    # likely closed by stop/manual; try to find stop fill
+    po = {}
+    try:
+        po = get_protective_orders(bot_id, symbol, direction) or {}
+    except Exception:
+        po = {}
+    oid = po.get("sl_order_id")
+    cid = po.get("sl_client_id")
+
+    exit_price = None
+    filled_qty = local_qty
+    if oid or cid:
+        try:
+            fill = get_fill_summary(
+                symbol=symbol,
+                order_id=str(oid) if oid else None,
+                client_order_id=str(cid) if cid else None,
+                max_wait_sec=float(os.getenv("FILL_MAX_WAIT_SEC", "20.0")),
+                poll_interval=float(os.getenv("FILL_POLL_INTERVAL", "0.25")),
+            )
+            exit_price = Decimal(str(fill["avg_fill_price"]))
+            filled_qty = Decimal(str(fill["filled_qty"]))
+        except Exception:
+            exit_price = None
+
+    if exit_price is None:
+        # last resort: use ref ticker as approximation (still better than leaving DB dirty)
+        try:
+            ref = get_reference_price(symbol)
+            if ref and ref > 0:
+                exit_price = Decimal(str(ref))
+        except Exception:
+            exit_price = None
+
+    if exit_price is None or exit_price <= 0:
+        print(f"[STOP] reconcile failed (no price) bot={bot_id} {direction} {symbol}")
+        return
+
+    try:
+        record_exit_fifo(
+            bot_id=bot_id,
+            symbol=symbol,
+            entry_side=entry_side,
+            exit_qty=filled_qty,
+            exit_price=exit_price,
+            reason="exchange_stop" if (oid or cid) else "exchange_flat",
+        )
+        print(f"[STOP] reconciled exit bot={bot_id} {direction} {symbol} qty={filled_qty} px={exit_price}")
+    except Exception as e:
+        print(f"[STOP] record_exit_fifo error (reconcile) bot={bot_id} {direction} {symbol}: {e}")
+
+    try:
+        clear_lock_level_pct(bot_id, symbol, direction)
+    except Exception:
+        pass
+
+    _ladder_cancel_exchange_stop(bot_id, symbol, direction)
+
+    # local cache
+    try:
+        key_local = (bot_id, symbol)
+        if key_local in BOT_POSITIONS:
+            BOT_POSITIONS[key_local]["qty"] = Decimal("0")
+            BOT_POSITIONS[key_local]["entry_price"] = None
+    except Exception:
+        pass
+
+
 def _risk_loop():
     print(f"[LADDER] risk loop started (interval={RISK_POLL_INTERVAL}s)")
     while True:
@@ -715,16 +1169,14 @@ def _risk_loop():
                                 )
                         except Exception:
                             pass
+                    # Plan A: exchange-native stop. We only upsert tighter stop orders and reconcile when exchange is flat.
+                    _ladder_upsert_exchange_stop(bot_id, symbol, direction, qty, stop_price)
+                    entry_side = "BUY" if direction == "LONG" else "SELL"
+                    _ladder_reconcile_if_exchange_flat(bot_id, symbol, direction, qty, entry_side)
 
-                    if _ladder_should_stop(direction, ref_price, stop_price):
-                        if not _exit_guard_allow(bot_id, symbol):
-                            continue
-                        print(
-                            f"[LADDER] STOP bot={bot_id} {direction} {symbol} qty={qty} "
-                            f"entry={entry} ref={ref_price} src={ref_src} "
-                            f"bid={best_bid} ask={best_ask} profit%={profit_pct:.4f} lock%={lock_pct} stop={stop_price}"
-                        )
-                        _ladder_close_position(bot_id, symbol, direction, qty, reason="ladder_stop")
+                    # Optional: keep the old bot-side close logic (NOT recommended when ENABLE_EXCHANGE_STOP=1)
+                    if ENABLE_BOT_SIDE_LADDER_CLOSE and _ladder_should_stop(direction, ref_price, stop_price):
+                        _ladder_close_position(bot_id, symbol, direction, qty, ref_price, ref_src)
 
                 except Exception as e:
                     print("[LADDER] loop error:", e)
@@ -1423,6 +1875,13 @@ def tv_webhook():
         if _bot_uses_ladder(bot_id, direction) and entry_price_dec is not None and final_qty > 0:
             try:
                 set_lock_level_pct(bot_id, symbol, direction, -LADDER_BASE_SL_PCT)
+                # Plan A: place initial exchange-native stop
+                try:
+                    lock_pct = Decimal(str(-LADDER_BASE_SL_PCT))
+                    stop_px = _compute_stop_price(direction, entry_price_dec, lock_pct)
+                    _ladder_upsert_exchange_stop(bot_id, symbol, direction, final_qty, stop_px)
+                except Exception as e:
+                    print('[STOP] initial place failed:', e)
             except Exception as e:
                 print("[LADDER] set base lock failed:", e)
 
@@ -1556,6 +2015,11 @@ def tv_webhook():
 
         try:
             clear_lock_level_pct(bot_id, symbol, direction_to_close)
+            # Plan A: cancel exchange-native stop after manual/strategy exit
+            try:
+                _ladder_cancel_exchange_stop(bot_id, symbol, direction_to_close)
+            except Exception:
+                pass
         except Exception:
             pass
 
