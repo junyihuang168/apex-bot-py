@@ -658,3 +658,37 @@ def list_recent_trades(bot_id: Optional[str] = None, limit: int = 200) -> list:
         return out
     finally:
         conn.close()
+
+# -----------------------------------------------------------------------------
+# Compatibility helpers (older app.py / worker imports)
+# -----------------------------------------------------------------------------
+
+def upsert_protective_orders(*args, **kwargs):
+    """Backward-compatible shim.
+
+    Some older versions of the repo imported `upsert_protective_orders` from pnl_store.
+    In this codebase, exchange-native protective orders are handled in the client/risk loop.
+    This function is intentionally a no-op to keep older imports working.
+    """
+    return None
+
+
+def list_pending_orders(*args, **kwargs):
+    """Backward-compatible shim.
+
+    Pending-order reconciliation is optional. If you don't use a pending-orders table,
+    returning an empty list is safe.
+    """
+    return []
+
+
+def touch_pending_try(*args, **kwargs):
+    return None
+
+
+def mark_pending_done(*args, **kwargs):
+    return None
+
+
+def mark_pending_failed(*args, **kwargs):
+    return None
