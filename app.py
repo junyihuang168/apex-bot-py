@@ -8,16 +8,12 @@ from flask import Flask, request, jsonify, Response
 
 from apex_client import (
     create_market_order,
-    create_trigger_order,
     get_market_price,
     get_reference_price,
     get_l1_bid_ask,
     ensure_public_depth_subscription,
     start_public_ws,
     get_fill_summary,
-    snap_price,
-    cancel_order_by_client_id,
-    cancel_order,
     get_open_position_for_symbol,
     _get_symbol_rules,
     _snap_quantity,
@@ -38,10 +34,6 @@ from pnl_store import (
     clear_lock_level_pct,
     is_signal_processed,
     mark_signal_processed,
-    get_protective_orders,
-    set_protective_orders,
-    clear_protective_orders,
-    list_active_protective_orders,
 )
 
 app = Flask(__name__)
@@ -53,9 +45,6 @@ DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "")
 ENABLE_WS = str(os.getenv("ENABLE_WS", "0")).strip() == "1"
 ENABLE_RISK_LOOP = str(os.getenv("ENABLE_RISK_LOOP", "0")).strip() == "1"  # run ladder risk loop in this process
 
-ENABLE_EXCHANGE_STOP = str(os.getenv("ENABLE_EXCHANGE_STOP", "0")).strip() == "1"  # use exchange-native STOP_MARKET trigger
-RISK_PRICE_SOURCE = str(os.getenv("RISK_PRICE_SOURCE", "L1_BIDASK")).strip().upper()  # L1_BIDASK / LAST / MARK
-
 # 退出互斥窗口（秒）：防止重复平仓
 EXIT_COOLDOWN_SEC = float(os.getenv("EXIT_COOLDOWN_SEC", "2.0"))
 
@@ -64,9 +53,7 @@ REMOTE_FALLBACK_SYMBOLS = {
     s.strip().upper() for s in os.getenv("REMOTE_FALLBACK_SYMBOLS", "").split(",") if s.strip()
 }
 
-# ✅ 说明：本版本支持“交易所原生止损单(Trigger STOP_MARKET)”用于移动止损；
-#    - 由 worker 后台循环根据锁盈阶梯更新 stop triggerPrice
-#    - 触发后由 worker 兜底对账并写入 PnL (无需 TradingView 额外发 exit 警报)
+# ✅ 说明：本版本不在交易所挂真实 TP/SL 单；仅使用真实 fills 进行记账，并由机器人在后台按规则触发平仓。
 
 # 本地 cache（仅辅助）
 BOT_POSITIONS: Dict[Tuple[str, str], dict] = {}
@@ -674,186 +661,6 @@ def _ladder_close_position(bot_id: str, symbol: str, direction: str, qty: Decima
         pass
 
 
-# --- Exchange-native stop helpers ---
-# We manage ONE reduce-only STOP_MARKET per (bot, symbol, direction).
-# The stop trigger is updated as lock level increases.
-
-_EX_STOP_MIN_MOVE_TICKS = int(os.getenv("EX_STOP_MIN_MOVE_TICKS", "1"))
-
-
-def _ex_stop_client_id(bot_id: str, symbol: str, direction: str) -> str:
-    b = _canon_bot_id(bot_id)
-    s = str(symbol).upper().replace("-", "")
-    d = str(direction).upper()
-    return f"sl-{b}-{s}-{d}"
-
-
-def _should_update_stop(old_price: Optional[Decimal], new_price: Decimal, tick: Decimal) -> bool:
-    if old_price is None or old_price <= 0:
-        return True
-    try:
-        diff = abs(new_price - old_price)
-        return diff >= (tick * Decimal(str(max(1, _EX_STOP_MIN_MOVE_TICKS))))
-    except Exception:
-        return True
-
-
-def _ensure_exchange_stop_order(bot_id: str, symbol: str, direction: str, qty: Decimal, stop_price: Decimal) -> None:
-    """Cancel+replace reduce-only STOP_MARKET trigger order using LAST price trigger."""
-    if qty <= 0 or stop_price <= 0:
-        return
-
-    rules = _get_symbol_rules(symbol)
-    tick = Decimal(str(rules.get("tick_size") or "0.01"))
-    stop_price = snap_price(symbol, stop_price)
-
-    # Load current stored protective state
-    po = get_protective_orders(bot_id, symbol, direction) or {}
-    old_sl_id = str(po.get("sl_order_id") or "").strip()
-    old_sl_price = po.get("sl_price")
-    try:
-        old_sl_price_dec = Decimal(str(old_sl_price)) if old_sl_price not in (None, "") else None
-    except Exception:
-        old_sl_price_dec = None
-
-    if not _should_update_stop(old_sl_price_dec, stop_price, tick):
-        return
-
-    # Cancel old stop order if present
-    if old_sl_id:
-        try:
-            cancel_order(old_sl_id)
-        except Exception:
-            pass
-
-    # Place new STOP_MARKET trigger
-    close_side = "SELL" if direction.upper() == "LONG" else "BUY"
-    client_id = _ex_stop_client_id(bot_id, symbol, direction)
-
-    try:
-        res = create_trigger_order(
-            symbol=symbol,
-            side=close_side,
-            qty=str(qty),
-            trigger_price=str(stop_price),
-            reduce_only=True,
-            client_order_id=client_id,
-            trigger_price_type="LAST",
-        )
-    except Exception as e:
-        print(f"[EXSTOP] create_trigger_order failed bot={bot_id} {direction} {symbol} stop={stop_price}: {e}")
-        return
-
-    # Try extract order id
-    order_id = ""
-    try:
-        data = res.get("data") if isinstance(res, dict) else None
-        if isinstance(data, dict):
-            order_id = str(data.get("orderId") or data.get("id") or "")
-        if not order_id:
-            order_id = str(res.get("order_id") or res.get("orderId") or "")
-    except Exception:
-        order_id = ""
-
-    set_protective_orders(
-        bot_id=bot_id,
-        symbol=symbol,
-        direction=direction,
-        sl_order_id=order_id,
-        tp_order_id=str(po.get("tp_order_id") or ""),
-        sl_client_id=client_id,
-        tp_client_id=str(po.get("tp_client_id") or ""),
-        sl_price=str(stop_price),
-        tp_price=str(po.get("tp_price") or ""),
-        is_active=1,
-    )
-
-    if LADDER_DEBUG:
-        print(f"[EXSTOP] UPDATED bot={bot_id} {direction} {symbol} qty={qty} stop={stop_price} sl_id={order_id}")
-
-
-def _reconcile_exchange_stop_fills() -> None:
-    """If exchange-native stop filled (position closed), fetch fills and record exit."""
-    try:
-        rows = list_active_protective_orders(limit=200)
-    except Exception:
-        return
-
-    for r in rows:
-        try:
-            bot_id = _canon_bot_id(r.get("bot_id"))
-            symbol = str(r.get("symbol") or "").upper().strip()
-            direction = str(r.get("direction") or "").upper().strip()
-            sl_order_id = str(r.get("sl_order_id") or "").strip()
-            if not bot_id or not symbol or not direction or not sl_order_id:
-                continue
-
-            # Check exchange position
-            pos = None
-            try:
-                pos = get_open_position_for_symbol(symbol)
-            except Exception:
-                pos = None
-
-            # If position still open, nothing to do
-            if pos and isinstance(pos, dict):
-                size = _to_decimal(pos.get("size") or pos.get("positionSize") or pos.get("qty"), Decimal("0"))
-                if abs(size) > Decimal("0"):
-                    continue
-
-            # Attempt fetch fill summary for the stop order
-            try:
-                fill = get_fill_summary(symbol=symbol, order_id=sl_order_id, client_order_id=str(r.get("sl_client_id") or ""), max_wait_sec=0.5, poll_interval=0.2)
-                filled_qty = _to_decimal(fill.get("filled_qty"), Decimal("0"))
-                exit_price = _to_decimal(fill.get("avg_fill_price"), Decimal("0"))
-            except Exception:
-                # If fill not yet available, keep for next round
-                continue
-
-            if filled_qty <= 0 or exit_price <= 0:
-                continue
-
-            entry_side = "BUY" if direction.upper() == "LONG" else "SELL"
-
-            try:
-                record_exit_fifo(
-                    bot_id=bot_id,
-                    symbol=symbol,
-                    entry_side=entry_side,
-                    exit_qty=filled_qty,
-                    exit_price=exit_price,
-                    reason="exchange_stop",
-                )
-            except Exception as e:
-                # Likely already recorded; still clear
-                print("[EXSTOP] record_exit_fifo error:", e)
-
-            try:
-                clear_lock_level_pct(bot_id, symbol, direction)
-            except Exception:
-                pass
-
-            try:
-                clear_protective_orders(bot_id, symbol, direction)
-            except Exception:
-                pass
-
-            # local cache
-            try:
-                key_local = (bot_id, symbol)
-                if key_local in BOT_POSITIONS:
-                    BOT_POSITIONS[key_local]["qty"] = Decimal("0")
-                    BOT_POSITIONS[key_local]["entry_price"] = None
-            except Exception:
-                pass
-
-            print(f"[EXSTOP] EXIT RECORDED bot={bot_id} {direction} {symbol} qty={filled_qty} @ {exit_price}")
-
-        except Exception as e:
-            print("[EXSTOP] reconcile error:", e)
-
-
-
 def _risk_loop():
     print(f"[LADDER] risk loop started (interval={RISK_POLL_INTERVAL}s)")
     while True:
@@ -909,31 +716,18 @@ def _risk_loop():
                         except Exception:
                             pass
 
-                    if ENABLE_EXCHANGE_STOP:
-                        # Keep an exchange-native STOP_MARKET trigger resting on book.
-                        # The trigger reference price is controlled by STOP_TRIGGER_PRICE_TYPE (default LAST).
-                        _ensure_exchange_stop_order(bot_id, symbol, direction, qty, stop_price)
-                    else:
-                        # Bot-side emergency close (legacy)
-                        if _ladder_should_stop(direction, ref_price, stop_price):
-                            if not _exit_guard_allow(bot_id, symbol):
-                                continue
-                            print(
-                                f"[LADDER] STOP bot={bot_id} {direction} {symbol} qty={qty} "
-                                f"entry={entry} ref={ref_price} src={ref_src} "
-                                f"bid={best_bid} ask={best_ask} profit%={profit_pct:.4f} lock%={lock_pct} stop={stop_price}"
-                            )
-                            _ladder_close_position(bot_id, symbol, direction, qty, reason="ladder_stop")
+                    if _ladder_should_stop(direction, ref_price, stop_price):
+                        if not _exit_guard_allow(bot_id, symbol):
+                            continue
+                        print(
+                            f"[LADDER] STOP bot={bot_id} {direction} {symbol} qty={qty} "
+                            f"entry={entry} ref={ref_price} src={ref_src} "
+                            f"bid={best_bid} ask={best_ask} profit%={profit_pct:.4f} lock%={lock_pct} stop={stop_price}"
+                        )
+                        _ladder_close_position(bot_id, symbol, direction, qty, reason="ladder_stop")
 
                 except Exception as e:
                     print("[LADDER] loop error:", e)
-        # Exchange stop reconciliation (fills/close detection)
-        if ENABLE_EXCHANGE_STOP:
-            try:
-                _reconcile_exchange_stop_fills()
-            except Exception as e:
-                print('[STOP] reconcile error:', e)
-
 
         time.sleep(RISK_POLL_INTERVAL)
 
