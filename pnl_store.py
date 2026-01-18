@@ -202,47 +202,6 @@ def mark_signal_processed(bot_id: str, signal_id: str, kind: str = ""):
     _write_with_retry(_w)
 
 
-# Backward-compatible alias (older app.py / worker.py may import this name)
-def upsert_protective_orders(
-    bot_id: str,
-    symbol: str,
-    direction: str,
-    sl_order_id: Optional[str] = None,
-    tp_order_id: Optional[str] = None,
-    sl_client_id: Optional[str] = None,
-    tp_client_id: Optional[str] = None,
-    sl_price: Optional[Decimal] = None,
-    tp_price: Optional[Decimal] = None,
-    is_active: bool = True,
-):
-    """
-    Compatibility wrapper for older code paths.
-    Internally calls set_protective_orders().
-    """
-    return set_protective_orders(
-        bot_id=bot_id,
-        symbol=symbol,
-        direction=direction,
-        sl_order_id=sl_order_id,
-        tp_order_id=tp_order_id,
-        sl_client_id=sl_client_id,
-        tp_client_id=tp_client_id,
-        sl_price=sl_price,
-        tp_price=tp_price,
-        is_active=is_active,
-    )
-
-
-# Older worker builds may import these names. Provide no-op stubs for safety.
-def list_pending_orders(*args, **kwargs):
-    return []
-
-def add_pending_order(*args, **kwargs):
-    return True
-
-def remove_pending_order(*args, **kwargs):
-    return True
-
 # ---------------------------
 # Core PnL
 # ---------------------------
@@ -614,43 +573,6 @@ def clear_protective_orders(bot_id: str, symbol: str, direction: str):
         return True
 
     _write_with_retry(_w)
-
-
-def list_active_protective_orders(bot_id: str = "", limit: int = 200) -> List[Dict[str, Any]]:
-    """
-    List active protective orders (is_active=1).
-    Used by worker risk loop to reconcile triggered STOP orders.
-    """
-    try:
-        lim = int(limit)
-        if lim < 1:
-            lim = 200
-        lim = min(lim, 1000)
-    except Exception:
-        lim = 200
-
-    conn = _connect()
-    try:
-        cur = conn.cursor()
-        if bot_id:
-            cur.execute("""
-                SELECT * FROM protective_orders
-                WHERE is_active=1 AND bot_id=?
-                ORDER BY ts DESC
-                LIMIT ?
-            """, (str(bot_id), lim))
-        else:
-            cur.execute("""
-                SELECT * FROM protective_orders
-                WHERE is_active=1
-                ORDER BY ts DESC
-                LIMIT ?
-            """, (lim,))
-        rows = cur.fetchall()
-        return [dict(r) for r in rows]
-    finally:
-        conn.close()
-
 
 
 def find_protective_owner_by_order_id(order_id: str) -> Dict[str, Any]:
