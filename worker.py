@@ -80,9 +80,8 @@ def main():
     # Fail-safe defaults (if supervisor/env didn't inject them)
     os.environ.setdefault("ENABLE_WS", "1")
     os.environ.setdefault("ENABLE_REST_POLL", "1")
-    os.environ.setdefault("ENABLE_RISK_LOOP", "1")  # ladder trailing (exchange stop updates when ENABLE_EXCHANGE_STOP=1)
-    os.environ.setdefault("ENABLE_EXCHANGE_STOP", "1")
-    os.environ.setdefault("RISK_PRICE_SOURCE", "LAST")
+    os.environ.setdefault("ENABLE_RISK_LOOP", "1")  # bot-side SL + ladder trailing
+    os.environ.setdefault("ENABLE_EXCHANGE_PROTECTIVE", "0")
 
     # Pending reconcile defaults
     os.environ.setdefault("PENDING_RETRY_GAP_SEC", "1")
