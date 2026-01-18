@@ -2,6 +2,7 @@ import os
 import time
 import threading
 from decimal import Decimal
+import importlib
 
 from pnl_store import (
     init_db,
@@ -30,8 +31,38 @@ except Exception:
 
 from apex_client import get_fill_summary
 
-# Reuse the monitor/risk threads implemented inside the web app module
-import app_any_amount_v2 as app_module
+
+def _import_app_module():
+    """
+    Worker needs to import the web app module to reuse its monitor/risk threads.
+    Different repos name this file differently. Try a list of common candidates.
+    """
+    candidates = [
+        os.getenv("WORKER_APP_MODULE", "").strip(),
+        "app_any_amount_v2",
+        "app_any_amount",
+        "app_any_amount_v1",
+        "app",
+        "main",
+        "server",
+    ]
+    for name in candidates:
+        if not name:
+            continue
+        try:
+            mod = importlib.import_module(name)
+            print(f"[worker] using app module: {name}")
+            return mod
+        except Exception as e:
+            last_err = e
+            continue
+    raise ModuleNotFoundError(
+        f"Worker cannot import any app module candidates={candidates}. "
+        f"Set WORKER_APP_MODULE to the correct module name. Last error={last_err}"
+    )
+
+
+app_module = _import_app_module()
 
 
 def _call_if_exists(name: str) -> bool:
@@ -49,7 +80,7 @@ def main():
     # Fail-safe defaults (if supervisor/env didn't inject them)
     os.environ.setdefault("ENABLE_WS", "1")
     os.environ.setdefault("ENABLE_REST_POLL", "1")
-    os.environ.setdefault("ENABLE_RISK_LOOP", "1")  # <-- bot-side SL + ladder trailing
+    os.environ.setdefault("ENABLE_RISK_LOOP", "1")  # bot-side SL + ladder trailing
     os.environ.setdefault("ENABLE_EXCHANGE_PROTECTIVE", "0")
 
     # Pending reconcile defaults
