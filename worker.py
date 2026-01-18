@@ -5,15 +5,28 @@ from decimal import Decimal
 
 from pnl_store import (
     init_db,
-    list_pending_orders,
-    touch_pending_try,
-    mark_pending_done,
-    mark_pending_failed,
     record_entry,
     record_exit_fifo,
     set_lock_level_pct,
     clear_lock_level_pct,
 )
+
+# Optional pending-order reconciliation helpers.
+# IMPORTANT: some deployments may still have an older pnl_store.py without these symbols.
+try:
+    from pnl_store import (
+        list_pending_orders,
+        touch_pending_try,
+        mark_pending_done,
+        mark_pending_failed,
+    )
+    _PENDING_AVAILABLE = True
+except Exception:
+    list_pending_orders = None
+    touch_pending_try = None
+    mark_pending_done = None
+    mark_pending_failed = None
+    _PENDING_AVAILABLE = False
 
 from apex_client import get_fill_summary
 
@@ -169,8 +182,11 @@ def main():
                 print("[worker][pending] reconcile loop error:", e)
                 time.sleep(1)
 
-    threading.Thread(target=_reconcile_pending_loop, daemon=True, name="pending-reconcile").start()
-    print("[worker] started pending reconcile loop")
+    if _PENDING_AVAILABLE:
+        threading.Thread(target=_reconcile_pending_loop, daemon=True, name="pending-reconcile").start()
+        print("[worker] started pending reconcile loop")
+    else:
+        print("[worker] pending reconcile DISABLED: pnl_store.py has no pending-order helpers")
 
     while True:
         time.sleep(60)
