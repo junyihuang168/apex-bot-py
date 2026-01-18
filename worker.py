@@ -1,47 +1,51 @@
 import os
 import time
+import threading
+from decimal import Decimal
 import importlib
 
-from pnl_store import init_db
+from pnl_store import (
+    init_db,
+    record_entry,
+    record_exit_fifo,
+    set_lock_level_pct,
+    clear_lock_level_pct,
+)
 
-"""
-Worker (Plan A - Exchange-native trailing stop, trigger = LAST)
+# Optional pending-order reconciliation helpers.
+# IMPORTANT: some deployments may still have an older pnl_store.py without these symbols.
+try:
+    from pnl_store import (
+        list_pending_orders,
+        touch_pending_try,
+        mark_pending_done,
+        mark_pending_failed,
+    )
+    _PENDING_AVAILABLE = True
+except Exception:
+    list_pending_orders = None
+    touch_pending_try = None
+    mark_pending_done = None
+    mark_pending_failed = None
+    _PENDING_AVAILABLE = False
 
-Goals:
-- Keep worker robust: never crash due to missing optional helpers.
-- Start:
-  1) WS/monitor thread (fills/orders stream)
-  2) Risk loop thread (ladder trailing stop manager)
-- Plan A:
-  - Use exchange-native STOP-MARKET (reduce-only) and cancel/replace to trail
-  - Trigger price type = LAST (per your request)
-
-Notes:
-- This worker intentionally does NOT import pending-order reconciliation helpers
-  (list_pending_orders, etc.) because your current pnl_store.py does not provide them.
-- If you later upgrade pnl_store.py and want reconciliation back, we can add it safely
-  behind a try/except (optional).
-"""
+from apex_client import get_fill_summary
 
 
-# ----------------------------
-# App module import
-# ----------------------------
 def _import_app_module():
     """
-    Your repo may name the web app file differently.
-    Prefer env WORKER_APP_MODULE, otherwise try common names.
+    Worker needs to import the web app module to reuse its monitor/risk threads.
+    Different repos name this file differently. Try a list of common candidates.
     """
     candidates = [
         os.getenv("WORKER_APP_MODULE", "").strip(),
         "app_any_amount_v2",
         "app_any_amount",
+        "app_any_amount_v1",
         "app",
         "main",
         "server",
     ]
-
-    last_err = None
     for name in candidates:
         if not name:
             continue
@@ -52,104 +56,170 @@ def _import_app_module():
         except Exception as e:
             last_err = e
             continue
-
     raise ModuleNotFoundError(
-        f"[worker] cannot import any app module. candidates={candidates}. "
-        f"Set WORKER_APP_MODULE to your correct module name. last_error={last_err}"
+        f"Worker cannot import any app module candidates={candidates}. "
+        f"Set WORKER_APP_MODULE to the correct module name. Last error={last_err}"
     )
 
 
-def _call_if_exists(app_module, func_name: str) -> bool:
-    fn = getattr(app_module, func_name, None)
+app_module = _import_app_module()
+
+
+def _call_if_exists(name: str) -> bool:
+    fn = getattr(app_module, name, None)
     if callable(fn):
         fn()
         return True
     return False
 
 
-# ----------------------------
-# Environment defaults
-# ----------------------------
-def _apply_env_defaults():
-    # Core switches
-    os.environ.setdefault("ENABLE_WS", "1")
-    os.environ.setdefault("ENABLE_REST_POLL", "1")
-    os.environ.setdefault("ENABLE_RISK_LOOP", "1")
-
-    # Plan A: exchange-native stop management on
-    os.environ.setdefault("ENABLE_EXCHANGE_STOP", "1")
-
-    # Use LAST as trigger reference
-    os.environ.setdefault("RISK_PRICE_SOURCE", "LAST")
-    os.environ.setdefault("STOP_TRIGGER_PRICE_TYPE", "LAST")
-
-    # Avoid too frequent cancel/replace
-    os.environ.setdefault("STOP_REPLACE_MIN_INTERVAL_SEC", "1.0")
-
-    # Optional: debug
-    os.environ.setdefault("WORKER_DEBUG", "0")
-
-
-# ----------------------------
-# Thread starters
-# ----------------------------
-def _start_monitor(app_module) -> bool:
-    # Try common names used in your codebase history
-    for n in ("_ensure_monitor_thread", "ensure_monitor_thread", "start_monitor_thread"):
-        if _call_if_exists(app_module, n):
-            print(f"[worker] started monitor via {n}()")
-            return True
-    print("[worker] WARNING: no monitor starter found in app module")
-    return False
-
-
-def _start_risk_loop(app_module) -> bool:
-    for n in ("_ensure_risk_thread", "ensure_risk_thread", "start_risk_thread"):
-        if _call_if_exists(app_module, n):
-            print(f"[worker] started risk loop via {n}()")
-            return True
-    print("[worker] WARNING: no risk-loop starter found in app module")
-    return False
-
-
-# ----------------------------
-# Main
-# ----------------------------
 def main():
-    # Init local DB
+    # Ensure DB initialized for PnL / positions
     init_db()
 
-    # Apply default env (Plan A)
-    _apply_env_defaults()
+    # Fail-safe defaults (if supervisor/env didn't inject them)
+    os.environ.setdefault("ENABLE_WS", "1")
+    os.environ.setdefault("ENABLE_REST_POLL", "1")
+    os.environ.setdefault("ENABLE_RISK_LOOP", "1")  # ladder trailing (exchange stop updates when ENABLE_EXCHANGE_STOP=1)
+    os.environ.setdefault("ENABLE_EXCHANGE_STOP", "1")
+    os.environ.setdefault("RISK_PRICE_SOURCE", "LAST")
 
-    debug = os.getenv("WORKER_DEBUG", "0") == "1"
-    if debug:
-        print("[worker] DEBUG env snapshot:")
-        for k in (
-            "ENABLE_WS",
-            "ENABLE_REST_POLL",
-            "ENABLE_RISK_LOOP",
-            "ENABLE_EXCHANGE_STOP",
-            "RISK_PRICE_SOURCE",
-            "STOP_TRIGGER_PRICE_TYPE",
-            "STOP_REPLACE_MIN_INTERVAL_SEC",
-            "WORKER_APP_MODULE",
-        ):
-            print(f"  - {k}={os.getenv(k)}")
+    # Pending reconcile defaults
+    os.environ.setdefault("PENDING_RETRY_GAP_SEC", "1")
+    os.environ.setdefault("PENDING_FILL_WAIT_SEC", "2.0")
+    os.environ.setdefault("PENDING_FILL_POLL_INTERVAL", "0.2")
 
-    # Import your app module
-    app_module = _import_app_module()
+    started_any = False
 
-    # Start threads
-    ok1 = _start_monitor(app_module)
-    ok2 = _start_risk_loop(app_module)
-
-    if ok1 or ok2:
-        print("[worker] OK: worker running (WS + risk loop).")
+    # Start monitor thread (private WS + fills/orders handling)
+    for n in ("_ensure_monitor_thread", "ensure_monitor_thread", "start_monitor_thread"):
+        if _call_if_exists(n):
+            print(f"[worker] started monitor via {n}()")
+            started_any = True
+            break
     else:
-        print("[worker] ERROR: nothing started. Check app module entrypoints.")
+        print("[worker] WARNING: no monitor starter found in app module")
 
-    # Keep alive
+    # Start risk thread (ladder SL/TS loop)
+    for n in ("_ensure_risk_thread", "ensure_risk_thread", "start_risk_thread"):
+        if _call_if_exists(n):
+            print(f"[worker] started risk loop via {n}()")
+            started_any = True
+            break
+    else:
+        print("[worker] WARNING: no risk-loop starter found in app module")
+
+    if not started_any:
+        print("[worker] ERROR: nothing was started. Check the app module for thread entrypoints.")
+    else:
+        print("[worker] OK: worker running (WS + optional risk loop).")
+
+    # ------------------------------------------------------------------
+    # Background reconciliation: record entries/exits when fills are delayed
+    # ------------------------------------------------------------------
+    def _reconcile_pending_loop():
+        while True:
+            try:
+                gap = int(float(os.getenv("PENDING_RETRY_GAP_SEC", "1")))
+                pendings = list_pending_orders(limit=50, min_retry_gap_sec=max(1, gap))
+                if not pendings:
+                    time.sleep(0.5)
+                    continue
+
+                for p in pendings:
+                    bot_id = str(p.get("bot_id"))
+                    sig_id = str(p.get("signal_id"))
+                    symbol = str(p.get("symbol"))
+                    mode = str(p.get("mode"))
+                    side = str(p.get("side"))
+                    direction = str(p.get("direction"))
+                    order_id = str(p.get("order_id") or "")
+                    client_order_id = str(p.get("client_order_id") or "")
+
+                    if not bot_id or not sig_id or not symbol or (not order_id and not client_order_id):
+                        mark_pending_failed(bot_id, sig_id, note="missing_keys")
+                        continue
+
+                    touch_pending_try(bot_id, sig_id)
+
+                    try:
+                        fill = get_fill_summary(
+                            symbol=symbol,
+                            order_id=order_id,
+                            client_order_id=client_order_id,
+                            max_wait_sec=float(os.getenv("PENDING_FILL_WAIT_SEC", "2.0")),
+                            poll_interval=float(os.getenv("PENDING_FILL_POLL_INTERVAL", "0.2")),
+                        )
+                    except Exception:
+                        continue
+
+                    try:
+                        qty = Decimal(str(fill.get("filled_qty") or "0"))
+                        px = Decimal(str(fill.get("avg_fill_price") or "0"))
+                    except Exception:
+                        continue
+
+                    if qty <= 0 or px <= 0:
+                        continue
+
+                    if mode == "entry":
+                        try:
+                            record_entry(
+                                bot_id=bot_id,
+                                symbol=symbol,
+                                side=side,
+                                qty=qty,
+                                price=px,
+                                reason="pending_entry_reconcile",
+                            )
+                        except Exception:
+                            # likely already recorded; treat as done
+                            pass
+
+                        # Initialize ladder base lock if needed
+                        try:
+                            if hasattr(app_module, "_bot_uses_ladder") and app_module._bot_uses_ladder(bot_id, direction):
+                                base = getattr(app_module, "LADDER_BASE_SL_PCT", Decimal("0.5"))
+                                try:
+                                    set_lock_level_pct(bot_id, symbol, direction, -Decimal(str(base)))
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+
+                        mark_pending_done(bot_id, sig_id, note=f"reconciled_entry qty={qty} px={px}")
+
+                    elif mode == "exit":
+                        entry_side = side  # side is the entry side for record_exit_fifo
+                        try:
+                            record_exit_fifo(
+                                bot_id=bot_id,
+                                symbol=symbol,
+                                entry_side=entry_side,
+                                exit_qty=qty,
+                                exit_price=px,
+                                reason="pending_exit_reconcile",
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            clear_lock_level_pct(bot_id, symbol, direction)
+                        except Exception:
+                            pass
+                        mark_pending_done(bot_id, sig_id, note=f"reconciled_exit qty={qty} px={px}")
+                    else:
+                        mark_pending_failed(bot_id, sig_id, note=f"unknown_mode:{mode}")
+
+            except Exception as e:
+                print("[worker][pending] reconcile loop error:", e)
+                time.sleep(1)
+
+    if _PENDING_AVAILABLE:
+        threading.Thread(target=_reconcile_pending_loop, daemon=True, name="pending-reconcile").start()
+        print("[worker] started pending reconcile loop")
+    else:
+        print("[worker] pending reconcile DISABLED: pnl_store.py has no pending-order helpers")
+
     while True:
         time.sleep(60)
 
