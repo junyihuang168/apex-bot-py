@@ -1322,7 +1322,15 @@ def tv_webhook():
             snapped_qty = _compute_entry_qty(symbol, side_raw, effective_notional)
         except Exception as e:
             print("[ENTRY] qty compute error:", e)
-            return "qty compute error", 500
+            return jsonify({
+                "status": "qty_compute_error",
+                "mode": "entry",
+                "bot_id": bot_id,
+                "symbol": symbol,
+                "side": side_raw,
+                "error": str(e),
+                "signal_id": sig_id,
+            }), 200
 
         size_str = str(snapped_qty)
         print(f"[ENTRY] bot={bot_id} symbol={symbol} side={side_raw} margin={budget} lev={leverage} notional={effective_notional} -> qty={size_str} sig={sig_id}")
@@ -1360,7 +1368,14 @@ def tv_webhook():
             return "order error", 500
 
         status, cancel_reason = _order_status_and_reason(order)
-        print(f"[ENTRY] order status={status} cancelReason={cancel_reason!r}")
+        data_brief = (order or {}).get("data") or {}
+        try:
+            code = data_brief.get("code")
+            msg = data_brief.get("msg")
+        except Exception:
+            code = None
+            msg = None
+        print(f"[ENTRY] order status={status} cancelReason={cancel_reason!r} orderId={data_brief.get('orderId')} code={code} msg={msg!r}")
 
         if status in ("CANCELED", "REJECTED"):
             return jsonify({
@@ -1372,11 +1387,30 @@ def tv_webhook():
                 "request_qty": size_str,
                 "order_status": status,
                 "cancel_reason": cancel_reason,
+                "code": code,
+                "msg": msg,
                 "signal_id": sig_id,
             }), 200
 
         order_id = order.get("order_id")
         client_order_id = order.get("client_order_id")
+
+        # If we did not receive an orderId, fail fast instead of waiting for fills.
+        # This is the most common case when size step/precision is invalid.
+        if not order_id:
+            return jsonify({
+                "status": "order_rejected",
+                "mode": "entry",
+                "bot_id": bot_id,
+                "symbol": symbol,
+                "side": side_raw,
+                "request_qty": size_str,
+                "order_status": status or "REJECTED",
+                "cancel_reason": cancel_reason or (msg or "missing orderId"),
+                "code": code,
+                "msg": msg,
+                "signal_id": sig_id,
+            }), 200
 
         entry_price_dec: Optional[Decimal] = None
         final_qty = snapped_qty
