@@ -3,75 +3,23 @@ import time
 import threading
 from decimal import Decimal
 
-import pnl_store as _pnl
-
-
-# --- Required pnl_store APIs (must exist) ---
-init_db = _pnl.init_db
-record_entry = _pnl.record_entry
-record_exit_fifo = _pnl.record_exit_fifo
-set_lock_level_pct = _pnl.set_lock_level_pct
-clear_lock_level_pct = _pnl.clear_lock_level_pct
-
-
-# --- Optional pending-order reconcile APIs (older pnl_store may not have them) ---
-list_pending_orders = getattr(_pnl, "list_pending_orders", None)
-touch_pending_try = getattr(_pnl, "touch_pending_try", None)
-mark_pending_done = getattr(_pnl, "mark_pending_done", None)
-mark_pending_failed = getattr(_pnl, "mark_pending_failed", None)
+from pnl_store import (
+    init_db,
+    list_pending_orders,
+    touch_pending_try,
+    mark_pending_done,
+    mark_pending_failed,
+    record_entry,
+    record_exit_fifo,
+    set_lock_level_pct,
+    clear_lock_level_pct,
+)
 
 from apex_client import get_fill_summary
 
-
-# Will be set in main() via _import_app_module()
-app_module = None
-
-
-def _import_app_module():
-    """Import the web app module that contains monitor/risk thread entrypoints.
-
-    Different repo versions may use different filenames:
-      - app.py                 -> module "app"
-      - app_any_amount_v2.py   -> module "app_any_amount_v2"
-      - app_any_amount.py      -> module "app_any_amount"
-      - main.py / server.py    -> module "main" / "server"
-
-    You can override the module name by setting env var WORKER_APP_MODULE.
-    """
-    import importlib
-
-    override = str(os.getenv("WORKER_APP_MODULE", "")).strip()
-    candidates = [override] if override else []
-    candidates += [
-        "app",  # prefer app.py (most common)
-        "app_any_amount_v2",
-        "app_any_amount",
-        "main",
-        "server",
-    ]
-
-    last_err = None
-    for name in candidates:
-        if not name:
-            continue
-        try:
-            mod = importlib.import_module(name)
-            print(f"[worker] using app module: {name}")
-            return mod
-        except Exception as e:
-            last_err = e
-            continue
-
-    raise ModuleNotFoundError(
-        f"[worker] cannot import any app module. candidates={candidates}. "
-        f"Set WORKER_APP_MODULE to your correct module name. last_error={last_err}"
-    )
-
-
+# Reuse the monitor/risk threads implemented inside the web app module
+import app as app_module
 def _call_if_exists(name: str) -> bool:
-    global app_module
-    if app_module is None:
-        return False
     fn = getattr(app_module, name, None)
     if callable(fn):
         fn()
@@ -80,28 +28,15 @@ def _call_if_exists(name: str) -> bool:
 
 
 def main():
-    global app_module
-
-    # Load the Flask app module (contains monitor/risk thread entrypoints)
-    app_module = _import_app_module()
-
     # Ensure DB initialized for PnL / positions
     init_db()
 
     # Fail-safe defaults (if supervisor/env didn't inject them)
-    # Worker is the only process that should keep long-lived WS connections and risk loops.
     os.environ.setdefault("ENABLE_WS", "1")
     os.environ.setdefault("ENABLE_REST_POLL", "1")
-    os.environ.setdefault("ENABLE_RISK_LOOP", "1")
-
-    # Plan A: exchange-native protective stop orders (STOP_MARKET reduceOnly) + cancel/replace.
-    os.environ.setdefault("ENABLE_EXCHANGE_STOP", "1")
-
-    # Trigger price type for native stop: LAST | MARK | INDEX
-    os.environ.setdefault("STOP_TRIGGER_PRICE_TYPE", "MARK")
-
-    # Risk/ladder progress price source (do NOT use BID/ASK here; we are not subscribing orderBook)
-    os.environ.setdefault("RISK_PRICE_SOURCE", "MARK")
+    os.environ.setdefault("ENABLE_RISK_LOOP", "1")  # <-- bot-side SL + ladder trailing
+    os.environ.setdefault("RISK_PRICE_SOURCE", "MARK")  # MARK / LAST / INDEX / L1
+    os.environ.setdefault("ENABLE_EXCHANGE_PROTECTIVE", "0")
 
     # Pending reconcile defaults
     os.environ.setdefault("PENDING_RETRY_GAP_SEC", "1")
@@ -233,24 +168,8 @@ def main():
                 print("[worker][pending] reconcile loop error:", e)
                 time.sleep(1)
 
-    helpers_ok = all(
-        fn is not None
-        for fn in (
-            list_pending_orders,
-            touch_pending_try,
-            mark_pending_done,
-            mark_pending_failed,
-        )
-    )
-
-    if os.getenv("ENABLE_PENDING_RECONCILE", "0") == "1" and helpers_ok:
-        threading.Thread(target=_reconcile_pending_loop, daemon=True, name="pending-reconcile").start()
-        print("[worker] pending reconcile ENABLED")
-    else:
-        if not helpers_ok:
-            print("[worker] pending reconcile DISABLED: pnl_store.py has no pending-order helpers")
-        else:
-            print("[worker] pending reconcile disabled (ENABLE_PENDING_RECONCILE!=1)")
+    threading.Thread(target=_reconcile_pending_loop, daemon=True, name="pending-reconcile").start()
+    print("[worker] started pending reconcile loop")
 
     while True:
         time.sleep(60)
