@@ -8,8 +8,10 @@ from flask import Flask, request, jsonify, Response
 
 from apex_client import (
     create_market_order,
+    get_market_price,
     get_reference_price,
-    get_mark_price,
+    get_l1_bid_ask,
+    ensure_public_depth_subscription,
     start_public_ws,
     get_fill_summary,
     get_open_position_for_symbol,
@@ -42,6 +44,7 @@ DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "")
 # ✅ 只让 worker 进程启用 WS/Fills（supervisord.conf 里给 worker 设置 ENABLE_WS="1"，web 设置 "0"）
 ENABLE_WS = str(os.getenv("ENABLE_WS", "0")).strip() == "1"
 ENABLE_RISK_LOOP = str(os.getenv("ENABLE_RISK_LOOP", "0")).strip() == "1"  # run ladder risk loop in this process
+RISK_PRICE_SOURCE = str(os.getenv("RISK_PRICE_SOURCE", "MARK")).upper().strip()  # MARK | LAST | INDEX | L1
 
 # 退出互斥窗口（秒）：防止重复平仓
 EXIT_COOLDOWN_SEC = float(os.getenv("EXIT_COOLDOWN_SEC", "2.0"))
@@ -283,23 +286,108 @@ def _get_mark_price(symbol: str) -> Optional[Decimal]:
         return None
 
 
-def _get_risk_price(symbol: str) -> Tuple[Optional[Decimal], str]:
-    """Get the price used for risk management / stop logic.
-   
-    MARK is preferred (robust against spread/manipulation).
-    Fallback: reference price (index/mark/last depending on availability).
+def _get_l1_risk_price(symbol: str, direction: str) -> Tuple[Optional[Decimal], str, Optional[Decimal], Optional[Decimal]]:
+    """Return (ref_price, source, best_bid, best_ask).
+
+    Ladder risk checks use:
+      - LONG  -> best_bid
+      - SHORT -> best_ask
+
+    Priority order:
+      1) Fresh L1 (public WS)
+      2) Cached ticker/mark (fast, avoids NO_PRICE)
+      3) Live ticker (REST)
+      4) Mark/position-derived (private REST)
+      5) Last cached price within RISK_TICKER_STALE_SEC
+
+    This makes risk management resilient when the public WS connection is flaky.
     """
-    # 1) MARK (preferred)
+    sym = str(symbol).upper().strip()
+    dir_u = str(direction or "").upper().strip()
+
+    # Ensure subscription exists (idempotent). Public WS is started in worker.
     try:
-        return get_mark_price(symbol), "MARK"
+        ensure_public_depth_subscription(sym, limit=25, speed="H")
     except Exception:
         pass
-    # 2) Reference (fallback)
-    try:
-        return get_reference_price(symbol), "REF"
-    except Exception:
-        return None, "NO_PRICE"
 
+    bid, ask, ts = None, None, 0.0
+    try:
+        bid, ask, ts = get_l1_bid_ask(sym)
+    except Exception:
+        bid, ask, ts = None, None, 0.0
+
+    now = time.time()
+    if bid is not None and ask is not None and bid > 0 and ask > 0 and (now - float(ts)) <= L1_STALE_SEC:
+        if dir_u == "LONG":
+            return bid, "L1_BID", bid, ask
+        return ask, "L1_ASK", bid, ask
+
+    # 2) Use cached ticker if still fresh enough (prevents blocking on REST during spikes)
+    with _RISK_TICKER_LOCK:
+        cached = _RISK_TICKER_CACHE.get(sym)
+    if cached:
+        cpx, cts = cached
+        if cpx is not None and cpx > 0 and (now - float(cts)) <= RISK_TICKER_REFRESH_SEC:
+            if dir_u == "LONG":
+                return cpx, "TICKER_CACHE", bid, ask
+            return cpx, "TICKER_CACHE", bid, ask
+
+    # 3) Live ticker (REST)
+    try:
+        ref = get_reference_price(sym)
+        if ref is not None and ref > 0:
+            with _RISK_TICKER_LOCK:
+                _RISK_TICKER_CACHE[sym] = (ref, now)
+            return ref, "TICKER_REST", bid, ask
+    except Exception:
+        pass
+
+    # 4) Mark/position-derived (private REST), optional
+    if L1_FALLBACK_TO_MARK:
+        try:
+            m = _get_mark_price(sym)
+            if m is not None and m > 0:
+                with _RISK_TICKER_LOCK:
+                    _RISK_TICKER_CACHE[sym] = (m, now)
+                return m, "MARK_FALLBACK", bid, ask
+        except Exception:
+            pass
+
+    # 5) Last cached (stale) within tolerance
+    if cached:
+        cpx, cts = cached
+        if cpx is not None and cpx > 0 and (now - float(cts)) <= RISK_TICKER_STALE_SEC:
+            return cpx, "TICKER_CACHE_STALE", bid, ask
+
+    return None, "NO_PRICE", bid, ask
+
+
+
+
+def _get_risk_price(symbol: str, direction: str):
+    """Return (price, source, bid, ask). Source is one of MARK/LAST/INDEX/L1/REF."""
+    src = (RISK_PRICE_SOURCE or 'MARK').upper()
+
+    # Prefer exchange-native reference prices when available.
+    if src == 'MARK':
+        mp = _get_mark_price(symbol)
+        if mp:
+            return mp, 'MARK', None, None
+        rp = get_reference_price(symbol)
+        return rp, 'REF', None, None
+
+    if src == 'LAST':
+        rp = get_reference_price(symbol)
+        return rp, 'LAST', None, None
+
+    if src == 'INDEX':
+        # If Omni SDK does not expose a dedicated index endpoint here, fall back.
+        rp = get_reference_price(symbol)
+        return rp, 'INDEX', None, None
+
+    # L1 / bid-ask path
+    return _get_l1_risk_price(symbol, direction)
 def _compute_profit_pct(direction: str, entry: Decimal, mark: Decimal) -> Decimal:
     if entry <= 0 or mark <= 0:
         return Decimal("0")
@@ -631,7 +719,7 @@ def _risk_loop():
                     if qty <= 0 or entry <= 0:
                         continue
 
-                    ref_price, ref_src = _get_risk_price(symbol)
+                    ref_price, ref_src, best_bid, best_ask = _get_risk_price(symbol, direction)
                     if ref_price is None or ref_price <= 0:
                         continue
 
@@ -649,7 +737,7 @@ def _risk_loop():
                                 print(
                                     f"[LADDER] STATUS bot={bot_id} {direction} {symbol} qty={qty} "
                                     f"entry={entry} ref={ref_price} src={ref_src} "
-                                    f"profit%={profit_pct:.4f} lock%={lock_pct} stop={stop_price}"
+                                    f"bid={best_bid} ask={best_ask} profit%={profit_pct:.4f} lock%={lock_pct} stop={stop_price}"
                                 )
                         except Exception:
                             pass
@@ -660,7 +748,7 @@ def _risk_loop():
                         print(
                             f"[LADDER] STOP bot={bot_id} {direction} {symbol} qty={qty} "
                             f"entry={entry} ref={ref_price} src={ref_src} "
-                            f"profit%={profit_pct:.4f} lock%={lock_pct} stop={stop_price}"
+                            f"bid={best_bid} ask={best_ask} profit%={profit_pct:.4f} lock%={lock_pct} stop={stop_price}"
                         )
                         _ladder_close_position(bot_id, symbol, direction, qty, reason="ladder_stop")
 
@@ -709,12 +797,16 @@ def _ensure_monitor_thread():
 
         # Ladder risk loop (bot-side trailing stop) is controlled independently of private WS.
         if ENABLE_RISK_LOOP:
-            # Public WS for L1 bid/ask (orderBook25.H.*) used by ladder risk checks.
-            # Safe to call multiple times.
-            try:
-                start_public_ws()
-            except Exception as e:
-                print("[SYSTEM] public WS failed to start:", e)
+            # In MARK/LAST/INDEX modes, we do NOT need public orderBook ws.
+            # Only start public ws when explicitly using L1 bid/ask as the risk price source.
+            if RISK_PRICE_SOURCE in ("L1", "BIDASK"):
+                try:
+                    start_public_ws()
+                except Exception as e:
+                    print("[SYSTEM] public WS failed to start:", e)
+            else:
+                print(f"[SYSTEM] risk price source={RISK_PRICE_SOURCE}; public WS not started")
+
             _ensure_risk_thread()
             print("[SYSTEM] ladder risk enabled in this process (ENABLE_RISK_LOOP=1)")
         else:
