@@ -8,10 +8,8 @@ from flask import Flask, request, jsonify, Response
 
 from apex_client import (
     create_market_order,
-    get_market_price,
     get_reference_price,
-    get_l1_bid_ask,
-    ensure_public_depth_subscription,
+    get_mark_price,
     start_public_ws,
     get_fill_summary,
     get_open_position_for_symbol,
@@ -285,82 +283,22 @@ def _get_mark_price(symbol: str) -> Optional[Decimal]:
         return None
 
 
-def _get_l1_risk_price(symbol: str, direction: str) -> Tuple[Optional[Decimal], str, Optional[Decimal], Optional[Decimal]]:
-    """Return (ref_price, source, best_bid, best_ask).
-
-    Ladder risk checks use:
-      - LONG  -> best_bid
-      - SHORT -> best_ask
-
-    Priority order:
-      1) Fresh L1 (public WS)
-      2) Cached ticker/mark (fast, avoids NO_PRICE)
-      3) Live ticker (REST)
-      4) Mark/position-derived (private REST)
-      5) Last cached price within RISK_TICKER_STALE_SEC
-
-    This makes risk management resilient when the public WS connection is flaky.
+def _get_risk_price(symbol: str) -> Tuple[Optional[Decimal], str]:
+    """Get the price used for risk management / stop logic.
+   
+    MARK is preferred (robust against spread/manipulation).
+    Fallback: reference price (index/mark/last depending on availability).
     """
-    sym = str(symbol).upper().strip()
-    dir_u = str(direction or "").upper().strip()
-
-    # Ensure subscription exists (idempotent). Public WS is started in worker.
+    # 1) MARK (preferred)
     try:
-        ensure_public_depth_subscription(sym, limit=25, speed="H")
+        return get_mark_price(symbol), "MARK"
     except Exception:
         pass
-
-    bid, ask, ts = None, None, 0.0
+    # 2) Reference (fallback)
     try:
-        bid, ask, ts = get_l1_bid_ask(sym)
+        return get_reference_price(symbol), "REF"
     except Exception:
-        bid, ask, ts = None, None, 0.0
-
-    now = time.time()
-    if bid is not None and ask is not None and bid > 0 and ask > 0 and (now - float(ts)) <= L1_STALE_SEC:
-        if dir_u == "LONG":
-            return bid, "L1_BID", bid, ask
-        return ask, "L1_ASK", bid, ask
-
-    # 2) Use cached ticker if still fresh enough (prevents blocking on REST during spikes)
-    with _RISK_TICKER_LOCK:
-        cached = _RISK_TICKER_CACHE.get(sym)
-    if cached:
-        cpx, cts = cached
-        if cpx is not None and cpx > 0 and (now - float(cts)) <= RISK_TICKER_REFRESH_SEC:
-            if dir_u == "LONG":
-                return cpx, "TICKER_CACHE", bid, ask
-            return cpx, "TICKER_CACHE", bid, ask
-
-    # 3) Live ticker (REST)
-    try:
-        ref = get_reference_price(sym)
-        if ref is not None and ref > 0:
-            with _RISK_TICKER_LOCK:
-                _RISK_TICKER_CACHE[sym] = (ref, now)
-            return ref, "TICKER_REST", bid, ask
-    except Exception:
-        pass
-
-    # 4) Mark/position-derived (private REST), optional
-    if L1_FALLBACK_TO_MARK:
-        try:
-            m = _get_mark_price(sym)
-            if m is not None and m > 0:
-                with _RISK_TICKER_LOCK:
-                    _RISK_TICKER_CACHE[sym] = (m, now)
-                return m, "MARK_FALLBACK", bid, ask
-        except Exception:
-            pass
-
-    # 5) Last cached (stale) within tolerance
-    if cached:
-        cpx, cts = cached
-        if cpx is not None and cpx > 0 and (now - float(cts)) <= RISK_TICKER_STALE_SEC:
-            return cpx, "TICKER_CACHE_STALE", bid, ask
-
-    return None, "NO_PRICE", bid, ask
-
+        return None, "NO_PRICE"
 
 def _compute_profit_pct(direction: str, entry: Decimal, mark: Decimal) -> Decimal:
     if entry <= 0 or mark <= 0:
@@ -693,7 +631,7 @@ def _risk_loop():
                     if qty <= 0 or entry <= 0:
                         continue
 
-                    ref_price, ref_src, best_bid, best_ask = _get_l1_risk_price(symbol, direction)
+                    ref_price, ref_src = _get_risk_price(symbol)
                     if ref_price is None or ref_price <= 0:
                         continue
 
@@ -711,7 +649,7 @@ def _risk_loop():
                                 print(
                                     f"[LADDER] STATUS bot={bot_id} {direction} {symbol} qty={qty} "
                                     f"entry={entry} ref={ref_price} src={ref_src} "
-                                    f"bid={best_bid} ask={best_ask} profit%={profit_pct:.4f} lock%={lock_pct} stop={stop_price}"
+                                    f"profit%={profit_pct:.4f} lock%={lock_pct} stop={stop_price}"
                                 )
                         except Exception:
                             pass
@@ -722,7 +660,7 @@ def _risk_loop():
                         print(
                             f"[LADDER] STOP bot={bot_id} {direction} {symbol} qty={qty} "
                             f"entry={entry} ref={ref_price} src={ref_src} "
-                            f"bid={best_bid} ask={best_ask} profit%={profit_pct:.4f} lock%={lock_pct} stop={stop_price}"
+                            f"profit%={profit_pct:.4f} lock%={lock_pct} stop={stop_price}"
                         )
                         _ladder_close_position(bot_id, symbol, direction, qty, reason="ladder_stop")
 
