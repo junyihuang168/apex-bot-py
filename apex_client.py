@@ -48,6 +48,10 @@ DEFAULT_SYMBOL_RULES = {
 
 SYMBOL_RULES: Dict[str, Dict[str, Any]] = {}
 
+# Cache timestamp for dynamically fetched market rules
+_SYMBOL_RULES_TS: float = 0.0
+_SYMBOL_RULES_LOCK = threading.Lock()
+
 NumberLike = Union[str, int, float]
 
 _CLIENT: Optional[HttpPrivateSign] = None
@@ -398,8 +402,248 @@ def get_client() -> HttpPrivateSign:
     # CRITICAL: ensure accountV3 cache is a dict (SDK internal usage)
     _ensure_account_v3_cache(client)
 
+    # Best-effort: fetch dynamic market rules (stepSize/minQty/tickSize)
+    try:
+        refresh_symbol_rules(force=False)
+    except Exception as e:
+        print(f'[apex_client][WARN] refresh_symbol_rules failed (continuing): {e}')
+
     _CLIENT = client
     return client
+
+
+# -----------------------------------------------------------------------------
+# Dynamic market rules fetch
+# -----------------------------------------------------------------------------
+
+def _to_decimal(v: Any, default: Optional[Decimal] = None) -> Optional[Decimal]:
+    if v is None or v == '':
+        return default
+    try:
+        return Decimal(str(v))
+    except Exception:
+        return default
+
+
+def _decimals_from_step(step: Optional[Decimal]) -> Optional[int]:
+    if step is None:
+        return None
+    try:
+        # exponent is negative decimals
+        exp = step.as_tuple().exponent
+        if exp >= 0:
+            return 0
+        return int(-exp)
+    except Exception:
+        return None
+
+
+def _extract_list_payload(j: Any) -> List[Dict[str, Any]]:
+    """Best-effort: find a list of dict items inside a typical API payload."""
+    out: List[Dict[str, Any]] = []
+    if j is None:
+        return out
+    if isinstance(j, list):
+        for it in j:
+            if isinstance(it, dict):
+                out.append(it)
+        return out
+    if not isinstance(j, dict):
+        return out
+
+    # Common wrappers
+    candidates = []
+    if 'data' in j:
+        candidates.append(j.get('data'))
+    for k in ('result', 'results', 'symbols', 'markets', 'instruments', 'contracts', 'rows', 'list'):
+        if k in j:
+            candidates.append(j.get(k))
+
+    # Explore nested dicts to find list values
+    for c in candidates:
+        if isinstance(c, list):
+            for it in c:
+                if isinstance(it, dict):
+                    out.append(it)
+        elif isinstance(c, dict):
+            for vk, vv in c.items():
+                if isinstance(vv, list):
+                    for it in vv:
+                        if isinstance(it, dict):
+                            out.append(it)
+    return out
+
+
+def _parse_rule_item(item: Dict[str, Any]) -> Optional[Tuple[str, Dict[str, Any]]]:
+    """Parse a single instrument/market entry into our SYMBOL_RULES shape.
+
+    We intentionally support many key aliases because ApeX payloads differ across
+    environments/SDK versions.
+    """
+    if not isinstance(item, dict):
+        return None
+
+    sym = (
+        item.get('symbol')
+        or item.get('symbolName')
+        or item.get('instrument')
+        or item.get('instrumentId')
+        or item.get('market')
+        or item.get('name')
+        or item.get('contract')
+    )
+    if not sym:
+        return None
+
+    sym = format_symbol(str(sym))
+
+    # Quantity step/min
+    step = _to_decimal(item.get('stepSize') or item.get('step_size') or item.get('sizeStep') or item.get('qtyStep') or item.get('quantityStep') or item.get('minSizeIncrement'))
+    min_qty = _to_decimal(item.get('minQty') or item.get('min_qty') or item.get('minSize') or item.get('minOrderSize') or item.get('minQuantity'))
+
+    # Price tick
+    tick = _to_decimal(item.get('tickSize') or item.get('tick_size') or item.get('priceStep') or item.get('minPriceIncrement') or item.get('priceTick'))
+
+    # Precision fallbacks
+    qty_dec = item.get('sizePrecision') or item.get('qtyPrecision') or item.get('quantityPrecision')
+    price_dec = item.get('pricePrecision') or item.get('quotePrecision')
+
+    try:
+        qty_dec = int(qty_dec) if qty_dec is not None and qty_dec != '' else None
+    except Exception:
+        qty_dec = None
+    try:
+        price_dec = int(price_dec) if price_dec is not None and price_dec != '' else None
+    except Exception:
+        price_dec = None
+
+    if step is None and qty_dec is not None:
+        try:
+            step = Decimal('1').scaleb(-qty_dec)
+        except Exception:
+            step = None
+    if tick is None and price_dec is not None:
+        try:
+            tick = Decimal('1').scaleb(-price_dec)
+        except Exception:
+            tick = None
+
+    # min qty fallback: if missing but step exists, use step
+    if min_qty is None and step is not None:
+        min_qty = step
+
+    if step is None and min_qty is None and tick is None:
+        return None
+
+    rule: Dict[str, Any] = {}
+    if min_qty is not None:
+        rule['min_qty'] = min_qty
+    if step is not None:
+        rule['step_size'] = step
+    if tick is not None:
+        rule['tick_size'] = tick
+
+    # Derive decimals from step/tick if not provided
+    if qty_dec is None and step is not None:
+        qty_dec = _decimals_from_step(step)
+    if price_dec is None and tick is not None:
+        price_dec = _decimals_from_step(tick)
+
+    if qty_dec is not None:
+        rule['qty_decimals'] = int(qty_dec)
+    if price_dec is not None:
+        rule['price_decimals'] = int(price_dec)
+
+    # Notional min (optional)
+    min_notional = _to_decimal(item.get('minNotional') or item.get('min_notional') or item.get('minValue') or item.get('minOrderValue'))
+    if min_notional is not None:
+        rule['min_notional'] = min_notional
+
+    return sym, rule
+
+
+def refresh_symbol_rules(force: bool = False) -> bool:
+    """Fetch market rules (stepSize/minQty/tickSize) and populate SYMBOL_RULES.
+
+    Why this matters:
+      - Different symbols have different size step/minimums (many are integer-only).
+      - If we compute qty without respecting stepSize, the exchange rejects the order,
+        and Trade History will be empty (exactly your LIT case).
+
+    Behavior:
+      - Best-effort and safe: never crashes startup; prints a warning on failure.
+      - Cached with a TTL.
+      - Can be disabled via env APEX_DISABLE_SYMBOL_RULES_FETCH=1
+    """
+    if _env_bool('APEX_DISABLE_SYMBOL_RULES_FETCH', False):
+        return False
+
+    ttl = float(os.getenv('SYMBOL_RULES_TTL_SEC', '3600'))
+    now = time.time()
+
+    global _SYMBOL_RULES_TS
+    with _SYMBOL_RULES_LOCK:
+        if (not force) and _SYMBOL_RULES_TS and (now - _SYMBOL_RULES_TS) < ttl and SYMBOL_RULES:
+            return True
+
+        base_url, _ = _get_base_and_network()
+        # ApeX environments/SDK builds differ in which public endpoints are exposed.
+        # We try a broader set; the first endpoint that yields parseable instruments
+        # will populate SYMBOL_RULES.
+        endpoints = [
+            # v3-style
+            '/api/v3/symbols',
+            '/api/v3/markets',
+            '/api/v3/instruments',
+            '/api/v3/contracts',
+            '/api/v3/exchangeInfo',
+            # older variants sometimes seen
+            '/api/v2/symbols',
+            '/api/v2/markets',
+            '/api/v1/symbols',
+            '/api/v1/markets',
+            '/api/v1/exchangeInfo',
+        ]
+
+        loaded = 0
+        tried = 0
+        last_err: Optional[Exception] = None
+
+        for ep in endpoints:
+            tried += 1
+            try:
+                url = f'{base_url}{ep}'
+                resp = requests.get(url, timeout=10)
+                resp.raise_for_status()
+                j = resp.json()
+                items = _extract_list_payload(j)
+                if not items:
+                    continue
+
+                for it in items:
+                    parsed = _parse_rule_item(it)
+                    if not parsed:
+                        continue
+                    sym, rule = parsed
+                    # Merge into dict (keep any pre-config overrides)
+                    cur = SYMBOL_RULES.get(sym, {})
+                    merged = dict(cur)
+                    merged.update(rule)
+                    SYMBOL_RULES[sym] = merged
+                    loaded += 1
+
+                if loaded > 0:
+                    _SYMBOL_RULES_TS = now
+                    print(f'[apex_client][rules] loaded {len(SYMBOL_RULES)} symbols from {ep}')
+                    return True
+
+            except Exception as e:
+                last_err = e
+                continue
+
+        if last_err:
+            print(f'[apex_client][WARN] symbol rules fetch failed (tried={tried}): {last_err}')
+        return False
 
 
 # -----------------------------------------------------------------------------
@@ -436,6 +680,17 @@ def _snap_price(symbol: str, price: Decimal) -> Decimal:
         return Decimal("0")
     snapped = (price // tick) * tick
     return snapped.quantize(tick, rounding=ROUND_DOWN)
+
+
+def _dec_to_str(d: Decimal) -> str:
+    """Stable decimal->string without scientific notation."""
+    try:
+        s = format(d, 'f')
+    except Exception:
+        s = str(d)
+    if '.' in s:
+        s = s.rstrip('0').rstrip('.')
+    return s if s else '0'
 
 
 # -----------------------------------------------------------------------------
@@ -759,39 +1014,151 @@ def create_market_order(
     client = get_client()
     sym = format_symbol(symbol)
     side_u = str(side).upper().strip()
-    qty = str(size)
 
+    # Snap qty to the symbol's stepSize/minQty (prevents exchange rejection)
+    qty_dec = _to_decimal(size, default=None)
+    if qty_dec is None:
+        raise ValueError(f"invalid size: {size}")
+    qty_snapped = _snap_quantity(sym, qty_dec)
+    qty = _dec_to_str(qty_snapped)
+
+    # ApeX requires a price field even for MARKET orders (signature). We use a conservative bound.
     worst_price = get_market_price(sym, side_u, qty)
 
     client_id = client_id or _random_client_id()
 
-    raw_res = _create_order_v3_compat(
-        client,
-        symbol=sym,
-        side=side_u,
-        order_type="MARKET",
-        size=qty,
-        price=str(worst_price),
-        reduce_only=bool(reduce_only),
-        client_id=str(client_id) if client_id else None,
-    )
+    def _place_market(size_str: str, cid: str) -> Dict[str, Any]:
+        return _create_order_v3_compat(
+            client,
+            symbol=sym,
+            side=side_u,
+            order_type="MARKET",
+            size=size_str,
+            price=str(worst_price),
+            reduce_only=bool(reduce_only),
+            client_id=str(cid) if cid else None,
+        )
+
+    try:
+        raw_res = _place_market(qty, client_id)
+    except Exception as e:
+        print(f"[apex_client][order][ERR] create MARKET failed symbol={sym} side={side_u} qty={qty} reduceOnly={reduce_only} clientId={client_id}: {e}")
+        raise
 
     # Robust parse
-    data = _extract_data_dict(raw_res)
+    data = _extract_data_dict(raw_res) or {}
     order_id = None
     client_order_id = None
 
+    # SDKs vary: sometimes orderId is nested, sometimes not present on error.
     if isinstance(data, dict):
         order_id = data.get("orderId") or data.get("id")
         client_order_id = data.get("clientOrderId") or data.get("clientId") or client_id
     else:
-        # object response
         try:
             order_id = getattr(raw_res, "orderId", None) or getattr(raw_res, "id", None)
         except Exception:
             order_id = None
         client_order_id = client_id
 
+    # Status / error extraction (for app.py to reject fast instead of timing out on fills)
+    status = ""
+    cancel_reason = ""
+    try:
+        if isinstance(data, dict):
+            status = str(data.get("status") or "").upper()
+            cancel_reason = str(
+                data.get("cancelReason")
+                or data.get("rejectReason")
+                or data.get("errorMessage")
+                or ""
+            )
+    except Exception:
+        status = ""
+        cancel_reason = ""
+
+    code = None
+    msg = ""
+    if isinstance(raw_res, dict):
+        code = raw_res.get("code") or raw_res.get("errCode") or raw_res.get("errorCode")
+        msg = str(raw_res.get("msg") or raw_res.get("message") or raw_res.get("error") or "")
+
+    # If no orderId, treat as rejected (most commonly: size step/precision violation)
+    if not order_id:
+        if not status:
+            status = "REJECTED"
+        if not cancel_reason and msg:
+            cancel_reason = msg
+
+        # Heuristic retry: many perp contracts are integer-sized (stepSize=1), but
+        # when symbol rules fetch fails we may still be using DEFAULT_SYMBOL_RULES (0.01).
+        # In that case, a qty like 5.61 will be rejected and Trade History will be empty.
+        reason_l = (cancel_reason or msg or "").lower()
+        rules = _get_symbol_rules(sym)
+        step_now = _to_decimal(rules.get('step_size'), default=Decimal('0.01')) or Decimal('0.01')
+        min_now = _to_decimal(rules.get('min_qty'), default=Decimal('0')) or Decimal('0')
+
+        # Only retry when qty is non-integer and our current step is sub-1 (likely default).
+        # Also require the reason to be plausibly sizing-related, or simply missing orderId.
+        sizing_hint = any(k in reason_l for k in (
+            'step', 'precision', 'invalid', 'size', 'quantity', 'lot', 'min', 'increment'
+        ))
+        try:
+            qty_int = qty_snapped.to_integral_value(rounding=ROUND_DOWN)
+        except Exception:
+            qty_int = None
+
+        # Retry only when our current rules are likely defaults (meaning fetch failed)
+        # and the rejection looks sizing-related.
+        try:
+            default_step = Decimal(str(DEFAULT_SYMBOL_RULES.get('step_size') or '0.01'))
+            default_min = Decimal(str(DEFAULT_SYMBOL_RULES.get('min_qty') or '0.01'))
+        except Exception:
+            default_step = Decimal('0.01')
+            default_min = Decimal('0.01')
+
+        likely_default_rules = (sym not in SYMBOL_RULES) or (step_now == default_step and (min_now == 0 or min_now == default_min))
+
+        if qty_int is not None and qty_int >= 1 and qty_snapped != qty_int and step_now < 1 and likely_default_rules and sizing_hint:
+            retry_cid = f"{client_id}R1"
+            retry_qty = _dec_to_str(qty_int)
+            try:
+                raw_res2 = _place_market(retry_qty, retry_cid)
+                data2 = _extract_data_dict(raw_res2) or {}
+                oid2 = (data2.get('orderId') or data2.get('id')) if isinstance(data2, dict) else None
+
+                # If retry produced an orderId, prefer it.
+                if oid2:
+                    raw_res = raw_res2
+                    data = data2
+                    order_id = str(oid2)
+                    client_order_id = str(data2.get('clientOrderId') or data2.get('clientId') or retry_cid)
+                    # Update qty fields to the retry quantity so downstream tracking/PNL uses the real requested size.
+                    qty_snapped = qty_int
+                    qty = retry_qty
+                    status = str(data2.get('status') or status or '').upper() or status
+                    cancel_reason = str(
+                        data2.get('cancelReason')
+                        or data2.get('rejectReason')
+                        or data2.get('errorMessage')
+                        or cancel_reason
+                        or ''
+                    )
+
+                    # Persist the inferred integer rule so future orders are snapped correctly.
+                    try:
+                        cur = SYMBOL_RULES.get(sym, {})
+                        merged = dict(cur)
+                        merged.update({'step_size': Decimal('1'), 'min_qty': Decimal('1'), 'qty_decimals': 0})
+                        SYMBOL_RULES[sym] = merged
+                        print(f"[apex_client][rules][infer] {sym} appears integer-sized; overriding stepSize=1 minQty=1")
+                    except Exception:
+                        pass
+            except Exception as e2:
+                # Keep original rejection info.
+                print(f"[apex_client][order][WARN] integer retry failed symbol={sym} qty={retry_qty} cid={retry_cid}: {e2}")
+
+    # Track only when we have a real order id
     if order_id:
         register_order_for_tracking(
             order_id=str(order_id),
@@ -800,8 +1167,26 @@ def create_market_order(
             expected_qty=qty,
         )
 
+    # Concise log for production diagnosis
+    brief_reason = (cancel_reason or msg or "")
+    if len(brief_reason) > 180:
+        brief_reason = brief_reason[:180] + "..."
+    print(
+        f"[apex_client][order] MARKET symbol={sym} side={side_u} qty={qty} reduceOnly={reduce_only} "
+        f"clientId={client_id} orderId={order_id or '-'} status={status or '-'} code={code or '-'} reason={brief_reason!r}"
+    )
+
     return {
         "raw": raw_res,
+        # Provide a 'data' dict so app.py can read status/cancelReason immediately
+        "data": {
+            "orderId": str(order_id) if order_id is not None else None,
+            "clientOrderId": str(client_order_id) if client_order_id is not None else str(client_id),
+            "status": status,
+            "cancelReason": cancel_reason,
+            "code": code,
+            "msg": msg,
+        },
         "order_id": str(order_id) if order_id is not None else None,
         "client_order_id": str(client_order_id) if client_order_id is not None else str(client_id),
         "symbol": sym,
@@ -826,6 +1211,22 @@ def create_trigger_order(
     client = get_client()
     sym = format_symbol(symbol)
     side_u = str(side).upper().strip()
+
+    # Snap qty and trigger price to exchange rules
+    try:
+        qd = _to_decimal(qty, default=Decimal('0'))
+        qd = _snap_quantity(sym, qd)
+        qty = format(qd, 'f')
+    except Exception as e:
+        print(f'[apex_client][order][ERROR] trigger qty invalid symbol={sym} qty={qty}: {e}')
+        raise
+
+    try:
+        tp = _to_decimal(trigger_price, default=None)
+        if tp is not None:
+            trigger_price = format(_snap_price(sym, tp), 'f')
+    except Exception:
+        pass
 
     try:
         protective_price = get_market_price(sym, side_u, qty)
