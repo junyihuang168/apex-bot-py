@@ -2,11 +2,9 @@ import os
 import time
 import threading
 from decimal import Decimal
-import importlib
-
-import requests
 
 import pnl_store as _pnl
+
 
 # --- Required pnl_store APIs (must exist) ---
 init_db = _pnl.init_db
@@ -15,7 +13,8 @@ record_exit_fifo = _pnl.record_exit_fifo
 set_lock_level_pct = _pnl.set_lock_level_pct
 clear_lock_level_pct = _pnl.clear_lock_level_pct
 
-# --- Optional pnl_store APIs (may not exist in some repo versions) ---
+
+# --- Optional pending-order reconcile APIs (older pnl_store may not have them) ---
 list_pending_orders = getattr(_pnl, "list_pending_orders", None)
 touch_pending_try = getattr(_pnl, "touch_pending_try", None)
 mark_pending_done = getattr(_pnl, "mark_pending_done", None)
@@ -32,29 +31,36 @@ def _import_app_module():
     """Import the web app module that contains monitor/risk thread entrypoints.
 
     Different repo versions may use different filenames:
-      - app.py            -> module "app"
-      - app_any_amount_v2.py -> module "app_any_amount_v2"
-      - app_any_amount.py -> module "app_any_amount"
-      - main.py / server.py etc.
+      - app.py                 -> module "app"
+      - app_any_amount_v2.py   -> module "app_any_amount_v2"
+      - app_any_amount.py      -> module "app_any_amount"
+      - main.py / server.py    -> module "main" / "server"
 
-    Priority:
-      1) env WORKER_APP_MODULE if set
-      2) fallback candidates list
+    You can override the module name by setting env var WORKER_APP_MODULE.
     """
-    env_mod = (os.getenv("WORKER_APP_MODULE") or "").strip()
-    candidates = [env_mod] if env_mod else []
-    candidates += ["app", "app_any_amount_v2", "app_any_amount", "main", "server"]
+    import importlib
+
+    override = str(os.getenv("WORKER_APP_MODULE", "")).strip()
+    candidates = [override] if override else []
+    candidates += [
+        "app",  # prefer app.py (most common)
+        "app_any_amount_v2",
+        "app_any_amount",
+        "main",
+        "server",
+    ]
 
     last_err = None
-    for mod in candidates:
-        if not mod:
+    for name in candidates:
+        if not name:
             continue
         try:
-            m = importlib.import_module(mod)
-            print(f"[worker] using app module: {mod}")
-            return m
+            mod = importlib.import_module(name)
+            print(f"[worker] using app module: {name}")
+            return mod
         except Exception as e:
             last_err = e
+            continue
 
     raise ModuleNotFoundError(
         f"[worker] cannot import any app module. candidates={candidates}. "
@@ -76,48 +82,69 @@ def _call_if_exists(name: str) -> bool:
 def main():
     global app_module
 
-    # Import app module dynamically (fixes ModuleNotFoundError on app_any_amount_v2)
+    # Load the Flask app module (contains monitor/risk thread entrypoints)
     app_module = _import_app_module()
 
-    # init db early
-    try:
-        init_db()
-    except Exception as e:
-        print("[worker] init_db error:", e)
+    # Ensure DB initialized for PnL / positions
+    init_db()
 
-    # Start monitor thread (WS / REST polling) from app module if present
+    # Fail-safe defaults (if supervisor/env didn't inject them)
+    # Worker is the only process that should keep long-lived WS connections and risk loops.
+    os.environ.setdefault("ENABLE_WS", "1")
+    os.environ.setdefault("ENABLE_REST_POLL", "1")
+    os.environ.setdefault("ENABLE_RISK_LOOP", "1")
+
+    # Plan A: exchange-native protective stop orders (STOP_MARKET reduceOnly) + cancel/replace.
+    os.environ.setdefault("ENABLE_EXCHANGE_STOP", "1")
+    os.environ.setdefault("STOP_TRIGGER_PRICE_TYPE", "MARK")  # LAST | MARK | INDEX
+    # Price source used only for ladder progress checks; keep LAST unless explicitly using BID/ASK.
+    os.environ.setdefault("RISK_PRICE_SOURCE", "LAST")
+
+    # Pending reconcile defaults
+    os.environ.setdefault("PENDING_RETRY_GAP_SEC", "1")
+    os.environ.setdefault("PENDING_FILL_WAIT_SEC", "2.0")
+    os.environ.setdefault("PENDING_FILL_POLL_INTERVAL", "0.2")
+
     started_any = False
-    if _call_if_exists("_ensure_monitor_thread") or _call_if_exists("ensure_monitor_thread"):
-        print("[worker] started monitor via app module")
-        started_any = True
 
-    # Start ladder/risk loop from app module if present
-    if _call_if_exists("_ensure_risk_thread") or _call_if_exists("ensure_risk_thread"):
-        print("[worker] started risk loop via app module")
-        started_any = True
+    # Start monitor thread (private WS + fills/orders handling)
+    for n in ("_ensure_monitor_thread", "ensure_monitor_thread", "start_monitor_thread"):
+        if _call_if_exists(n):
+            print(f"[worker] started monitor via {n}()")
+            started_any = True
+            break
+    else:
+        print("[worker] WARNING: no monitor starter found in app module")
+
+    # Start risk thread (ladder SL/TS loop)
+    for n in ("_ensure_risk_thread", "ensure_risk_thread", "start_risk_thread"):
+        if _call_if_exists(n):
+            print(f"[worker] started risk loop via {n}()")
+            started_any = True
+            break
+    else:
+        print("[worker] WARNING: no risk-loop starter found in app module")
 
     if not started_any:
-        print("[worker] WARNING: app module has no monitor/risk thread entrypoints")
+        print("[worker] ERROR: nothing was started. Check the app module for thread entrypoints.")
+    else:
+        print("[worker] OK: worker running (WS + optional risk loop).")
 
     # ------------------------------------------------------------------
     # Background reconciliation: record entries/exits when fills are delayed
-    # This is optional and depends on pnl_store pending helpers.
     # ------------------------------------------------------------------
     def _reconcile_pending_loop():
         while True:
             try:
                 gap = int(float(os.getenv("PENDING_RETRY_GAP_SEC", "1")))
-                max_age = int(float(os.getenv("PENDING_MAX_AGE_SEC", "60")))
-                max_tries = int(float(os.getenv("PENDING_MAX_TRIES", "20")))
-
-                pendings = list_pending_orders(max_age_sec=max_age, max_tries=max_tries)
+                pendings = list_pending_orders(limit=50, min_retry_gap_sec=max(1, gap))
                 if not pendings:
-                    time.sleep(gap)
+                    time.sleep(0.5)
                     continue
 
                 for p in pendings:
                     bot_id = str(p.get("bot_id"))
-                    sig_id = str(p.get("sig_id"))
+                    sig_id = str(p.get("signal_id"))
                     symbol = str(p.get("symbol"))
                     mode = str(p.get("mode"))
                     side = str(p.get("side"))
@@ -162,6 +189,7 @@ def main():
                                 reason="pending_entry_reconcile",
                             )
                         except Exception:
+                            # likely already recorded; treat as done
                             pass
 
                         # Initialize ladder base lock if needed
