@@ -2,67 +2,23 @@ import os
 import time
 import threading
 from decimal import Decimal
-import importlib
 
 from pnl_store import (
     init_db,
+    list_pending_orders,
+    touch_pending_try,
+    mark_pending_done,
+    mark_pending_failed,
     record_entry,
     record_exit_fifo,
     set_lock_level_pct,
     clear_lock_level_pct,
 )
 
-# Optional pending-order reconciliation helpers.
-# IMPORTANT: some deployments may still have an older pnl_store.py without these symbols.
-try:
-    from pnl_store import (
-        list_pending_orders,
-        touch_pending_try,
-        mark_pending_done,
-        mark_pending_failed,
-    )
-    _PENDING_AVAILABLE = True
-except Exception:
-    list_pending_orders = None
-    touch_pending_try = None
-    mark_pending_done = None
-    mark_pending_failed = None
-    _PENDING_AVAILABLE = False
-
 from apex_client import get_fill_summary
 
-
-def _import_app_module():
-    """
-    Worker needs to import the web app module to reuse its monitor/risk threads.
-    Different repos name this file differently. Try a list of common candidates.
-    """
-    candidates = [
-        os.getenv("WORKER_APP_MODULE", "").strip(),
-        "app_any_amount_v2",
-        "app_any_amount",
-        "app_any_amount_v1",
-        "app",
-        "main",
-        "server",
-    ]
-    for name in candidates:
-        if not name:
-            continue
-        try:
-            mod = importlib.import_module(name)
-            print(f"[worker] using app module: {name}")
-            return mod
-        except Exception as e:
-            last_err = e
-            continue
-    raise ModuleNotFoundError(
-        f"Worker cannot import any app module candidates={candidates}. "
-        f"Set WORKER_APP_MODULE to the correct module name. Last error={last_err}"
-    )
-
-
-app_module = _import_app_module()
+# Reuse the monitor/risk threads implemented inside the web app module
+import app_any_amount_v2 as app_module
 
 
 def _call_if_exists(name: str) -> bool:
@@ -78,10 +34,16 @@ def main():
     init_db()
 
     # Fail-safe defaults (if supervisor/env didn't inject them)
+    # Worker is the only process that should keep long-lived WS connections and risk loops.
     os.environ.setdefault("ENABLE_WS", "1")
     os.environ.setdefault("ENABLE_REST_POLL", "1")
-    os.environ.setdefault("ENABLE_RISK_LOOP", "1")  # bot-side SL + ladder trailing
-    os.environ.setdefault("ENABLE_EXCHANGE_PROTECTIVE", "0")
+    os.environ.setdefault("ENABLE_RISK_LOOP", "1")
+
+    # Plan A: exchange-native protective stop orders (STOP_MARKET reduceOnly) + cancel/replace.
+    os.environ.setdefault("ENABLE_EXCHANGE_STOP", "1")
+    os.environ.setdefault("STOP_TRIGGER_PRICE_TYPE", "MARK")  # LAST | MARK | INDEX
+    # Price source used only for ladder progress checks; keep LAST unless explicitly using BID/ASK.
+    os.environ.setdefault("RISK_PRICE_SOURCE", "LAST")
 
     # Pending reconcile defaults
     os.environ.setdefault("PENDING_RETRY_GAP_SEC", "1")
@@ -213,11 +175,8 @@ def main():
                 print("[worker][pending] reconcile loop error:", e)
                 time.sleep(1)
 
-    if _PENDING_AVAILABLE:
-        threading.Thread(target=_reconcile_pending_loop, daemon=True, name="pending-reconcile").start()
-        print("[worker] started pending reconcile loop")
-    else:
-        print("[worker] pending reconcile DISABLED: pnl_store.py has no pending-order helpers")
+    threading.Thread(target=_reconcile_pending_loop, daemon=True, name="pending-reconcile").start()
+    print("[worker] started pending reconcile loop")
 
     while True:
         time.sleep(60)
