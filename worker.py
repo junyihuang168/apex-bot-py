@@ -96,9 +96,12 @@ def main():
 
     # Plan A: exchange-native protective stop orders (STOP_MARKET reduceOnly) + cancel/replace.
     os.environ.setdefault("ENABLE_EXCHANGE_STOP", "1")
-    os.environ.setdefault("STOP_TRIGGER_PRICE_TYPE", "MARK")  # LAST | MARK | INDEX
-    # Price source used only for ladder progress checks; keep LAST unless explicitly using BID/ASK.
-    os.environ.setdefault("RISK_PRICE_SOURCE", "LAST")
+
+    # Trigger price type for native stop: LAST | MARK | INDEX
+    os.environ.setdefault("STOP_TRIGGER_PRICE_TYPE", "MARK")
+
+    # Risk/ladder progress price source (do NOT use BID/ASK here; we are not subscribing orderBook)
+    os.environ.setdefault("RISK_PRICE_SOURCE", "MARK")
 
     # Pending reconcile defaults
     os.environ.setdefault("PENDING_RETRY_GAP_SEC", "1")
