@@ -801,42 +801,62 @@ def create_trigger_order(
     trigger_price: str,
     reduce_only: bool = True,
     client_order_id: Optional[str] = None,
+    trigger_price_type: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """Create an exchange-native STOP_MARKET (trigger-market) order.
+
+    SDK parameter names drift across apexomni versions, so we try multiple variants
+    and also provide positional fallbacks when required.
+
+    trigger_price_type: LAST | MARK | INDEX
+    """
     client = get_client()
     sym = format_symbol(symbol)
     side_u = str(side).upper().strip()
 
     try:
-        protective_price = get_market_price(sym, side_u, qty)
+        protective_price = get_market_price(sym, side_u, str(qty))
     except Exception:
         protective_price = str(trigger_price)
 
-    base = {
-        "symbol": sym,
-        "side": side_u,
-    }
+    base = {"symbol": sym, "side": side_u}
 
     type_variants = [
         {"type": "STOP_MARKET"},
         {"orderType": "STOP_MARKET"},
+        {"order_type": "STOP_MARKET"},
     ]
     size_variants = [
         {"size": str(qty)},
         {"qty": str(qty)},
+        {"quantity": str(qty)},
     ]
     price_variants = [
         {"price": str(protective_price)},
         {"limitPrice": str(protective_price)},
+        {"worstPrice": str(protective_price)},
+        {"worst_price": str(protective_price)},
     ]
     trigger_variants = [
         {"triggerPrice": str(trigger_price)},
         {"trigger_price": str(trigger_price)},
     ]
+
+    tpt_u = str(trigger_price_type).upper().strip() if trigger_price_type else ""
+    tpt_variants: List[Dict[str, Any]] = [{}]
+    if tpt_u:
+        tpt_variants = [
+            {"triggerPriceType": tpt_u},
+            {"trigger_price_type": tpt_u},
+        ]
+
     reduce_variants = [
         {"reduceOnly": bool(reduce_only)},
         {"reduce_only": bool(reduce_only)},
+        {},
     ]
-    client_variants = [{}]
+
+    client_variants: List[Dict[str, Any]] = [{}]
     if client_order_id:
         client_variants = [
             {"clientOrderId": str(client_order_id)},
@@ -844,110 +864,108 @@ def create_trigger_order(
             {"client_id": str(client_order_id)},
         ]
 
+    fn = getattr(client, "create_order_v3")
+
+    def _call_positional_with_prune(f, args, kw_payload: Dict[str, Any]):
+        p = dict(kw_payload)
+        last = None
+        for _ in range(12):
+            try:
+                return f(*args, **p)
+            except TypeError as te:
+                last = te
+                msg = str(te)
+                m = re.search(r"unexpected keyword argument ['\"]([^'\"]+)['\"]", msg)
+                if m:
+                    bad = m.group(1)
+                    p.pop(bad, None)
+                    continue
+                raise
+        if last:
+            raise last
+        raise RuntimeError("positional prune failed")
+
+    def _try_positional(payload: Dict[str, Any]):
+        ty = payload.get("type") or payload.get("orderType") or payload.get("order_type")
+        sz = payload.get("size") or payload.get("qty") or payload.get("quantity")
+        px = payload.get("price") or payload.get("limitPrice") or payload.get("worstPrice") or payload.get("worst_price")
+        if ty is None or sz is None:
+            raise TypeError("positional fallback missing type/size")
+
+        def _kw_without(*remove_keys: str) -> Dict[str, Any]:
+            kw = dict(payload)
+            for k in remove_keys:
+                kw.pop(k, None)
+            return kw
+
+        patterns: List[Tuple[List[Any], Tuple[str, ...]]] = []
+        # (type, size, [price])
+        patterns.append(([ty, sz], ("type", "orderType", "order_type", "size", "qty", "quantity")))
+        if px is not None:
+            patterns.append(([ty, sz, px], ("type", "orderType", "order_type", "size", "qty", "quantity", "price", "limitPrice", "worstPrice", "worst_price")))
+        # (side, type, size, [price])
+        patterns.append(([side_u, ty, sz], ("side", "type", "orderType", "order_type", "size", "qty", "quantity")))
+        if px is not None:
+            patterns.append(([side_u, ty, sz, px], ("side", "type", "orderType", "order_type", "size", "qty", "quantity", "price", "limitPrice", "worstPrice", "worst_price")))
+        # (symbol, side, type, size, [price])
+        patterns.append(([sym, side_u, ty, sz], ("symbol", "side", "type", "orderType", "order_type", "size", "qty", "quantity")))
+        if px is not None:
+            patterns.append(([sym, side_u, ty, sz, px], ("symbol", "side", "type", "orderType", "order_type", "size", "qty", "quantity", "price", "limitPrice", "worstPrice", "worst_price")))
+
+        last_e = None
+        for args, remove in patterns:
+            try:
+                return _call_positional_with_prune(fn, args, _kw_without(*remove))
+            except Exception as e:
+                last_e = e
+                continue
+        if last_e:
+            raise last_e
+        raise RuntimeError("positional patterns all failed")
+
     last_exc: Optional[Exception] = None
     for t in type_variants:
         for s in size_variants:
             for p in price_variants:
                 for trig in trigger_variants:
-                    for r in reduce_variants:
-                        for c in client_variants:
-                            payload: Dict[str, Any] = {}
-                            payload.update(base)
-                            payload.update(t)
-                            payload.update(s)
-                            payload.update(p)
-                            payload.update(trig)
-                            payload.update(r)
-                            payload.update(c)
-                            try:
-                                res = _safe_call(getattr(client, "create_order_v3"), **payload)
-                                data = _extract_data_dict(res)
-                                if isinstance(data, dict):
-                                    oid = data.get("orderId") or data.get("id")
-                                    if oid:
-                                        register_order_for_tracking(str(oid), str(client_order_id or ""), sym)
-                                return res
-                            except Exception as e:
-                                # Some SDK builds require positional args (notably: type + size). Try a broader
-                                # positional fallback before giving up.
-                                last_exc = e
-
+                    for tpt in tpt_variants:
+                        for r in reduce_variants:
+                            for c in client_variants:
+                                payload: Dict[str, Any] = {}
+                                payload.update(base)
+                                payload.update(t)
+                                payload.update(s)
+                                payload.update(p)
+                                payload.update(trig)
+                                payload.update(tpt)
+                                payload.update(r)
+                                payload.update(c)
                                 try:
-                                    if isinstance(e, TypeError) and ("missing" in str(e)) and ("required positional argument" in str(e)):
-                                        fn = getattr(client, "create_order_v3")
-
-                                        ty = payload.get("type") or payload.get("orderType") or payload.get("order_type")
-                                        sz = payload.get("size") or payload.get("qty") or payload.get("quantity")
-                                        px = payload.get("price") or payload.get("limitPrice") or payload.get("worstPrice") or payload.get("worst_price")
-
-                                        if ty is None or sz is None:
-                                            raise e
-
-                                        TYPE_KEYS = ("type", "orderType", "order_type")
-                                        SIZE_KEYS = ("size", "qty", "quantity")
-                                        PRICE_KEYS = ("price", "limitPrice", "worstPrice", "worst_price")
-                                        SIDE_KEYS = ("side",)
-                                        SYM_KEYS = ("symbol",)
-
-                                        def _call_positional_with_prune(f, args, kw_payload: Dict[str, Any]):
-                                            p = dict(kw_payload)
-                                            last = None
-                                            for _ in range(12):
-                                                try:
-                                                    return f(*args, **p)
-                                                except TypeError as te:
-                                                    last = te
-                                                    msg = str(te)
-                                                    m = re.search(r"unexpected keyword argument ['\"]([^'\"]+)['\"]", msg)
-                                                    if m:
-                                                        bad = m.group(1)
-                                                        p.pop(bad, None)
-                                                        continue
-                                                    raise
-                                            if last:
-                                                raise last
-                                            raise RuntimeError("positional prune failed")
-
-                                        def _kw_without(remove_keys: Tuple[str, ...]):
-                                            kw = dict(payload)
-                                            for k in remove_keys:
-                                                kw.pop(k, None)
-                                            return kw
-
-                                        patterns = [
-                                            ([ty, sz], TYPE_KEYS + SIZE_KEYS),
-                                            ([ty, sz, px] if px is not None else None, TYPE_KEYS + SIZE_KEYS + PRICE_KEYS),
-                                            ([side_u, ty, sz], SIDE_KEYS + TYPE_KEYS + SIZE_KEYS),
-                                            ([side_u, ty, sz, px] if px is not None else None, SIDE_KEYS + TYPE_KEYS + SIZE_KEYS + PRICE_KEYS),
-                                            ([sym, side_u, ty, sz], SYM_KEYS + SIDE_KEYS + TYPE_KEYS + SIZE_KEYS),
-                                            ([sym, side_u, ty, sz, px] if px is not None else None, SYM_KEYS + SIDE_KEYS + TYPE_KEYS + SIZE_KEYS + PRICE_KEYS),
-                                            ([sym, ty, sz], SYM_KEYS + TYPE_KEYS + SIZE_KEYS),
-                                            ([sym, ty, sz, px] if px is not None else None, SYM_KEYS + TYPE_KEYS + SIZE_KEYS + PRICE_KEYS),
-                                        ]
-
-                                        for args, remove in patterns:
-                                            if args is None:
-                                                continue
-                                            try:
-                                                res2 = _call_positional_with_prune(fn, args, _kw_without(remove))
-                                                data2 = _extract_data_dict(res2)
-                                                if isinstance(data2, dict):
-                                                    oid2 = data2.get("orderId") or data2.get("id")
-                                                    if oid2:
-                                                        register_order_for_tracking(str(oid2), str(client_order_id or ""), sym)
-                                                return res2
-                                            except Exception as e2:
-                                                last_exc = e2
-                                                continue
-                                except Exception:
-                                    # Keep the original exception semantics.
-                                    pass
-
-                                continue
+                                    res = _safe_call(fn, **payload)
+                                    data = _extract_data_dict(res)
+                                    if isinstance(data, dict):
+                                        oid = data.get("orderId") or data.get("id")
+                                        if oid:
+                                            register_order_for_tracking(str(oid), str(client_order_id or ""), sym)
+                                    return res
+                                except Exception as e:
+                                    last_exc = e
+                                    try:
+                                        if isinstance(e, TypeError) and ("required positional argument" in str(e) or "missing" in str(e)):
+                                            res2 = _try_positional(payload)
+                                            data2 = _extract_data_dict(res2)
+                                            if isinstance(data2, dict):
+                                                oid2 = data2.get("orderId") or data2.get("id")
+                                                if oid2:
+                                                    register_order_for_tracking(str(oid2), str(client_order_id or ""), sym)
+                                            return res2
+                                    except Exception as e2:
+                                        last_exc = e2
+                                        continue
 
     if last_exc:
         raise last_exc
-    raise RuntimeError("create_trigger_order: create_order_v3 failed with all compatible parameter variants")
+    raise RuntimeError("create_trigger_order failed")
 
 
 def get_open_position_for_symbol(symbol: str) -> Dict[str, Any]:
@@ -1059,6 +1077,75 @@ def _parse_fill(x: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "ts": ts_f,
         "raw": d,
     }
+
+
+def create_stop_market_order(
+    symbol: str,
+    side: str,
+    size: str,
+    trigger_price: str,
+    reduce_only: bool = True,
+    client_id: Optional[str] = None,
+    trigger_price_type: str = "MARK",
+) -> Dict[str, Any]:
+    """Create an exchange-native STOP_MARKET (trigger-market) order.
+
+    This is the protective order used by Plan A trailing stop logic.
+    - trigger_price_type: LAST | MARK | INDEX
+    """
+    res = create_trigger_order(
+        symbol=symbol,
+        side=side,
+        qty=str(size),
+        trigger_price=str(trigger_price),
+        reduce_only=bool(reduce_only),
+        client_order_id=str(client_id) if client_id else None,
+        trigger_price_type=str(trigger_price_type).upper().strip() if trigger_price_type else None,
+    )
+    data = _extract_data_dict(res)
+    out: Dict[str, Any] = {"raw": res}
+    if isinstance(data, dict):
+        out["order_id"] = data.get("orderId") or data.get("id")
+        out["client_order_id"] = data.get("clientOrderId") or data.get("clientId") or client_id
+        out["data"] = data
+    else:
+        out["order_id"] = None
+        out["client_order_id"] = client_id
+    return out
+
+
+def cancel_order_v3(order_id: Optional[str] = None, client_order_id: Optional[str] = None) -> Any:
+    """Cancel by orderId or clientOrderId (best-effort across SDK versions)."""
+    client = get_client()
+    oid = str(order_id).strip() if order_id else ""
+    cid = str(client_order_id).strip() if client_order_id else ""
+
+    # Prefer cancel by orderId
+    if oid:
+        try:
+            return _safe_call(getattr(client, "cancel_order_v3"), orderId=oid)
+        except Exception:
+            # Some builds use snake_case
+            try:
+                return _safe_call(getattr(client, "cancel_order_v3"), order_id=oid)
+            except Exception:
+                pass
+
+    # Fallback cancel by client order id
+    if cid:
+        for fn_name in ("cancel_order_by_client_id_v3", "cancel_order_v3"):
+            if not hasattr(client, fn_name):
+                continue
+            fn = getattr(client, fn_name)
+            try:
+                return _safe_call(fn, clientOrderId=cid)
+            except Exception:
+                try:
+                    return _safe_call(fn, client_order_id=cid)
+                except Exception:
+                    continue
+
+    raise ValueError("cancel_order_v3 requires order_id or client_order_id")
 
 
 def _parse_order_update(x: Dict[str, Any]) -> Optional[Dict[str, Any]]:
