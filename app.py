@@ -54,6 +54,19 @@ REMOTE_FALLBACK_SYMBOLS = {
     s.strip().upper() for s in os.getenv("REMOTE_FALLBACK_SYMBOLS", "").split(",") if s.strip()
 }
 
+
+# ----------------------------
+# ✅ Mirror bots (SMC long/short pairs) — ensure EXIT happens before ENTRY when flipping
+# Default pairs: BOT_1<->BOT_11 ... BOT_5<->BOT_15 (override via MIRROR_BOT_PAIRS)
+# Example: MIRROR_BOT_PAIRS="BOT_1:BOT_11,BOT_2:BOT_12,BOT_3:BOT_13"
+# ----------------------------
+MIRROR_BOT_PAIRS_RAW = str(os.getenv("MIRROR_BOT_PAIRS", "")).strip()
+MIRROR_WAIT_SEC = float(os.getenv("MIRROR_WAIT_SEC", "4.0"))
+MIRROR_FORCE_EXIT = str(os.getenv("MIRROR_FORCE_EXIT", "1")).strip() == "1"
+
+_MIRROR_LOCKS: dict = {}  # symbol -> threading.Lock
+_MIRROR_LOCKS_GUARD = threading.Lock()
+
 # ✅ 说明：本版本不在交易所挂真实 TP/SL 单；仅使用真实 fills 进行记账，并由机器人在后台按规则触发平仓。
 
 # 本地 cache（仅辅助）
@@ -535,6 +548,223 @@ def _order_status_and_reason(order: dict):
         or ""
     )
     return status, cancel_reason
+
+
+# ----------------------------
+# ✅ Mirror helpers
+# ----------------------------
+
+def _parse_mirror_pairs(raw: str) -> dict:
+    """Return mapping bot->mirror_bot.
+
+    Format: "BOT_1:BOT_11,BOT_2:BOT_12" (case/spacing tolerant).
+    If empty, defaults to BOT_1<->BOT_11 ... BOT_5<->BOT_15.
+    """
+    mapping = {}
+    raw = (raw or '').strip()
+
+    def _add(a: str, b: str):
+        a = _canon_bot_id(a)
+        b = _canon_bot_id(b)
+        if not a or not b or a == b:
+            return
+        mapping[a] = b
+        mapping[b] = a
+
+    if raw:
+        for part in raw.split(','):
+            part = part.strip()
+            if not part or ':' not in part:
+                continue
+            a, b = part.split(':', 1)
+            _add(a.strip(), b.strip())
+        return mapping
+
+    # default: 1-5 paired with 11-15
+    for i in range(1, 6):
+        _add(f"BOT_{i}", f"BOT_{i+10}")
+    return mapping
+
+
+_MIRROR_PAIRS = _parse_mirror_pairs(MIRROR_BOT_PAIRS_RAW)
+
+
+def _mirror_partner(bot_id: str) -> str:
+    return _MIRROR_PAIRS.get(_canon_bot_id(bot_id), "")
+
+
+def _is_mirror_bot(bot_id: str) -> bool:
+    return bool(_mirror_partner(bot_id))
+
+
+def _get_mirror_lock(symbol: str) -> threading.Lock:
+    sym = str(symbol or '').upper().strip()
+    with _MIRROR_LOCKS_GUARD:
+        lk = _MIRROR_LOCKS.get(sym)
+        if lk is None:
+            lk = threading.Lock()
+            _MIRROR_LOCKS[sym] = lk
+        return lk
+
+
+def _execute_exit_order(
+    bot_id: str,
+    symbol: str,
+    *,
+    force_direction: str = "",
+    ignore_cooldown: bool = False,
+    reason: str = "strategy_exit",
+    sig_id: str = "",
+) -> dict:
+    """Execute a reduce-only market close for bot+symbol and record real fills.
+
+    - force_direction: "LONG" or "SHORT" (optional)
+    - ignore_cooldown: bypass EXIT_COOLDOWN_SEC guard (used for mirror flips)
+
+    Returns a payload dict suitable for jsonify().
+    """
+    bot_id = _canon_bot_id(bot_id)
+    symbol = str(symbol or "").upper().strip()
+
+    if (not ignore_cooldown) and (not _exit_guard_allow(bot_id, symbol)):
+        return {"status": "cooldown_skip", "mode": "exit", "bot_id": bot_id, "symbol": symbol, "signal_id": sig_id}
+
+    opens = get_bot_open_positions(bot_id)
+    long_key = (symbol, "LONG")
+    short_key = (symbol, "SHORT")
+
+    long_qty = opens.get(long_key, {}).get("qty", Decimal("0"))
+    short_qty = opens.get(short_key, {}).get("qty", Decimal("0"))
+
+    # Prefer local cache direction unless forced
+    key_local = (bot_id, symbol)
+    local = BOT_POSITIONS.get(key_local)
+    preferred = "LONG"
+    if local and str(local.get("side", "")).upper() == "SELL":
+        preferred = "SHORT"
+
+    direction_to_close = None
+    qty_to_close = Decimal("0")
+
+    fd = str(force_direction or "").upper().strip()
+    if fd in ("LONG", "SHORT"):
+        if fd == "LONG" and long_qty > 0:
+            direction_to_close, qty_to_close = "LONG", long_qty
+        elif fd == "SHORT" and short_qty > 0:
+            direction_to_close, qty_to_close = "SHORT", short_qty
+
+    if (not direction_to_close) or qty_to_close <= 0:
+        if preferred == "LONG" and long_qty > 0:
+            direction_to_close, qty_to_close = "LONG", long_qty
+        elif preferred == "SHORT" and short_qty > 0:
+            direction_to_close, qty_to_close = "SHORT", short_qty
+        elif long_qty > 0:
+            direction_to_close, qty_to_close = "LONG", long_qty
+        elif short_qty > 0:
+            direction_to_close, qty_to_close = "SHORT", short_qty
+
+    if (not direction_to_close) or qty_to_close <= 0:
+        if symbol in REMOTE_FALLBACK_SYMBOLS:
+            remote = get_open_position_for_symbol(symbol)
+            if remote and remote["size"] > 0:
+                direction_to_close = remote["side"]
+                qty_to_close = remote["size"]
+            else:
+                return {"status": "no_position", "mode": "exit", "bot_id": bot_id, "symbol": symbol, "signal_id": sig_id}
+        else:
+            return {"status": "no_position", "mode": "exit", "bot_id": bot_id, "symbol": symbol, "signal_id": sig_id}
+
+    entry_side = "BUY" if direction_to_close == "LONG" else "SELL"
+    exit_side = "SELL" if direction_to_close == "LONG" else "BUY"
+
+    # Deterministic numeric clientId for attribution: BBB + ts + 02 (EXIT)
+    bnum = _bot_num(bot_id)
+    ts_now = int(time.time())
+    exit_client_id = f"{bnum:03d}{ts_now}02"
+
+    try:
+        order = create_market_order(
+            symbol=symbol,
+            side=exit_side,
+            size=str(qty_to_close),
+            reduce_only=True,
+            client_id=exit_client_id,
+        )
+    except Exception as e:
+        print("[EXIT] create_market_order error:", e)
+        return {"status": "order_error", "mode": "exit", "bot_id": bot_id, "symbol": symbol, "signal_id": sig_id, "error": str(e)}
+
+    status, cancel_reason = _order_status_and_reason(order)
+    print(f"[EXIT] order status={status} cancelReason={cancel_reason!r} bot={bot_id} symbol={symbol} reason={reason}")
+
+    if status in ("CANCELED", "REJECTED"):
+        return {
+            "status": "exit_rejected",
+            "mode": "exit",
+            "bot_id": bot_id,
+            "symbol": symbol,
+            "exit_side": exit_side,
+            "requested_qty": str(qty_to_close),
+            "order_status": status,
+            "cancel_reason": cancel_reason,
+            "signal_id": sig_id,
+        }
+
+    try:
+        fill = get_fill_summary(
+            symbol=symbol,
+            order_id=order.get("order_id"),
+            client_order_id=order.get("client_order_id"),
+            max_wait_sec=float(os.getenv("FILL_MAX_WAIT_SEC", "20.0")),
+            poll_interval=float(os.getenv("FILL_POLL_INTERVAL", "0.25")),
+        )
+        exit_price = Decimal(str(fill["avg_fill_price"]))
+        filled_qty = Decimal(str(fill["filled_qty"]))
+        print(f"[EXIT] fill ok bot={bot_id} symbol={symbol} filled_qty={filled_qty} avg_fill={exit_price}")
+    except Exception as e:
+        print(f"[EXIT] fill wait failed bot={bot_id} symbol={symbol} err:", e)
+        return {"status": "fill_unavailable", "mode": "exit", "bot_id": bot_id, "symbol": symbol, "signal_id": sig_id}
+
+    try:
+        record_exit_fifo(
+            bot_id=bot_id,
+            symbol=symbol,
+            entry_side=entry_side,
+            exit_qty=filled_qty,
+            exit_price=exit_price,
+            reason=reason,
+        )
+    except Exception as e:
+        print("[PNL] record_exit_fifo error:", e)
+
+    try:
+        clear_lock_level_pct(bot_id, symbol, direction_to_close)
+    except Exception:
+        pass
+
+    # Refresh local cache based on DB remaining
+    try:
+        opens2 = get_bot_open_positions(bot_id)
+        rem = opens2.get((symbol, direction_to_close), {}).get("qty", Decimal("0"))
+    except Exception:
+        rem = Decimal("0")
+
+    if key_local in BOT_POSITIONS:
+        BOT_POSITIONS[key_local]["qty"] = rem
+        if rem <= 0:
+            BOT_POSITIONS[key_local]["entry_price"] = None
+
+    return {
+        "status": "ok",
+        "mode": "exit",
+        "bot_id": bot_id,
+        "symbol": symbol,
+        "exit_side": exit_side,
+        "closed_qty": str(qty_to_close),
+        "order_status": status,
+        "cancel_reason": cancel_reason,
+        "signal_id": sig_id,
+    }
 
 
 # ----------------------------
@@ -1275,6 +1505,8 @@ def tv_webhook():
         if side_raw not in ("BUY", "SELL"):
             return "missing or invalid side", 400
 
+
+
         # ✅ Constraint A: global same-symbol same-direction (across all bots)
         desired_dir = "LONG" if side_raw == "BUY" else "SHORT"
         open_dirs = get_symbol_open_directions(symbol)
@@ -1289,23 +1521,96 @@ def tv_webhook():
                 "open_directions": sorted(list(open_dirs)),
                 "signal_id": sig_id,
             }), 200
+
         if len(open_dirs) == 1 and desired_dir not in open_dirs:
-            return jsonify({
-                "status": "reject_opposite_direction_locked",
-                "mode": "entry",
-                "bot_id": bot_id,
-                "symbol": symbol,
-                "desired_direction": desired_dir,
-                "locked_direction": list(open_dirs)[0],
-                "signal_id": sig_id,
-            }), 200
+            locked_dir = list(open_dirs)[0]
+
+            # ✅ Mirror sequencing: when flipping direction via SMC mirror bots
+            # ensure the opposite position is CLOSED first, then allow ENTRY.
+            if _is_mirror_bot(bot_id):
+                partner = _mirror_partner(bot_id)
+
+                with _get_mirror_lock(symbol):
+                    # re-check inside lock
+                    open_dirs2 = get_symbol_open_directions(symbol)
+                    if len(open_dirs2) == 1 and desired_dir not in open_dirs2:
+                        locked_dir = list(open_dirs2)[0]
+
+                        mirror_forced_exit = False
+                        mirror_exit_status = None
+
+                        # If partner currently holds the locked direction, force-close partner first.
+                        if MIRROR_FORCE_EXIT and partner:
+                            try:
+                                p_opens = get_bot_open_positions(partner)
+                                pqty = p_opens.get((symbol, locked_dir), {}).get("qty", Decimal("0"))
+                            except Exception:
+                                pqty = Decimal("0")
+
+                            if pqty > 0:
+                                res = _execute_exit_order(
+                                    partner,
+                                    symbol,
+                                    force_direction=locked_dir,
+                                    ignore_cooldown=True,
+                                    reason="mirror_flip_exit",
+                                    sig_id=sig_id,
+                                )
+                                mirror_exit_status = res.get("status")
+                                mirror_forced_exit = res.get("status") == "ok"
+
+                                # If we could not confirm fills, fail-closed.
+                                if res.get("status") not in ("ok", "no_position"):
+                                    return jsonify({
+                                        "status": "mirror_exit_failed",
+                                        "mode": "entry",
+                                        "bot_id": bot_id,
+                                        "symbol": symbol,
+                                        "desired_direction": desired_dir,
+                                        "locked_direction": locked_dir,
+                                        "mirror_partner": partner,
+                                        "mirror_exit_status": mirror_exit_status,
+                                        "signal_id": sig_id,
+                                    }), 200
+
+                        # Wait a short window for lock to clear (covers cases where EXIT webhook arrives slightly later).
+                        deadline = time.time() + MIRROR_WAIT_SEC
+                        while time.time() < deadline:
+                            dirs = get_symbol_open_directions(symbol)
+                            if len(dirs) == 0 or (len(dirs) == 1 and desired_dir in dirs):
+                                break
+                            time.sleep(0.15)
+
+                        dirs = get_symbol_open_directions(symbol)
+                        if len(dirs) == 1 and desired_dir not in dirs:
+                            return jsonify({
+                                "status": "reject_opposite_direction_locked",
+                                "mode": "entry",
+                                "bot_id": bot_id,
+                                "symbol": symbol,
+                                "desired_direction": desired_dir,
+                                "locked_direction": list(dirs)[0],
+                                "mirror_partner": partner,
+                                "mirror_forced_exit": mirror_forced_exit,
+                                "mirror_exit_status": mirror_exit_status,
+                                "signal_id": sig_id,
+                            }), 200
+            else:
+                return jsonify({
+                    "status": "reject_opposite_direction_locked",
+                    "mode": "entry",
+                    "bot_id": bot_id,
+                    "symbol": symbol,
+                    "desired_direction": desired_dir,
+                    "locked_direction": locked_dir,
+                    "signal_id": sig_id,
+                }), 200
 
         try:
             budget = _extract_budget_usdt(body)
         except Exception as e:
             print("[ENTRY] budget error:", e)
             return str(e), 400
-
         # Optional leverage support (default 1x). If you later decide to use leverage,
         # treat `position_size_usdt` as *margin*, so effective notional = margin * leverage.
         try:
@@ -1511,141 +1816,14 @@ def tv_webhook():
     # EXIT（策略出场 / TV 出场）
     # -------------------------
     if mode == "exit":
-        if not _exit_guard_allow(bot_id, symbol):
-            print(f"[EXIT] SKIP (cooldown) bot={bot_id} symbol={symbol} sig={sig_id}")
-            return jsonify({"status": "cooldown_skip", "mode": "exit", "bot_id": bot_id, "symbol": symbol, "signal_id": sig_id}), 200
-
-        opens = get_bot_open_positions(bot_id)
-        long_key = (symbol, "LONG")
-        short_key = (symbol, "SHORT")
-
-        long_qty = opens.get(long_key, {}).get("qty", Decimal("0"))
-        short_qty = opens.get(short_key, {}).get("qty", Decimal("0"))
-
-        key_local = (bot_id, symbol)
-        local = BOT_POSITIONS.get(key_local)
-        preferred = "LONG"
-        if local and str(local.get("side", "")).upper() == "SELL":
-            preferred = "SHORT"
-
-        direction_to_close = None
-        qty_to_close = Decimal("0")
-
-        if preferred == "LONG" and long_qty > 0:
-            direction_to_close, qty_to_close = "LONG", long_qty
-        elif preferred == "SHORT" and short_qty > 0:
-            direction_to_close, qty_to_close = "SHORT", short_qty
-        elif long_qty > 0:
-            direction_to_close, qty_to_close = "LONG", long_qty
-        elif short_qty > 0:
-            direction_to_close, qty_to_close = "SHORT", short_qty
-
-        if (not direction_to_close or qty_to_close <= 0):
-            if symbol in REMOTE_FALLBACK_SYMBOLS:
-                remote = get_open_position_for_symbol(symbol)
-                if remote and remote["size"] > 0:
-                    direction_to_close = remote["side"]
-                    qty_to_close = remote["size"]
-                else:
-                    return jsonify({"status": "no_position"}), 200
-            else:
-                return jsonify({"status": "no_position"}), 200
-
-        entry_side = "BUY" if direction_to_close == "LONG" else "SELL"
-        exit_side = "SELL" if direction_to_close == "LONG" else "BUY"
-
-        # Deterministic numeric clientId for attribution: BBB + ts + 02 (EXIT)
-        bnum = _bot_num(bot_id)
-        ts_now = int(time.time())
-        exit_client_id = f"{bnum:03d}{ts_now}02"
-
-        try:
-            order = create_market_order(
-                symbol=symbol,
-                side=exit_side,
-                size=str(qty_to_close),
-                reduce_only=True,
-                client_id=exit_client_id,
-            )
-        except Exception as e:
-            print("[EXIT] create_market_order error:", e)
-            return "order error", 500
-
-        status, cancel_reason = _order_status_and_reason(order)
-        print(f"[EXIT] order status={status} cancelReason={cancel_reason!r}")
-
-        if status in ("CANCELED", "REJECTED"):
-            return jsonify({
-                "status": "exit_rejected",
-                "mode": "exit",
-                "bot_id": bot_id,
-                "symbol": symbol,
-                "exit_side": exit_side,
-                "requested_qty": str(qty_to_close),
-                "order_status": status,
-                "cancel_reason": cancel_reason,
-                "signal_id": sig_id,
-            }), 200
-
-        exit_price = None
-        filled_qty = qty_to_close
-
-        try:
-            fill = get_fill_summary(
-                symbol=symbol,
-                order_id=order.get("order_id"),
-                client_order_id=order.get("client_order_id"),
-                max_wait_sec=float(os.getenv("FILL_MAX_WAIT_SEC", "20.0")),
-                poll_interval=float(os.getenv("FILL_POLL_INTERVAL", "0.25")),
-            )
-            exit_price = Decimal(str(fill["avg_fill_price"]))
-            filled_qty = Decimal(str(fill["filled_qty"]))
-            print(f"[EXIT] fill ok bot={bot_id} symbol={symbol} filled_qty={filled_qty} avg_fill={exit_price}")
-        except Exception as e:
-            print(f"[EXIT] fill wait failed bot={bot_id} symbol={symbol} err:", e)
-            # Fail-closed: if fills are unavailable we do NOT write a fake price.
-            return jsonify({"status": "fill_unavailable", "mode": "exit", "bot_id": bot_id, "symbol": symbol, "signal_id": sig_id}), 200
-
-        try:
-            record_exit_fifo(
-                bot_id=bot_id,
-                symbol=symbol,
-                entry_side=entry_side,
-                exit_qty=filled_qty,
-                exit_price=exit_price,
-                reason="strategy_exit",
-            )
-        except Exception as e:
-            print("[PNL] record_exit_fifo error (strategy):", e)
-
-        try:
-            clear_lock_level_pct(bot_id, symbol, direction_to_close)
-        except Exception:
-            pass
-
-        # Refresh local cache based on DB remaining
-        try:
-            opens2 = get_bot_open_positions(bot_id)
-            rem = opens2.get((symbol, direction_to_close), {}).get("qty", Decimal("0"))
-        except Exception:
-            rem = Decimal("0")
-
-        if key_local in BOT_POSITIONS:
-            BOT_POSITIONS[key_local]["qty"] = rem
-            if rem <= 0:
-                BOT_POSITIONS[key_local]["entry_price"] = None
-
-        return jsonify({
-            "status": "ok",
-            "mode": "exit",
-            "bot_id": bot_id,
-            "symbol": symbol,
-            "exit_side": exit_side,
-            "closed_qty": str(qty_to_close),
-            "order_status": status,
-            "cancel_reason": cancel_reason,
-            "signal_id": sig_id,
-        }), 200
+        payload = _execute_exit_order(
+            bot_id,
+            symbol,
+            ignore_cooldown=False,
+            reason="strategy_exit",
+            sig_id=sig_id,
+        )
+        return jsonify(payload), 200
 
     return "unsupported mode", 400
 
