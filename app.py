@@ -54,7 +54,7 @@ EXIT_COOLDOWN_SEC = float(os.getenv("EXIT_COOLDOWN_SEC", "2.0"))
 #   we can block the OPEN to prevent immediate re-entry / flip.
 # - ENTRY_COOLDOWN_AFTER_EXIT_SEC: time-based cooldown (per symbol)
 # - ENTRY_BLOCK_SAME_TV_CLIENT_ID: block ENTRY if its TV client_id equals the most recent EXIT client_id (per symbol)
-ENTRY_COOLDOWN_AFTER_EXIT_SEC = float(os.getenv("ENTRY_COOLDOWN_AFTER_EXIT_SEC", "4.0"))
+ENTRY_COOLDOWN_AFTER_EXIT_SEC = float(os.getenv("ENTRY_COOLDOWN_AFTER_EXIT_SEC", "0.0"))
 ENTRY_BLOCK_SAME_TV_CLIENT_ID = str(os.getenv("ENTRY_BLOCK_SAME_TV_CLIENT_ID", "1")).strip() == "1"
 
 
