@@ -49,6 +49,15 @@ RISK_PRICE_SOURCE = str(os.getenv("RISK_PRICE_SOURCE", "MARK")).upper().strip() 
 # 退出互斥窗口（秒）：防止重复平仓
 EXIT_COOLDOWN_SEC = float(os.getenv("EXIT_COOLDOWN_SEC", "2.0"))
 
+# Entry-after-exit guard:
+# - When TradingView emits CLOSE then OPEN almost at the same time (same bar / same timestamp),
+#   we can block the OPEN to prevent immediate re-entry / flip.
+# - ENTRY_COOLDOWN_AFTER_EXIT_SEC: time-based cooldown (per symbol)
+# - ENTRY_BLOCK_SAME_TV_CLIENT_ID: block ENTRY if its TV client_id equals the most recent EXIT client_id (per symbol)
+ENTRY_COOLDOWN_AFTER_EXIT_SEC = float(os.getenv("ENTRY_COOLDOWN_AFTER_EXIT_SEC", "4.0"))
+ENTRY_BLOCK_SAME_TV_CLIENT_ID = str(os.getenv("ENTRY_BLOCK_SAME_TV_CLIENT_ID", "1")).strip() == "1"
+
+
 # 远程兜底白名单：只有本地无 lots 且 symbol 在白名单，才允许 remote fallback
 REMOTE_FALLBACK_SYMBOLS = {
     s.strip().upper() for s in os.getenv("REMOTE_FALLBACK_SYMBOLS", "").split(",") if s.strip()
@@ -78,6 +87,12 @@ _MONITOR_LOCK = threading.Lock()
 # ✅ 退出互斥：bot+symbol 粒度 cooldown
 _EXIT_LOCK = threading.Lock()
 _LAST_EXIT_TS: Dict[Tuple[str, str], float] = {}
+
+# ✅ Entry guard: symbol-level (prevents CLOSE->OPEN immediate re-entry)
+_ENTRY_GUARD_LOCK = threading.Lock()
+_LAST_EXIT_SYMBOL_TS: Dict[str, float] = {}         # symbol -> last exit ts
+_LAST_EXIT_TV_CLIENT_ID: Dict[str, str] = {}        # symbol -> last exit tv client_id (raw string)
+
 
 
 def _require_token() -> bool:
@@ -439,6 +454,55 @@ def _exit_guard_allow(bot_id: str, symbol: str) -> bool:
             return False
         _LAST_EXIT_TS[key] = now
         return True
+
+
+def _mark_symbol_exit(symbol: str, tv_client_id: str = "") -> None:
+    """Mark that this symbol has just received an EXIT intent.
+
+    Used to block immediate CLOSE->OPEN (same bar / same timestamp) scenarios.
+    This marker is intentionally written on EXIT webhook receipt (not on fill confirmation),
+    because the user requirement is to block OPEN when CLOSE arrives together.
+    """
+    sym = str(symbol or "").upper().strip()
+    if not sym:
+        return
+    now = time.time()
+    with _ENTRY_GUARD_LOCK:
+        _LAST_EXIT_SYMBOL_TS[sym] = now
+        if tv_client_id:
+            _LAST_EXIT_TV_CLIENT_ID[sym] = str(tv_client_id)
+
+
+def _entry_guard_reject(symbol: str, tv_client_id: str = "") -> Optional[dict]:
+    """Return a rejection payload if ENTRY is not allowed right after EXIT for this symbol."""
+    sym = str(symbol or "").upper().strip()
+    now = time.time()
+
+    with _ENTRY_GUARD_LOCK:
+        last_ts = _LAST_EXIT_SYMBOL_TS.get(sym, 0.0)
+        last_tv = _LAST_EXIT_TV_CLIENT_ID.get(sym, "")
+
+    # 1) Same TV client_id (usually includes bar timestamp) => block
+    if ENTRY_BLOCK_SAME_TV_CLIENT_ID and tv_client_id and last_tv and str(tv_client_id) == str(last_tv):
+        return {
+            "status": "reject_entry_same_bar_as_exit",
+            "symbol": sym,
+            "tv_client_id": str(tv_client_id),
+            "last_exit_tv_client_id": str(last_tv),
+        }
+
+    # 2) Time-based cooldown per symbol
+    if ENTRY_COOLDOWN_AFTER_EXIT_SEC and ENTRY_COOLDOWN_AFTER_EXIT_SEC > 0:
+        dt = now - float(last_ts or 0.0)
+        if dt < ENTRY_COOLDOWN_AFTER_EXIT_SEC:
+            return {
+                "status": "reject_entry_after_exit_cooldown",
+                "symbol": sym,
+                "cooldown_sec": ENTRY_COOLDOWN_AFTER_EXIT_SEC,
+                "since_exit_sec": round(dt, 3),
+            }
+
+    return None
 
 
 # ----------------------------
@@ -1539,6 +1603,13 @@ def tv_webhook():
             return "missing or invalid side", 400
 
 
+        # ✅ Entry guard: if a CLOSE arrived together with OPEN, block the OPEN.
+        rej = _entry_guard_reject(symbol, tv_client_id=str(tv_client_id or ""))
+        if rej is not None:
+            rej.update({"mode": "entry", "bot_id": bot_id, "signal_id": sig_id})
+            return jsonify(rej), 200
+
+
 
         # ✅ Constraint A: global same-symbol same-direction (across all bots)
         desired_dir = "LONG" if side_raw == "BUY" else "SHORT"
@@ -1849,6 +1920,8 @@ def tv_webhook():
     # EXIT（策略出场 / TV 出场）
     # -------------------------
     if mode == "exit":
+        # ✅ Guard marker: block immediate CLOSE->OPEN on the same symbol
+        _mark_symbol_exit(symbol, tv_client_id=str(tv_client_id or ""))
         payload = _execute_exit_order(
             bot_id,
             symbol,
