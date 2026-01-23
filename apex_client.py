@@ -1098,6 +1098,59 @@ def create_market_order(
         step_now = _to_decimal(rules.get('step_size'), default=Decimal('0.01')) or Decimal('0.01')
         min_now = _to_decimal(rules.get('min_qty'), default=Decimal('0')) or Decimal('0')
 
+        # 🔧 Dynamic stepSize inference & retry:
+        # Some contracts require integer-lot sizing (e.g., stepSize=100). If our fetched rules are wrong
+        # (or partially parsed), the exchange rejects with a message like:
+        #   "Invalid size scale parameters. Value: 65905.09, stepSize is 100."
+        # In that case, parse the stepSize, update local rules, snap the qty, and retry once.
+        try:
+            m = re.search(r"stepsize\s*(?:is|=)\s*([0-9]+(?:\.[0-9]+)?)", (cancel_reason or msg or ""), re.IGNORECASE)
+            if m:
+                inferred_step = Decimal(m.group(1))
+                if inferred_step > 0 and inferred_step != step_now:
+                    snapped = (qty_dec // inferred_step) * inferred_step
+                    # quantize to integer-ish if step is whole number
+                    snapped = snapped.quantize(Decimal('1')) if inferred_step >= 1 else snapped.quantize(inferred_step, rounding=ROUND_DOWN)
+                    if snapped > 0:
+                        retry_cid = f"{client_id}RSTEP"
+                        retry_qty = _dec_to_str(snapped)
+                        try:
+                            raw_res2 = _place_market(retry_qty, retry_cid)
+                            data2 = _extract_data_dict(raw_res2) or {}
+                            oid2 = (data2.get('orderId') or data2.get('id')) if isinstance(data2, dict) else None
+                            if oid2:
+                                raw_res = raw_res2
+                                data = data2
+                                order_id = str(oid2)
+                                client_order_id = str(data2.get('clientOrderId') or data2.get('clientId') or retry_cid)
+                                qty_snapped = snapped
+                                qty = retry_qty
+                                status = str(data2.get('status') or status or '').upper() or status
+                                cancel_reason = str(
+                                    data2.get('cancelReason')
+                                    or data2.get('rejectReason')
+                                    or data2.get('errorMessage')
+                                    or cancel_reason
+                                    or ''
+                                )
+                                # Persist inferred rule for future orders
+                                try:
+                                    cur = SYMBOL_RULES.get(sym, {})
+                                    merged = dict(cur)
+                                    merged.update({
+                                        'step_size': inferred_step,
+                                        'min_qty': max(min_now, inferred_step) if min_now else inferred_step,
+                                        'qty_decimals': _decimals_from_step(inferred_step) or 0
+                                    })
+                                    SYMBOL_RULES[sym] = merged
+                                    print(f"[apex_client][rules][infer] {sym} overriding stepSize={inferred_step} (from rejection msg)")
+                                except Exception:
+                                    pass
+                        except Exception as e2:
+                            print(f"[apex_client][order][WARN] stepSize retry failed symbol={sym} step={inferred_step} qty={retry_qty} cid={retry_cid}: {e2}")
+        except Exception:
+            pass
+
         # Only retry when qty is non-integer and our current step is sub-1 (likely default).
         # Also require the reason to be plausibly sizing-related, or simply missing orderId.
         sizing_hint = any(k in reason_l for k in (
