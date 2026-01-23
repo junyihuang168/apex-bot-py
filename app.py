@@ -475,13 +475,15 @@ def _extract_budget_usdt(body: dict) -> Decimal:
 def _compute_entry_qty(symbol: str, side: str, size_usdt: Any) -> Decimal:
     """Compute order size (contract qty) from a USDT notional.
 
-    Notes:
+    Why this exists:
       - ApeX places orders by *quantity*. Quantity must satisfy stepSize/minQty.
       - For very low-price symbols, minQty can be large. If the requested notional
         is too small, we can optionally upsize to the minimum tradable quantity.
 
-    Reference price source:
-      - `get_market_price()` (prefers L1 when available; otherwise mark/ticker fallback)
+    Robust reference price selection (fixes 'reference price = 0.00' after WS staleness):
+      1) get_reference_price()  -> REST ticker (most stable)
+      2) get_market_price()     -> L1 bid/ask when available, but can transiently be 0 if public WS is stale
+      3) _get_mark_price()      -> best-effort mark/index/oracle/last fallback
     """
     sym = str(symbol).upper().strip()
     side_u = str(side).upper().strip()
@@ -494,11 +496,40 @@ def _compute_entry_qty(symbol: str, side: str, size_usdt: Any) -> Decimal:
     if budget_usdt <= 0:
         raise ValueError(f"invalid size_usdt: {size_usdt}")
 
-    # Reference price (bid/ask preferred when L1 is available inside get_market_price)
-    ref_price_str = get_market_price(sym, side_u, str(min_qty))
-    ref_price_dec = _to_decimal(ref_price_str, default=Decimal("0"))
+    def _pick_ref_price() -> Tuple[Decimal, str]:
+        # 1) REST ticker/reference (most stable; does not depend on public WS health)
+        try:
+            rp = get_reference_price(sym)
+            rp_dec = _to_decimal(rp, default=Decimal("0"))
+            if rp_dec > 0:
+                return rp_dec, "REF_REST"
+        except Exception:
+            pass
+
+        # 2) Market price helper (prefers L1 when available; can become 0 when WS is stale)
+        for q in (str(min_qty), "1"):
+            try:
+                mp = get_market_price(sym, side_u, q)
+                mp_dec = _to_decimal(mp, default=Decimal("0"))
+                if mp_dec > 0:
+                    return mp_dec, f"MARKET_PRICE(q={q})"
+            except Exception:
+                continue
+
+        # 3) Mark/index/oracle fallback (best effort)
+        try:
+            mk = _get_mark_price(sym)
+            mk_dec = _to_decimal(mk, default=Decimal("0"))
+            if mk_dec > 0:
+                return mk_dec, "MARK_FALLBACK"
+        except Exception:
+            pass
+
+        return Decimal("0"), "NO_PRICE"
+
+    ref_price_dec, ref_src = _pick_ref_price()
     if ref_price_dec <= 0:
-        raise RuntimeError(f"invalid reference price for qty compute: {ref_price_str}")
+        raise RuntimeError(f"invalid reference price for qty compute: {ref_price_dec} src={ref_src}")
 
     # Floor to step (exchange-style)
     qty_raw = budget_usdt / ref_price_dec
@@ -516,12 +547,14 @@ def _compute_entry_qty(symbol: str, side: str, size_usdt: Any) -> Decimal:
     qty_min = (min_steps * step).quantize(step, rounding=ROUND_DOWN)
 
     est_notional = (qty_min * ref_price_dec).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
-    min_needed = (est_notional * (Decimal("1") + ENTRY_MIN_NOTIONAL_MARGIN_PCT)).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+    min_needed = (est_notional * (Decimal("1") + ENTRY_MIN_NOTIONAL_MARGIN_PCT)).quantize(
+        Decimal("0.00000001"), rounding=ROUND_DOWN
+    )
 
     if not ENTRY_AUTO_UPSIZE_TO_MIN_QTY:
         raise ValueError(
             f"budget too small for {sym}: budget={budget_usdt} < min_needed~{min_needed} "
-            f"(minQty={min_qty}, step={step}, ref={ref_price_dec})"
+            f"(minQty={min_qty}, step={step}, ref={ref_price_dec}, src={ref_src})"
         )
 
     if ENTRY_MAX_NOTIONAL_USDT > 0 and est_notional > ENTRY_MAX_NOTIONAL_USDT:
@@ -533,7 +566,7 @@ def _compute_entry_qty(symbol: str, side: str, size_usdt: Any) -> Decimal:
     print(
         f"[ENTRY] upsize_to_minQty symbol={sym} side={side_u} "
         f"budget={budget_usdt} -> qty={qty_min} est_notional={est_notional} "
-        f"(minQty={min_qty} step={step} ref={ref_price_dec})"
+        f"(minQty={min_qty} step={step} ref={ref_price_dec} src={ref_src})"
     )
     return qty_min
 
