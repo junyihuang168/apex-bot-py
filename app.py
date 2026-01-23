@@ -54,7 +54,7 @@ EXIT_COOLDOWN_SEC = float(os.getenv("EXIT_COOLDOWN_SEC", "2.0"))
 #   we can block the OPEN to prevent immediate re-entry / flip.
 # - ENTRY_COOLDOWN_AFTER_EXIT_SEC: time-based cooldown (per symbol)
 # - ENTRY_BLOCK_SAME_TV_CLIENT_ID: block ENTRY if its TV client_id equals the most recent EXIT client_id (per symbol)
-ENTRY_COOLDOWN_AFTER_EXIT_SEC = float(os.getenv("ENTRY_COOLDOWN_AFTER_EXIT_SEC", "0.0"))
+ENTRY_COOLDOWN_AFTER_EXIT_SEC = float(os.getenv("ENTRY_COOLDOWN_AFTER_EXIT_SEC", "4.0"))
 ENTRY_BLOCK_SAME_TV_CLIENT_ID = str(os.getenv("ENTRY_BLOCK_SAME_TV_CLIENT_ID", "1")).strip() == "1"
 
 
@@ -484,6 +484,7 @@ def _entry_guard_reject(symbol: str, tv_client_id: str = "") -> Optional[dict]:
 
     # 1) Same TV client_id (usually includes bar timestamp) => block
     if ENTRY_BLOCK_SAME_TV_CLIENT_ID and tv_client_id and last_tv and str(tv_client_id) == str(last_tv):
+        print(f"[ENTRY_GUARD] reject_entry_same_bar_as_exit symbol={sym} tv_client_id={tv_client_id} last_exit_tv={last_tv}")
         return {
             "status": "reject_entry_same_bar_as_exit",
             "symbol": sym,
@@ -495,7 +496,8 @@ def _entry_guard_reject(symbol: str, tv_client_id: str = "") -> Optional[dict]:
     if ENTRY_COOLDOWN_AFTER_EXIT_SEC and ENTRY_COOLDOWN_AFTER_EXIT_SEC > 0:
         dt = now - float(last_ts or 0.0)
         if dt < ENTRY_COOLDOWN_AFTER_EXIT_SEC:
-            return {
+            print(f"[ENTRY_GUARD] reject_entry_after_exit_cooldown symbol={sym} dt={dt:.3f}s cooldown={ENTRY_COOLDOWN_AFTER_EXIT_SEC}s")
+        return {
                 "status": "reject_entry_after_exit_cooldown",
                 "symbol": sym,
                 "cooldown_sec": ENTRY_COOLDOWN_AFTER_EXIT_SEC,
@@ -724,6 +726,7 @@ def _execute_exit_order(
     symbol = str(symbol or "").upper().strip()
 
     if (not ignore_cooldown) and (not _exit_guard_allow(bot_id, symbol)):
+        print(f"[EXIT] cooldown_skip bot={bot_id} symbol={symbol} cooldown={EXIT_COOLDOWN_SEC}s")
         return {"status": "cooldown_skip", "mode": "exit", "bot_id": bot_id, "symbol": symbol, "signal_id": sig_id}
 
     opens = get_bot_open_positions(bot_id)
@@ -767,8 +770,10 @@ def _execute_exit_order(
                 direction_to_close = remote["side"]
                 qty_to_close = remote["size"]
             else:
+                print(f"[EXIT] no_position bot={bot_id} symbol={symbol}")
                 return {"status": "no_position", "mode": "exit", "bot_id": bot_id, "symbol": symbol, "signal_id": sig_id}
         else:
+            print(f"[EXIT] no_position bot={bot_id} symbol={symbol}")
             return {"status": "no_position", "mode": "exit", "bot_id": bot_id, "symbol": symbol, "signal_id": sig_id}
 
     entry_side = "BUY" if direction_to_close == "LONG" else "SELL"
