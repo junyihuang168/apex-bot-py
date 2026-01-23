@@ -451,6 +451,38 @@ def _extract_list_payload(j: Any) -> List[Dict[str, Any]]:
     if not isinstance(j, dict):
         return out
 
+
+
+def _deep_find_first(obj: Any, keys: Iterable[str], max_depth: int = 4) -> Any:
+    """Recursively search nested dict/list structures for the first matching key.
+
+    ApeX public endpoints are not stable across environments/versions; some return
+    rules in nested 'filters'/'spec'/'config' objects. This helper makes symbol
+    rule parsing resilient so stepSize/minQty/tickSize are captured correctly.
+    """
+    if max_depth < 0:
+        return None
+    try:
+        if isinstance(obj, dict):
+            for k in keys:
+                if k in obj:
+                    v = obj.get(k)
+                    if v is not None and v != '':
+                        return v
+            for v in obj.values():
+                r = _deep_find_first(v, keys, max_depth=max_depth - 1)
+                if r is not None and r != '':
+                    return r
+        elif isinstance(obj, list):
+            for v in obj:
+                r = _deep_find_first(v, keys, max_depth=max_depth - 1)
+                if r is not None and r != '':
+                    return r
+    except Exception:
+        return None
+    return None
+
+
     # Common wrappers
     candidates = []
     if 'data' in j:
@@ -498,13 +530,30 @@ def _parse_rule_item(item: Dict[str, Any]) -> Optional[Tuple[str, Dict[str, Any]
     sym = format_symbol(str(sym))
 
     # Quantity step/min
-    step = _to_decimal(item.get('stepSize') or item.get('step_size') or item.get('sizeStep') or item.get('qtyStep') or item.get('quantityStep') or item.get('minSizeIncrement'))
-    min_qty = _to_decimal(item.get('minQty') or item.get('min_qty') or item.get('minSize') or item.get('minOrderSize') or item.get('minQuantity'))
+    step_raw = (
+        item.get('stepSize') or item.get('step_size') or item.get('sizeStep') or item.get('qtyStep')
+        or item.get('quantityStep') or item.get('minSizeIncrement')
+    )
+    if step_raw is None or step_raw == '':
+        step_raw = _deep_find_first(item, ['stepSize', 'step_size', 'sizeStep', 'qtyStep', 'quantityStep', 'minSizeIncrement', 'step'])
+    step = _to_decimal(step_raw)
+
+    min_raw = (
+        item.get('minQty') or item.get('min_qty') or item.get('minSize') or item.get('minOrderSize')
+        or item.get('minQuantity')
+    )
+    if min_raw is None or min_raw == '':
+        min_raw = _deep_find_first(item, ['minQty', 'min_qty', 'minSize', 'minOrderSize', 'minQuantity', 'minOrderQty'])
+    min_qty = _to_decimal(min_raw)
 
     # Price tick
-    tick = _to_decimal(item.get('tickSize') or item.get('tick_size') or item.get('priceStep') or item.get('minPriceIncrement') or item.get('priceTick'))
-
-    # Precision fallbacks
+    tick_raw = (
+        item.get('tickSize') or item.get('tick_size') or item.get('priceStep') or item.get('minPriceIncrement')
+        or item.get('priceTick')
+    )
+    if tick_raw is None or tick_raw == '':
+        tick_raw = _deep_find_first(item, ['tickSize', 'tick_size', 'priceStep', 'minPriceIncrement', 'priceTick', 'tick'])
+    tick = _to_decimal(tick_raw)# Precision fallbacks
     qty_dec = item.get('sizePrecision') or item.get('qtyPrecision') or item.get('quantityPrecision')
     price_dec = item.get('pricePrecision') or item.get('quotePrecision')
 
