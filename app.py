@@ -494,15 +494,17 @@ def _entry_guard_reject(symbol: str, tv_client_id: str = "") -> Optional[dict]:
 
     # 2) Time-based cooldown per symbol
     if ENTRY_COOLDOWN_AFTER_EXIT_SEC and ENTRY_COOLDOWN_AFTER_EXIT_SEC > 0:
-        dt = now - float(last_ts or 0.0)
-        if dt < ENTRY_COOLDOWN_AFTER_EXIT_SEC:
-            print(f"[ENTRY_GUARD] reject_entry_after_exit_cooldown symbol={sym} dt={dt:.3f}s cooldown={ENTRY_COOLDOWN_AFTER_EXIT_SEC}s")
-        return {
-                "status": "reject_entry_after_exit_cooldown",
-                "symbol": sym,
-                "cooldown_sec": ENTRY_COOLDOWN_AFTER_EXIT_SEC,
-                "since_exit_sec": round(dt, 3),
-            }
+        # If we've never seen an EXIT marker for this symbol, allow ENTRY.
+        if last_ts and float(last_ts) > 0:
+            dt = now - float(last_ts)
+            if dt < ENTRY_COOLDOWN_AFTER_EXIT_SEC:
+                print(f"[ENTRY_GUARD] reject_entry_after_exit_cooldown symbol={sym} dt={dt:.3f}s cooldown={ENTRY_COOLDOWN_AFTER_EXIT_SEC}s")
+                return {
+                    "status": "reject_entry_after_exit_cooldown",
+                    "symbol": sym,
+                    "cooldown_sec": ENTRY_COOLDOWN_AFTER_EXIT_SEC,
+                    "since_exit_sec": round(dt, 3),
+                }
 
     return None
 
