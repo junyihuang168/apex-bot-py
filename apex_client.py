@@ -439,19 +439,42 @@ def _decimals_from_step(step: Optional[Decimal]) -> Optional[int]:
 
 
 def _extract_list_payload(j: Any) -> List[Dict[str, Any]]:
-    """Best-effort: find a list of dict items inside a typical API payload."""
+    """Best-effort: collect a flat list of dict items from any nested payload.
+
+    ApeX public endpoints are not perfectly stable; some responses nest contract
+    metadata several levels deep (e.g., /api/v3/symbols). We traverse the payload
+    up to a limited depth and let _parse_rule_item() decide which dicts are
+    relevant instruments/markets.
+    """
     out: List[Dict[str, Any]] = []
     if j is None:
         return out
-    if isinstance(j, list):
-        for it in j:
-            if isinstance(it, dict):
-                out.append(it)
-        return out
-    if not isinstance(j, dict):
-        return out
 
+    def _visit(obj: Any, depth: int) -> None:
+        if depth < 0 or obj is None:
+            return
+        if isinstance(obj, dict):
+            out.append(obj)
+            for v in obj.values():
+                _visit(v, depth - 1)
+            return
+        if isinstance(obj, list):
+            for v in obj:
+                _visit(v, depth - 1)
+            return
 
+    _visit(j, 5)
+    # Dedupe by object id (dicts are unhashable)
+    seen: set[int] = set()
+    uniq: List[Dict[str, Any]] = []
+    for it in out:
+        oid = id(it)
+        if oid in seen:
+            continue
+        seen.add(oid)
+        if isinstance(it, dict):
+            uniq.append(it)
+    return uniq
 
 def _deep_find_first(obj: Any, keys: Iterable[str], max_depth: int = 4) -> Any:
     """Recursively search nested dict/list structures for the first matching key.
@@ -483,28 +506,6 @@ def _deep_find_first(obj: Any, keys: Iterable[str], max_depth: int = 4) -> Any:
     return None
 
 
-    # Common wrappers
-    candidates = []
-    if 'data' in j:
-        candidates.append(j.get('data'))
-    for k in ('result', 'results', 'symbols', 'markets', 'instruments', 'contracts', 'rows', 'list'):
-        if k in j:
-            candidates.append(j.get(k))
-
-    # Explore nested dicts to find list values
-    for c in candidates:
-        if isinstance(c, list):
-            for it in c:
-                if isinstance(it, dict):
-                    out.append(it)
-        elif isinstance(c, dict):
-            for vk, vv in c.items():
-                if isinstance(vv, list):
-                    for it in vv:
-                        if isinstance(it, dict):
-                            out.append(it)
-    return out
-
 
 def _parse_rule_item(item: Dict[str, Any]) -> Optional[Tuple[str, Dict[str, Any]]]:
     """Parse a single instrument/market entry into our SYMBOL_RULES shape.
@@ -517,7 +518,10 @@ def _parse_rule_item(item: Dict[str, Any]) -> Optional[Tuple[str, Dict[str, Any]
 
     sym = (
         item.get('symbol')
+        or item.get('crossSymbolName')
+        or item.get('crossSymbol')
         or item.get('symbolName')
+        or item.get('contractName')
         or item.get('instrument')
         or item.get('instrumentId')
         or item.get('market')
