@@ -151,8 +151,8 @@ def _to_decimal(x: Any, default: Decimal = Decimal("0")) -> Decimal:
 # BOT GROUPS
 #
 # Per your requirement:
-# - Keep bot-side SL/TP ONLY for: BOT_1–5 (LONG) and BOT_11–15 (SHORT)
-# - Remove bot-side SL/TP for: BOT_6–10 and BOT_16–20 (they remain signal-driven only)
+# - Enable bot-side ladder trailing stop for: BOT_6–10 (LONG) and BOT_16–20 (SHORT)
+# - Other bots remain signal-driven only (PnL recording + strategy exits), unless overridden by env.
 #
 # Note: In this repo, the only bot-side SL/TP implementation is the ladder-stop loop below.
 #+#+#+#+########################################
@@ -161,8 +161,8 @@ def _to_decimal(x: Any, default: Decimal = Decimal("0")) -> Decimal:
 # ✅ BOT 分组（按你要求）
 # ----------------------------
 
-_ALLOWED_LONG_TPSL = {f"BOT_{i}" for i in range(1, 6)}
-_ALLOWED_SHORT_TPSL = {f"BOT_{i}" for i in range(11, 16)}
+_ALLOWED_LONG_TPSL = {f"BOT_{i}" for i in range(6, 11)}
+_ALLOWED_SHORT_TPSL = {f"BOT_{i}" for i in range(16, 21)}
 
 # “TPSL bots” here means: bots that are allowed to have bot-side SL/TP logic enabled.
 # (In this repo, the only bot-side SL/TP is the ladder stop loop below.)
@@ -173,29 +173,29 @@ SHORT_TPSL_BOTS = _parse_bot_list(os.getenv("SHORT_TPSL_BOTS", ",".join(sorted(_
 LONG_PNL_ONLY_BOTS = _parse_bot_list(
     os.getenv(
         "LONG_PNL_ONLY_BOTS",
-        ",".join([*(f"BOT_{i}" for i in range(6, 11)), *(f"BOT_{i}" for i in range(21, 31))]),
+        ",".join([*(f"BOT_{i}" for i in range(1, 6)), *(f"BOT_{i}" for i in range(21, 31))]),
     )
 ) - _ALLOWED_LONG_TPSL
 
 SHORT_PNL_ONLY_BOTS = _parse_bot_list(
     os.getenv(
         "SHORT_PNL_ONLY_BOTS",
-        ",".join([*(f"BOT_{i}" for i in range(16, 21)), *(f"BOT_{i}" for i in range(31, 41))]),
+        ",".join([*(f"BOT_{i}" for i in range(11, 16)), *(f"BOT_{i}" for i in range(31, 41))]),
     )
 ) - _ALLOWED_SHORT_TPSL
 
 
 # ----------------------------
 # ✅ Ladder Stop (bot-side only; no exchange protective orders)
-# BOT1-5: LONG ladder
-# BOT11-15: SHORT ladder
+# BOT6-10: LONG ladder
+# BOT16-20: SHORT ladder
 # ----------------------------
 
 LADDER_LONG_BOTS  = _parse_bot_list(os.getenv("LADDER_LONG_BOTS",  ",".join(sorted(_ALLOWED_LONG_TPSL)))) & _ALLOWED_LONG_TPSL
 LADDER_SHORT_BOTS = _parse_bot_list(os.getenv("LADDER_SHORT_BOTS", ",".join(sorted(_ALLOWED_SHORT_TPSL)))) & _ALLOWED_SHORT_TPSL
 
 # Base stop-loss (percent). Example 0.5 -> -0.5% initial lock.
-LADDER_BASE_SL_PCT = Decimal(os.getenv("LADDER_BASE_SL_PCT", "0.5"))
+LADDER_BASE_SL_PCT = Decimal(os.getenv("LADDER_BASE_SL_PCT", "0.60"))
 
 # Profit% : lock% mapping (both in percent, not decimals)
 # Default (your old ladder):
@@ -204,7 +204,7 @@ LADDER_BASE_SL_PCT = Decimal(os.getenv("LADDER_BASE_SL_PCT", "0.5"))
 # 0.55 -> +0.35
 # 0.75 -> +0.55
 # 0.95 -> +0.75
-_DEFAULT_LADDER_LEVELS = "0.15:0.125,0.35:0.15,0.55:0.35,0.75:0.55,0.95:0.75"
+_DEFAULT_LADDER_LEVELS = "0.30:0.20,0.55:0.30,0.80:0.45,1.10:0.70,1.45:0.95"
 LADDER_LEVELS_RAW = os.getenv("LADDER_LEVELS", _DEFAULT_LADDER_LEVELS)
 
 # Risk poll interval (seconds)
