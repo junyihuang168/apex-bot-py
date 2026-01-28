@@ -194,10 +194,6 @@ SHORT_PNL_ONLY_BOTS = _parse_bot_list(
 # BOT_11-20: SHORT ladder
 # ----------------------------
 
- (bot-side only; no exchange protective orders)
-# BOT1-5: LONG ladder
-# BOT11-15: SHORT ladder
-# ----------------------------
 
 LADDER_LONG_BOTS  = _parse_bot_list(os.getenv("LADDER_LONG_BOTS",  ",".join(sorted(_ALLOWED_LONG_TPSL)))) & _ALLOWED_LONG_TPSL
 LADDER_SHORT_BOTS = _parse_bot_list(os.getenv("LADDER_SHORT_BOTS", ",".join(sorted(_ALLOWED_SHORT_TPSL)))) & _ALLOWED_SHORT_TPSL
