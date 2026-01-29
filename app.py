@@ -156,15 +156,22 @@ def _to_decimal(x: Any, default: Decimal = Decimal("0")) -> Decimal:
 #
 # 说明：
 # - 本版本的“移动止损”是机器人侧（bot-side）reduceOnly 市价平仓，不在交易所挂保护单。
-# - 具体参数见：LADDER_BASE_SL_PCT 与 LADDER_LEVELS
+# - 具体参数见：LADDER_CONFIGS（按 bot 分段配置 Base SL + Ladder Levels）
 ########################################
 
 # ----------------------------
 # ✅ BOT 分组（按你最新需求）
+#
+# LONG bots:
+# - BOT_1~BOT_10
+# - BOT_21~BOT_25
+# SHORT bots:
+# - BOT_11~BOT_20
+# - BOT_31~BOT_35
 # ----------------------------
 
-_ALLOWED_LONG_TPSL  = {f"BOT_{i}" for i in range(1, 11)}   # BOT_1 ~ BOT_10
-_ALLOWED_SHORT_TPSL = {f"BOT_{i}" for i in range(11, 21)}  # BOT_11 ~ BOT_20
+_ALLOWED_LONG_TPSL = {f"BOT_{i}" for i in range(1, 11)} | {f"BOT_{i}" for i in range(21, 26)}
+_ALLOWED_SHORT_TPSL = {f"BOT_{i}" for i in range(11, 21)} | {f"BOT_{i}" for i in range(31, 36)}
 
 # “TPSL bots” here means: bots that are allowed to have bot-side Ladder Stop enabled.
 # You can override via env LONG_TPSL_BOTS / SHORT_TPSL_BOTS, but we always intersect with the allowed sets.
@@ -190,26 +197,110 @@ SHORT_PNL_ONLY_BOTS = _parse_bot_list(
 
 # ----------------------------
 # ✅ Ladder Stop (bot-side only; no exchange protective orders)
-# BOT_1-10: LONG ladder
-# BOT_11-20: SHORT ladder
+#
+# 你现在有 3 套“初始止损 + 阶梯锁盈”方案，并且都要求：
+# - 触发到最后一档后继续“无限”上调（用最后一档的 trailing gap 继续跟随）
+# - 每套方案只部署到指定 bot 段
+#
+# 方案 A：Base SL -0.35%，阶梯= 0.15→0.125, 0.35→0.15, 0.55→0.35, 0.75→0.55, 0.95→0.75
+#   - LONG: BOT_1~BOT_5
+#   - SHORT: BOT_11~BOT_15
+#
+# 方案 B：Base SL -0.35%，阶梯= 0.30→0.20, 0.55→0.30, 0.80→0.45, 1.10→0.70, 1.45→0.95
+#   - LONG: BOT_6~BOT_10
+#   - SHORT: BOT_16~BOT_20
+#
+# 方案 C：Base SL -0.45%，阶梯= 0.22→0.18, 0.35→0.26, 0.50→0.38, 0.70→0.55, 0.90→0.75
+#   - LONG: BOT_21~BOT_25
+#   - SHORT: BOT_31~BOT_35
 # ----------------------------
 
 
-LADDER_LONG_BOTS  = _parse_bot_list(os.getenv("LADDER_LONG_BOTS",  ",".join(sorted(_ALLOWED_LONG_TPSL)))) & _ALLOWED_LONG_TPSL
-LADDER_SHORT_BOTS = _parse_bot_list(os.getenv("LADDER_SHORT_BOTS", ",".join(sorted(_ALLOWED_SHORT_TPSL)))) & _ALLOWED_SHORT_TPSL
+def _ladder_levels(*pairs: Tuple[str, str]) -> List[Tuple[Decimal, Decimal]]:
+    out: List[Tuple[Decimal, Decimal]] = []
+    for a, b in pairs:
+        out.append((Decimal(str(a)), Decimal(str(b))))
+    out.sort(key=lambda x: x[0])
+    return out
 
-# Base stop-loss (percent). Example 0.5 -> -0.5% initial lock.
-LADDER_BASE_SL_PCT = Decimal(os.getenv("LADDER_BASE_SL_PCT", "0.5"))
 
-# Profit% : lock% mapping (both in percent, not decimals)
-# Default (your old ladder):
-# 0.15 -> +0.125
-# 0.35 -> +0.15
-# 0.55 -> +0.35
-# 0.75 -> +0.55
-# 0.95 -> +0.75
-_DEFAULT_LADDER_LEVELS = "0.15:0.125,0.35:0.15,0.55:0.35,0.75:0.55,0.95:0.75"
-LADDER_LEVELS_RAW = os.getenv("LADDER_LEVELS", _DEFAULT_LADDER_LEVELS)
+_LADDER_CFG_A = {
+    "name": "A",
+    "base_sl_pct": Decimal("0.35"),
+    "levels": _ladder_levels(
+        ("0.15", "0.125"),
+        ("0.35", "0.15"),
+        ("0.55", "0.35"),
+        ("0.75", "0.55"),
+        ("0.95", "0.75"),
+    ),
+    "long_bots": {f"BOT_{i}" for i in range(1, 6)},
+    "short_bots": {f"BOT_{i}" for i in range(11, 16)},
+}
+
+_LADDER_CFG_B = {
+    "name": "B",
+    "base_sl_pct": Decimal("0.35"),
+    "levels": _ladder_levels(
+        ("0.30", "0.20"),
+        ("0.55", "0.30"),
+        ("0.80", "0.45"),
+        ("1.10", "0.70"),
+        ("1.45", "0.95"),
+    ),
+    "long_bots": {f"BOT_{i}" for i in range(6, 11)},
+    "short_bots": {f"BOT_{i}" for i in range(16, 21)},
+}
+
+_LADDER_CFG_C = {
+    "name": "C",
+    "base_sl_pct": Decimal("0.45"),
+    "levels": _ladder_levels(
+        ("0.22", "0.18"),
+        ("0.35", "0.26"),
+        ("0.50", "0.38"),
+        ("0.70", "0.55"),
+        ("0.90", "0.75"),
+    ),
+    "long_bots": {f"BOT_{i}" for i in range(21, 26)},
+    "short_bots": {f"BOT_{i}" for i in range(31, 36)},
+}
+
+
+LADDER_CONFIGS = [_LADDER_CFG_A, _LADDER_CFG_B, _LADDER_CFG_C]
+
+
+def _ladder_trailing_gap_pct(levels: List[Tuple[Decimal, Decimal]]) -> Optional[Decimal]:
+    """After the last level, we keep trailing by the last gap: gap = last_profit - last_lock."""
+    if not levels:
+        return None
+    last_profit, last_lock = levels[-1]
+    try:
+        gap = last_profit - last_lock
+    except Exception:
+        return None
+    if gap <= 0:
+        return None
+    return gap
+
+
+def _get_ladder_cfg(bot_id: str, direction: str) -> Optional[dict]:
+    b = _canon_bot_id(bot_id)
+    d = str(direction or "").upper().strip()
+    for cfg in LADDER_CONFIGS:
+        if d == "LONG" and b in cfg["long_bots"]:
+            return cfg
+        if d == "SHORT" and b in cfg["short_bots"]:
+            return cfg
+    return None
+
+
+def _all_ladder_bots() -> Set[str]:
+    s: Set[str] = set()
+    for cfg in LADDER_CONFIGS:
+        s |= set(cfg.get("long_bots", set()))
+        s |= set(cfg.get("short_bots", set()))
+    return s
 
 # Risk poll interval (seconds)
 RISK_POLL_INTERVAL = float(os.getenv("RISK_POLL_INTERVAL", "1.0"))
@@ -237,40 +328,8 @@ RISK_TICKER_REFRESH_SEC = float(os.getenv("RISK_TICKER_REFRESH_SEC", "0.75"))
 RISK_TICKER_STALE_SEC = float(os.getenv("RISK_TICKER_STALE_SEC", "30.0"))
 _RISK_TICKER_CACHE: Dict[str, Tuple[Decimal, float]] = {}  # symbol -> (price, ts)
 _RISK_TICKER_LOCK = threading.Lock()
-
-
-
-def _parse_ladder_levels(s: str):
-    out = []
-    for part in (s or "").split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if ":" not in part:
-            continue
-        a, b = part.split(":", 1)
-        try:
-            profit = Decimal(a.strip())
-            lock = Decimal(b.strip())
-        except Exception:
-            continue
-        out.append((profit, lock))
-    # sort by profit threshold ascending
-    out.sort(key=lambda x: x[0])
-    return out
-
-
-LADDER_LEVELS = _parse_ladder_levels(LADDER_LEVELS_RAW)
-
-
 def _bot_uses_ladder(bot_id: str, direction: str) -> bool:
-    b = _canon_bot_id(bot_id)
-    d = str(direction or "").upper()
-    if d == "LONG":
-        return b in LADDER_LONG_BOTS
-    if d == "SHORT":
-        return b in LADDER_SHORT_BOTS
-    return False
+    return _get_ladder_cfg(bot_id, direction) is not None
 
 
 def _get_mark_price(symbol: str) -> Optional[Decimal]:
@@ -908,10 +967,10 @@ _RISK_THREAD_STARTED = False
 _RISK_LOCK = threading.Lock()
 
 
-def _ladder_desired_lock_pct(profit_pct: Decimal) -> Optional[Decimal]:
-    """Return the desired lock pct given current profit pct."""
-    desired = None
-    for p_th, lock in LADDER_LEVELS:
+def _ladder_desired_lock_pct(levels: List[Tuple[Decimal, Decimal]], profit_pct: Decimal) -> Optional[Decimal]:
+    """Return the desired lock pct given current profit pct and discrete ladder levels."""
+    desired: Optional[Decimal] = None
+    for p_th, lock in (levels or []):
         if profit_pct >= p_th:
             desired = lock
         else:
@@ -920,6 +979,22 @@ def _ladder_desired_lock_pct(profit_pct: Decimal) -> Optional[Decimal]:
 
 
 def _maybe_raise_lock(bot_id: str, symbol: str, direction: str, profit_pct: Decimal):
+    """Update and return current lock% for (bot,symbol,direction).
+
+    Rules:
+    - Initialize lock% to -base_sl_pct.
+    - Raise lock% as profit reaches ladder thresholds.
+    - After the last level, keep trailing "infinitely" by the last gap (last_profit - last_lock).
+    """
+    cfg = _get_ladder_cfg(bot_id, direction)
+    if not cfg:
+        return None
+
+    base_sl_pct: Decimal = cfg["base_sl_pct"]
+    levels: List[Tuple[Decimal, Decimal]] = cfg["levels"]
+    tail_gap = _ladder_trailing_gap_pct(levels)
+    last_profit = levels[-1][0] if levels else None
+
     # current lock
     try:
         cur = get_lock_level_pct(bot_id, symbol, direction)
@@ -927,13 +1002,20 @@ def _maybe_raise_lock(bot_id: str, symbol: str, direction: str, profit_pct: Deci
         cur = None
 
     if cur is None:
-        cur = -LADDER_BASE_SL_PCT
+        cur = -base_sl_pct
         try:
             set_lock_level_pct(bot_id, symbol, direction, cur)
         except Exception:
             return cur
 
-    desired = _ladder_desired_lock_pct(profit_pct)
+    desired = _ladder_desired_lock_pct(levels, profit_pct)
+
+    # Infinite tail: once profit is beyond the last ladder threshold, keep trailing by the last gap.
+    if tail_gap is not None and last_profit is not None and profit_pct >= last_profit:
+        tail_lock = profit_pct - tail_gap
+        if desired is None or tail_lock > desired:
+            desired = tail_lock
+
     if desired is not None and desired > cur:
         try:
             set_lock_level_pct(bot_id, symbol, direction, desired)
@@ -1028,11 +1110,8 @@ def _ladder_close_position(bot_id: str, symbol: str, direction: str, qty: Decima
 def _risk_loop():
     print(f"[LADDER] risk loop started (interval={RISK_POLL_INTERVAL}s)")
     while True:
-        try:
-            # bots that have ladder enabled
-            bots = sorted({*_parse_bot_list(','.join(LADDER_LONG_BOTS)), *_parse_bot_list(','.join(LADDER_SHORT_BOTS))})
-        except Exception:
-            bots = list(LADDER_LONG_BOTS | LADDER_SHORT_BOTS)
+        # bots that have ladder enabled (across all ladder configs)
+        bots = sorted(_all_ladder_bots())
 
         for bot_id in bots:
             try:
@@ -1063,6 +1142,8 @@ def _risk_loop():
 
                     profit_pct = _compute_profit_pct(direction, entry, ref_price)
                     lock_pct = _maybe_raise_lock(bot_id, symbol, direction, profit_pct)
+                    if lock_pct is None:
+                        continue
                     stop_price = _compute_stop_price(direction, entry, Decimal(str(lock_pct)))
 
                     if LADDER_DEBUG:
@@ -1906,7 +1987,10 @@ def tv_webhook():
         direction = "LONG" if side_raw == "BUY" else "SHORT"
         if _bot_uses_ladder(bot_id, direction) and entry_price_dec is not None and final_qty > 0:
             try:
-                set_lock_level_pct(bot_id, symbol, direction, -LADDER_BASE_SL_PCT)
+                cfg = _get_ladder_cfg(bot_id, direction)
+                base_sl = (cfg or {}).get("base_sl_pct")
+                if isinstance(base_sl, Decimal) and base_sl > 0:
+                    set_lock_level_pct(bot_id, symbol, direction, -base_sl)
             except Exception as e:
                 print("[LADDER] set base lock failed:", e)
 
