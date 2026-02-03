@@ -232,13 +232,21 @@ def _ladder_levels(*pairs: Tuple[str, str]) -> List[Tuple[Decimal, Decimal]]:
 
 _LADDER_CFG_A = {
     "name": "A",
-    "base_sl_pct": Decimal("0.35"),
+    "mode": "LADDER",
+    # BOT_1-5 (LONG) & BOT_11-15 (SHORT)
+    # Initial SL = -1.0%
+    # Ladder: Profit% -> Lock%
+    # 1.0 -> 0.0
+    # 2.0 -> 1.0
+    # 3.0 -> 2.0
+    # 5.0 -> 3.5
+    # Infinite tail: after 5.0%, keep trailing with gap = 1.5 (profit - lock)
+    "base_sl_pct": Decimal("1.0"),
     "levels": _ladder_levels(
-        ("0.15", "0.125"),
-        ("0.35", "0.15"),
-        ("0.55", "0.35"),
-        ("0.75", "0.55"),
-        ("0.95", "0.75"),
+        ("1.0", "0.0"),
+        ("2.0", "1.0"),
+        ("3.0", "2.0"),
+        ("5.0", "3.5"),
     ),
     "long_bots": {f"BOT_{i}" for i in range(1, 6)},
     "short_bots": {f"BOT_{i}" for i in range(11, 16)},
@@ -260,14 +268,30 @@ _LADDER_CFG_B = {
 
 _LADDER_CFG_C = {
     "name": "C",
-    "base_sl_pct": Decimal("0.45"),
-    "levels": _ladder_levels(
-        ("0.22", "0.18"),
-        ("0.35", "0.26"),
-        ("0.50", "0.38"),
-        ("0.70", "0.55"),
-        ("0.90", "0.75"),
-    ),
+    "mode": "CYCLE_23",
+    # BOT_21-25 (LONG) & BOT_31-35 (SHORT)
+    #
+    # Initial SL = -0.8%
+    # Stage 1 (one-time): Profit >= 0.8%  -> Lock = 0.0% (breakeven)
+    #
+    # Then repeat forever (k = 0,1,2,...), monotonic lock only (never decrease):
+    #   Stage 2: Profit >= (2.0 + 4.0*k)% -> Lock = 60% of that trigger = 0.60*(2.0+4.0*k)
+    #   Stage 3: Profit >= (4.0 + 4.0*k)% -> Lock = (4.0+4.0*k) - 0.5
+    #
+    # Note: This implements a *stepwise* "2 -> 3 -> 2 -> 3 ..." ladder loop (not a continuous trail),
+    #       and we always apply: new_lock = max(old_lock, candidate_lock).
+    "base_sl_pct": Decimal("0.8"),
+    "cycle": {
+        "stage1_profit": Decimal("0.8"),
+        "stage1_lock": Decimal("0.0"),
+        "cycle_step": Decimal("4.0"),
+        "stage2_start": Decimal("2.0"),
+        "stage2_lock_ratio": Decimal("0.60"),
+        "stage3_start": Decimal("4.0"),
+        "stage3_lock_offset": Decimal("0.5"),
+    },
+    # levels is unused for CYCLE_23 but kept for schema compatibility
+    "levels": [],
     "long_bots": {f"BOT_{i}" for i in range(21, 26)},
     "short_bots": {f"BOT_{i}" for i in range(31, 36)},
 }
@@ -1014,22 +1038,70 @@ def _ladder_desired_lock_pct(levels: List[Tuple[Decimal, Decimal]], profit_pct: 
     return desired
 
 
+def _cycle23_desired_lock_pct(cfg: dict, profit_pct: Decimal) -> Optional[Decimal]:
+    """Desired lock% for the CYCLE_23 scheme (stage2/stage3 loop), independent of current lock.
+
+    Returns the maximum candidate lock% implied by the rules, or None if no rule is active yet.
+    Caller must enforce monotonicity: new_lock = max(old_lock, desired).
+    """
+    cycle = cfg.get("cycle") or {}
+    try:
+        stage1_profit: Decimal = Decimal(str(cycle.get("stage1_profit", "0.8")))
+        stage1_lock: Decimal = Decimal(str(cycle.get("stage1_lock", "0.0")))
+        cycle_step: Decimal = Decimal(str(cycle.get("cycle_step", "4.0")))
+        stage2_start: Decimal = Decimal(str(cycle.get("stage2_start", "2.0")))
+        stage2_lock_ratio: Decimal = Decimal(str(cycle.get("stage2_lock_ratio", "0.60")))
+        stage3_start: Decimal = Decimal(str(cycle.get("stage3_start", "4.0")))
+        stage3_lock_offset: Decimal = Decimal(str(cycle.get("stage3_lock_offset", "0.5")))
+    except Exception:
+        return None
+
+    desired: Optional[Decimal] = None
+
+    # Stage 1 (one-time floor)
+    if profit_pct >= stage1_profit:
+        desired = stage1_lock
+
+    # Stage 2/3 loop (stepwise triggers)
+    if cycle_step > 0:
+        # Stage 2 triggers at: stage2_start + k*cycle_step
+        if profit_pct >= stage2_start:
+            k2_max = int(((profit_pct - stage2_start) / cycle_step).to_integral_value(rounding=ROUND_DOWN))
+            for k in range(0, k2_max + 1):
+                trig = stage2_start + (cycle_step * Decimal(k))
+                cand = (stage2_lock_ratio * trig)
+                desired = cand if desired is None or cand > desired else desired
+
+        # Stage 3 triggers at: stage3_start + k*cycle_step
+        if profit_pct >= stage3_start:
+            k3_max = int(((profit_pct - stage3_start) / cycle_step).to_integral_value(rounding=ROUND_DOWN))
+            for k in range(0, k3_max + 1):
+                trig = stage3_start + (cycle_step * Decimal(k))
+                cand = trig - stage3_lock_offset
+                desired = cand if desired is None or cand > desired else desired
+
+    return desired
+
+
 def _maybe_raise_lock(bot_id: str, symbol: str, direction: str, profit_pct: Decimal):
     """Update and return current lock% for (bot,symbol,direction).
 
-    Rules:
-    - Initialize lock% to -base_sl_pct.
-    - Raise lock% as profit reaches ladder thresholds.
-    - After the last level, keep trailing "infinitely" by the last gap (last_profit - last_lock).
+    Common rules:
+    - Initialize lock% to -base_sl_pct (negative).
+    - Only ever RAISE lock% (monotonic): new_lock = max(old_lock, desired_lock).
+    - Close will be triggered when price hits the stop derived from lock%.
+
+    Modes:
+    - LADDER: discrete (profit -> lock) levels + infinite tail via last gap.
+    - CYCLE_23: stage1 breakeven + repeating stage2/stage3 stepwise loop.
     """
     cfg = _get_ladder_cfg(bot_id, direction)
     if not cfg:
         return None
 
-    base_sl_pct: Decimal = cfg["base_sl_pct"]
-    levels: List[Tuple[Decimal, Decimal]] = cfg["levels"]
-    tail_gap = _ladder_trailing_gap_pct(levels)
-    last_profit = levels[-1][0] if levels else None
+    mode = str(cfg.get("mode") or "LADDER").upper().strip()
+    base_sl_pct: Decimal = cfg.get("base_sl_pct", Decimal("0"))
+    levels: List[Tuple[Decimal, Decimal]] = cfg.get("levels") or []
 
     # current lock
     try:
@@ -1038,25 +1110,38 @@ def _maybe_raise_lock(bot_id: str, symbol: str, direction: str, profit_pct: Deci
         cur = None
 
     if cur is None:
-        cur = -base_sl_pct
+        cur = -Decimal(str(base_sl_pct))
         try:
             set_lock_level_pct(bot_id, symbol, direction, cur)
         except Exception:
             return cur
 
-    desired = _ladder_desired_lock_pct(levels, profit_pct)
+    desired: Optional[Decimal] = None
 
-    # Infinite tail: once profit is beyond the last ladder threshold, keep trailing by the last gap.
-    if tail_gap is not None and last_profit is not None and profit_pct >= last_profit:
-        tail_lock = profit_pct - tail_gap
-        if desired is None or tail_lock > desired:
-            desired = tail_lock
+    if mode == "LADDER":
+        desired = _ladder_desired_lock_pct(levels, profit_pct)
 
+        # Infinite tail: once profit is beyond the last ladder threshold, keep trailing by the last gap.
+        tail_gap = _ladder_trailing_gap_pct(levels)
+        last_profit = levels[-1][0] if levels else None
+        if tail_gap is not None and last_profit is not None and profit_pct >= last_profit:
+            tail_lock = profit_pct - tail_gap
+            if desired is None or tail_lock > desired:
+                desired = tail_lock
+
+    elif mode == "CYCLE_23":
+        desired = _cycle23_desired_lock_pct(cfg, profit_pct)
+
+    else:
+        # Unknown mode: behave like LADDER but without tail.
+        desired = _ladder_desired_lock_pct(levels, profit_pct)
+
+    # ✅ Hard constraint: stop-lock only moves upward
     if desired is not None and desired > cur:
         try:
             set_lock_level_pct(bot_id, symbol, direction, desired)
             print(
-                f"[LADDER] RAISE_LOCK bot={bot_id} {direction} {symbol} profit%={profit_pct:.4f} lock% {cur} -> {desired}"
+                f"[LADDER] RAISE_LOCK bot={bot_id} {direction} {symbol} profit%={profit_pct:.4f} lock% {cur} -> {desired} mode={mode}"
             )
             return desired
         except Exception:
