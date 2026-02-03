@@ -73,6 +73,12 @@ MIRROR_BOT_PAIRS_RAW = str(os.getenv("MIRROR_BOT_PAIRS", "")).strip()
 MIRROR_WAIT_SEC = float(os.getenv("MIRROR_WAIT_SEC", "4.0"))
 MIRROR_FORCE_EXIT = str(os.getenv("MIRROR_FORCE_EXIT", "1")).strip() == "1"
 
+# ✅ Global single-position per symbol (across ALL bots):
+# If ANY bot currently holds a position on a symbol, and ANOTHER bot sends an ENTRY for the same symbol,
+# we will force-close the existing holder(s) first, then allow the new ENTRY.
+GLOBAL_SYMBOL_SINGLE_POSITION = str(os.getenv("GLOBAL_SYMBOL_SINGLE_POSITION", "1")).strip() == "1"
+GLOBAL_FLIP_WAIT_SEC = float(os.getenv("GLOBAL_FLIP_WAIT_SEC", "6.0"))
+
 _MIRROR_LOCKS: dict = {}  # symbol -> threading.Lock
 _MIRROR_LOCKS_GUARD = threading.Lock()
 
@@ -769,6 +775,36 @@ def _get_mirror_lock(symbol: str) -> threading.Lock:
             lk = threading.Lock()
             _MIRROR_LOCKS[sym] = lk
         return lk
+
+
+def _find_symbol_holders(symbol: str) -> List[Dict[str, Any]]:
+    """Return a list of bots currently holding an open position for this symbol.
+
+    Output items: {"bot_id": "BOT_X", "direction": "LONG|SHORT", "qty": Decimal}
+
+    Source of truth is the local PnL DB (lots with remaining_qty).
+    This is used to enforce **global single-position per symbol**.
+    """
+    sym = str(symbol or "").upper().strip()
+    if not sym:
+        return []
+
+    holders: List[Dict[str, Any]] = []
+    bots = list_bots_with_activity()
+    for b in bots:
+        b2 = _canon_bot_id(b)
+        try:
+            opens = get_bot_open_positions(b2)
+        except Exception:
+            continue
+        for d in ("LONG", "SHORT"):
+            try:
+                q = opens.get((sym, d), {}).get("qty", Decimal("0"))
+            except Exception:
+                q = Decimal("0")
+            if q and q > 0:
+                holders.append({"bot_id": b2, "direction": d, "qty": q})
+    return holders
 
 
 def _execute_exit_order(
@@ -1694,113 +1730,143 @@ def tv_webhook():
         if side_raw not in ("BUY", "SELL"):
             return "missing or invalid side", 400
 
-
-        # ✅ Entry guard: if a CLOSE arrived together with OPEN, block the OPEN.
-        rej = _entry_guard_reject(symbol, tv_client_id=str(tv_client_id or ""))
-        if rej is not None:
-            rej.update({"mode": "entry", "bot_id": bot_id, "signal_id": sig_id})
-            return jsonify(rej), 200
-
-
-
-        # ✅ Constraint A: global same-symbol same-direction (across all bots)
         desired_dir = "LONG" if side_raw == "BUY" else "SHORT"
-        open_dirs = get_symbol_open_directions(symbol)
-        if len(open_dirs) > 1:
-            # This should not happen; fail-closed to avoid netting issues.
-            return jsonify({
-                "status": "reject_direction_conflict",
-                "mode": "entry",
-                "bot_id": bot_id,
-                "symbol": symbol,
-                "desired_direction": desired_dir,
-                "open_directions": sorted(list(open_dirs)),
-                "signal_id": sig_id,
-            }), 200
 
-        if len(open_dirs) == 1 and desired_dir not in open_dirs:
-            locked_dir = list(open_dirs)[0]
+        # ✅ Global single-position per symbol (across ALL bots):
+        # If another bot is already holding this symbol (either direction),
+        # force-close the existing holder(s) first, then allow the new ENTRY.
+        forced_flip = False
+        flip_summary: Dict[str, Any] = {}
 
-            # ✅ Mirror sequencing: when flipping direction via SMC mirror bots
-            # ensure the opposite position is CLOSED first, then allow ENTRY.
-            if _is_mirror_bot(bot_id):
-                partner = _mirror_partner(bot_id)
+        if GLOBAL_SYMBOL_SINGLE_POSITION:
+            with _get_mirror_lock(symbol):
+                holders = _find_symbol_holders(symbol)
 
-                with _get_mirror_lock(symbol):
-                    # re-check inside lock
-                    open_dirs2 = get_symbol_open_directions(symbol)
-                    if len(open_dirs2) == 1 and desired_dir not in open_dirs2:
-                        locked_dir = list(open_dirs2)[0]
+                # Remote fallback (covers cases where local DB is empty after restart,
+                # but an exchange position still exists). Only runs for whitelisted symbols.
+                if (not holders) and (symbol in REMOTE_FALLBACK_SYMBOLS):
+                    try:
+                        remote = get_open_position_for_symbol(symbol)
+                    except Exception:
+                        remote = None
+                    if isinstance(remote, dict) and remote.get("size") is not None:
+                        try:
+                            rsz = Decimal(str(remote.get("size")))
+                        except Exception:
+                            rsz = Decimal("0")
+                        rdir = str(remote.get("side") or "").upper().strip()
+                        if rsz > 0 and rdir in ("LONG", "SHORT"):
+                            res = _execute_exit_order(
+                                bot_id,
+                                symbol,
+                                force_direction=rdir,
+                                ignore_cooldown=True,
+                                reason="global_symbol_flip_exit_remote",
+                                sig_id=sig_id,
+                            )
+                            if res.get("status") not in ("ok", "no_position"):
+                                return jsonify({
+                                    "status": "global_flip_exit_failed",
+                                    "mode": "entry",
+                                    "bot_id": bot_id,
+                                    "symbol": symbol,
+                                    "desired_direction": desired_dir,
+                                    "holder": {"bot_id": "REMOTE", "direction": rdir},
+                                    "holder_exit_status": res.get("status"),
+                                    "signal_id": sig_id,
+                                }), 200
+                            # Wait briefly for exchange position to clear before continuing.
+                            deadline = time.time() + max(0.5, float(GLOBAL_FLIP_WAIT_SEC or 0))
+                            while time.time() < deadline:
+                                try:
+                                    chk = get_open_position_for_symbol(symbol)
+                                except Exception:
+                                    chk = None
+                                if not isinstance(chk, dict) or chk.get("size") in (None, "", "0", "0.0"):
+                                    break
+                                try:
+                                    csz = Decimal(str(chk.get("size")))
+                                except Exception:
+                                    csz = Decimal("0")
+                                if csz <= 0:
+                                    break
+                                time.sleep(0.15)
+                            forced_flip = True
 
-                        mirror_forced_exit = False
-                        mirror_exit_status = None
+                # If the only holder is THIS bot and direction matches, do nothing.
+                same_owner_same_dir = (
+                    len(holders) == 1
+                    and holders[0].get("bot_id") == bot_id
+                    and holders[0].get("direction") == desired_dir
+                )
 
-                        # If partner currently holds the locked direction, force-close partner first.
-                        if MIRROR_FORCE_EXIT and partner:
-                            try:
-                                p_opens = get_bot_open_positions(partner)
-                                pqty = p_opens.get((symbol, locked_dir), {}).get("qty", Decimal("0"))
-                            except Exception:
-                                pqty = Decimal("0")
+                if holders and (not same_owner_same_dir):
+                    results: List[Dict[str, Any]] = []
+                    for h in holders:
+                        h_bot = _canon_bot_id(h.get("bot_id"))
+                        h_dir = str(h.get("direction") or "").upper().strip()
+                        if h_dir not in ("LONG", "SHORT"):
+                            continue
+                        res = _execute_exit_order(
+                            h_bot,
+                            symbol,
+                            force_direction=h_dir,
+                            ignore_cooldown=True,
+                            reason="global_symbol_flip_exit",
+                            sig_id=sig_id,
+                        )
+                        results.append({
+                            "bot_id": h_bot,
+                            "direction": h_dir,
+                            "requested_qty": str(h.get("qty")) if h.get("qty") is not None else "0",
+                            "exit_status": res.get("status"),
+                        })
 
-                            if pqty > 0:
-                                res = _execute_exit_order(
-                                    partner,
-                                    symbol,
-                                    force_direction=locked_dir,
-                                    ignore_cooldown=True,
-                                    reason="mirror_flip_exit",
-                                    sig_id=sig_id,
-                                )
-                                mirror_exit_status = res.get("status")
-                                mirror_forced_exit = res.get("status") == "ok"
-
-                                # If we could not confirm fills, fail-closed.
-                                if res.get("status") not in ("ok", "no_position"):
-                                    return jsonify({
-                                        "status": "mirror_exit_failed",
-                                        "mode": "entry",
-                                        "bot_id": bot_id,
-                                        "symbol": symbol,
-                                        "desired_direction": desired_dir,
-                                        "locked_direction": locked_dir,
-                                        "mirror_partner": partner,
-                                        "mirror_exit_status": mirror_exit_status,
-                                        "signal_id": sig_id,
-                                    }), 200
-
-                        # Wait a short window for lock to clear (covers cases where EXIT webhook arrives slightly later).
-                        deadline = time.time() + MIRROR_WAIT_SEC
-                        while time.time() < deadline:
-                            dirs = get_symbol_open_directions(symbol)
-                            if len(dirs) == 0 or (len(dirs) == 1 and desired_dir in dirs):
-                                break
-                            time.sleep(0.15)
-
-                        dirs = get_symbol_open_directions(symbol)
-                        if len(dirs) == 1 and desired_dir not in dirs:
+                        # If we could not confirm fills, fail-closed.
+                        if res.get("status") not in ("ok", "no_position"):
                             return jsonify({
-                                "status": "reject_opposite_direction_locked",
+                                "status": "global_flip_exit_failed",
                                 "mode": "entry",
                                 "bot_id": bot_id,
                                 "symbol": symbol,
                                 "desired_direction": desired_dir,
-                                "locked_direction": list(dirs)[0],
-                                "mirror_partner": partner,
-                                "mirror_forced_exit": mirror_forced_exit,
-                                "mirror_exit_status": mirror_exit_status,
+                                "holder": {"bot_id": h_bot, "direction": h_dir},
+                                "holder_exit_status": res.get("status"),
                                 "signal_id": sig_id,
                             }), 200
-            else:
-                return jsonify({
-                    "status": "reject_opposite_direction_locked",
-                    "mode": "entry",
-                    "bot_id": bot_id,
-                    "symbol": symbol,
-                    "desired_direction": desired_dir,
-                    "locked_direction": locked_dir,
-                    "signal_id": sig_id,
-                }), 200
+
+                    # Wait for all directions to clear before opening the new position.
+                    deadline = time.time() + max(0.5, float(GLOBAL_FLIP_WAIT_SEC or 0))
+                    while time.time() < deadline:
+                        dirs = get_symbol_open_directions(symbol)
+                        if not dirs:
+                            break
+                        time.sleep(0.15)
+
+                    dirs = get_symbol_open_directions(symbol)
+                    if dirs:
+                        return jsonify({
+                            "status": "global_flip_exit_incomplete",
+                            "mode": "entry",
+                            "bot_id": bot_id,
+                            "symbol": symbol,
+                            "desired_direction": desired_dir,
+                            "remaining_open_directions": sorted(list(dirs)),
+                            "flip_results": results,
+                            "signal_id": sig_id,
+                        }), 200
+
+                    forced_flip = True
+                    flip_summary = {"flip_results": results}
+
+
+        # ✅ Entry guard: if a CLOSE arrived together with OPEN, block the OPEN.
+        # BUT: when we just forced a global flip (close->open), we must allow the OPEN.
+        if not forced_flip:
+            rej = _entry_guard_reject(symbol, tv_client_id=str(tv_client_id or ""))
+            if rej is not None:
+                rej.update({"mode": "entry", "bot_id": bot_id, "signal_id": sig_id})
+                return jsonify(rej), 200
 
         try:
             budget = _extract_budget_usdt(body)
@@ -1994,7 +2060,7 @@ def tv_webhook():
             except Exception as e:
                 print("[LADDER] set base lock failed:", e)
 
-        return jsonify({
+        resp = {
             "status": "ok",
             "mode": "entry",
             "bot_id": bot_id,
@@ -2008,7 +2074,14 @@ def tv_webhook():
             "order_id": order_id,
             "client_order_id": client_order_id,
             "signal_id": sig_id,
-        }), 200
+        }
+
+        if forced_flip:
+            resp["forced_flip"] = True
+            if isinstance(flip_summary, dict) and flip_summary:
+                resp.update(flip_summary)
+
+        return jsonify(resp), 200
 
 
     # -------------------------
