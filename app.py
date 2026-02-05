@@ -1,3 +1,4 @@
+# app.py
 import os
 import time
 import threading
@@ -153,7 +154,7 @@ def _to_decimal(x: Any, default: Decimal = Decimal("0")) -> Decimal:
         return default
 
 
-#+#+#+#+########################################
+########################################################################
 # BOT GROUPS
 #
 # ✅ 移动止损（Ladder Stop）适用范围（按你最新需求）
@@ -163,7 +164,7 @@ def _to_decimal(x: Any, default: Decimal = Decimal("0")) -> Decimal:
 # 说明：
 # - 本版本的“移动止损”是机器人侧（bot-side）reduceOnly 市价平仓，不在交易所挂保护单。
 # - 具体参数见：LADDER_CONFIGS（按 bot 分段配置 Base SL + Ladder Levels）
-########################################
+########################################################################
 
 # ----------------------------
 # ✅ BOT 分组（按你最新需求）
@@ -204,21 +205,34 @@ SHORT_PNL_ONLY_BOTS = _parse_bot_list(
 # ----------------------------
 # ✅ Ladder Stop (bot-side only; no exchange protective orders)
 #
-# 你现在有 3 套“初始止损 + 阶梯锁盈”方案，并且都要求：
-# - 触发到最后一档后继续“无限”上调（用最后一档的 trailing gap 继续跟随）
-# - 每套方案只部署到指定 bot 段
+# 说明：
+# - 本版本的止损/移动止损都是机器人侧（bot-side）reduceOnly 市价平仓，不在交易所挂保护单。
+# - “初始止损”通过 lock% 初始化为 -base_sl_pct 实现。
+# - “无限延伸”通过最后一档 gap = (last_profit - last_lock) 继续跟随：lock = profit - gap。
 #
-# 方案 A：Base SL -0.35%，阶梯= 0.15→0.125, 0.35→0.15, 0.55→0.35, 0.75→0.55, 0.95→0.75
-#   - LONG: BOT_1~BOT_5
+# 当前已启用的方案（按 bot 段部署）：
+#
+# 方案 A（阶梯 + 无限）：Initial SL -1.0%
+#   1.0→0.0, 2.0→1.0, 3.0→2.0, 5.0→3.5
+#   - LONG:  BOT_1~BOT_5
 #   - SHORT: BOT_11~BOT_15
 #
-# 方案 B：Base SL -0.35%，阶梯= 0.30→0.20, 0.55→0.30, 0.80→0.45, 1.10→0.70, 1.45→0.95
-#   - LONG: BOT_6~BOT_10
+# 方案 B（已删除阶梯；仅保留硬止损）：Fixed SL -1.0%（无阶梯/无锁盈）
+#   - LONG:  BOT_6~BOT_10
 #   - SHORT: BOT_16~BOT_20
 #
-# 方案 C：Base SL -0.45%，阶梯= 0.22→0.18, 0.35→0.26, 0.50→0.38, 0.70→0.55, 0.90→0.75
-#   - LONG: BOT_21~BOT_25
+# 方案 C（cycle23 无限循环）：Initial SL -0.8%
+#   Stage1: profit>=0.8% -> lock=0.0%
+#   Then repeat forever (k=0,1,2...):
+#     Stage2: profit>=(2.0+4.0k)% -> lock=0.60*(2.0+4.0k)%
+#     Stage3: profit>=(4.0+4.0k)% -> lock=(4.0+4.0k)-0.5
+#   - LONG:  BOT_21~BOT_25
 #   - SHORT: BOT_31~BOT_35
+#
+# 方案 D（阶梯 + 无限）：Initial SL -0.85%
+#   2.0→0.4, 2.4→0.8，然后按最后 gap=1.6 无限上调（lock=profit-1.6）
+#   - LONG:  BOT_26~BOT_30
+#   - SHORT: BOT_36~BOT_40
 # ----------------------------
 
 
@@ -246,16 +260,12 @@ _LADDER_CFG_A = {
 }
 
 
-_LADDER_CFG_B = {
-    "name": "B",
-    "base_sl_pct": Decimal("0.35"),
-    "levels": _ladder_levels(
-        ("0.30", "0.20"),
-        ("0.55", "0.30"),
-        ("0.80", "0.45"),
-        ("1.10", "0.70"),
-        ("1.45", "0.95"),
-    ),
+_LADDER_CFG_B_FIXED = {
+    "name": "B_FIXED_1PCT",  # ✅ Scheme B removed: keep ONLY a fixed -1.0% stop (no ladder)
+    # BOT_6-10 (LONG) & BOT_16-20 (SHORT): Fixed SL = -1.0% (bot-side)
+    "base_sl_pct": Decimal("1.0"),
+    # No ladder levels: lock% will stay at -1.0% forever (pure hard stop).
+    "levels": _ladder_levels(),
     "long_bots": {f"BOT_{i}" for i in range(6, 11)},
     "short_bots": {f"BOT_{i}" for i in range(16, 21)},
 }
@@ -287,8 +297,24 @@ _LADDER_CFG_C = {
 }
 
 
+_LADDER_CFG_D = {
+    "name": "D",
+    # ✅ BOT_26-30 (LONG) & BOT_36-40 (SHORT): Initial SL = -0.85%
+    "base_sl_pct": Decimal("0.85"),
+    # Ladder:
+    #   Profit >= 2.0% -> lock 0.4%
+    #   Profit >= 2.4% -> lock 0.8%
+    # Infinite tail uses last gap: 2.4 - 0.8 = 1.6  => lock = profit - 1.6 (for profit >= 2.4)
+    "levels": _ladder_levels(
+        ("2.0", "0.4"),
+        ("2.4", "0.8"),
+    ),
+    "long_bots": {f"BOT_{i}" for i in range(26, 31)},
+    "short_bots": {f"BOT_{i}" for i in range(36, 41)},
+}
 
-LADDER_CONFIGS = [_LADDER_CFG_A, _LADDER_CFG_B, _LADDER_CFG_C]
+
+LADDER_CONFIGS = [_LADDER_CFG_A, _LADDER_CFG_B_FIXED, _LADDER_CFG_C, _LADDER_CFG_D]
 
 
 def _ladder_trailing_gap_pct(levels: List[Tuple[Decimal, Decimal]]) -> Optional[Decimal]:
@@ -1703,7 +1729,7 @@ def dashboard():
         const hint = (res.status === 403)
           ? '403 Forbidden. If you set DASHBOARD_TOKEN, paste it above (or open /dashboard?token=...).'
           : `HTTP ${res.status}`;
-        setErr(hint + (data ? ('\n' + JSON.stringify(data, null, 2)) : ''));
+        setErr(hint + (data ? ('\\n' + JSON.stringify(data, null, 2)) : ''));
         return;
       }
 
@@ -2142,110 +2168,107 @@ def tv_webhook():
 
             # Fallback: use position entryPrice snapshot if order detail is delayed.
             try:
-                pos_wait = float(os.getenv("POSITION_FALLBACK_WAIT_SEC", "8.0"))
-                pos_poll = float(os.getenv("POSITION_FALLBACK_POLL_INTERVAL", "0.5"))
-                deadline = time.time() + pos_wait
-
-                while time.time() < deadline and entry_price_dec is None:
+                pos_wait = float(os.getenv("POS_FALLBACK_MAX_WAIT_SEC", "2.5"))
+                deadline = time.time() + max(0.2, pos_wait)
+                while time.time() < deadline:
                     pos = get_open_position_for_symbol(symbol)
-                    if isinstance(pos, dict):
-                        sz = pos.get("size")
-                        ep = pos.get("entryPrice") or pos.get("entry_price") or pos.get("avgEntryPrice")
+                    if isinstance(pos, dict) and pos.get("side") and pos.get("size") is not None:
                         try:
-                            dsz = Decimal(str(sz)) if sz is not None else Decimal("0")
+                            pside = str(pos.get("side")).upper().strip()
+                            psize = Decimal(str(pos.get("size")))
+                            epx = pos.get("entryPrice") or pos.get("entry_price") or pos.get("avgEntryPrice")
+                            epx_dec = _to_decimal(epx, default=Decimal("0"))
                         except Exception:
-                            dsz = Decimal("0")
+                            pside, psize, epx_dec = "", Decimal("0"), Decimal("0")
 
-                        if dsz > 0 and ep not in (None, "", "0", "0.0"):
-                            entry_price_dec = Decimal(str(ep))
-                            # Use delta vs pre-order position size, capped at requested qty.
-                            try:
-                                delta_sz = (dsz - pre_pos_size)
-                            except Exception:
-                                delta_sz = dsz
-                            if delta_sz <= 0:
-                                final_qty = snapped_qty
-                            else:
-                                final_qty = min(snapped_qty, delta_sz)
+                        if side_raw == "BUY" and pside == "LONG":
+                            if psize > pre_pos_size and epx_dec > 0:
+                                entry_price_dec = epx_dec
+                                final_qty = (psize - pre_pos_size) if (psize - pre_pos_size) > 0 else snapped_qty
+                                break
+                        elif side_raw == "SELL" and pside == "SHORT":
+                            if psize > pre_pos_size and epx_dec > 0:
+                                entry_price_dec = epx_dec
+                                final_qty = (psize - pre_pos_size) if (psize - pre_pos_size) > 0 else snapped_qty
+                                break
 
-                            print(f"[ENTRY] position fallback bot={bot_id} symbol={symbol} posSize={dsz} prePos={pre_pos_size} delta={delta_sz} final_qty={final_qty} entryPrice={entry_price_dec}")
-                            break
+                    time.sleep(0.15)
+            except Exception:
+                pass
 
-                    time.sleep(pos_poll)
+        if entry_price_dec is None or entry_price_dec <= 0:
+            # If we still can't confirm, fail-closed (do not record fake entry).
+            return jsonify({
+                "status": "fill_unavailable",
+                "mode": "entry",
+                "bot_id": bot_id,
+                "symbol": symbol,
+                "side": side_raw,
+                "request_qty": size_str,
+                "order_status": status,
+                "cancel_reason": cancel_reason,
+                "signal_id": sig_id,
+            }), 200
 
-            except Exception as e2:
-                print(f"[ENTRY] position fallback failed bot={bot_id} symbol={symbol} err:", e2)
+        # Record entry into PnL DB
+        try:
+            record_entry(
+                bot_id=bot_id,
+                symbol=symbol,
+                entry_side=side_raw,
+                qty=final_qty,
+                entry_price=entry_price_dec,
+                client_order_id=client_order_id or entry_client_id,
+            )
+        except Exception as e:
+            print("[PNL] record_entry error:", e)
 
-        key = (bot_id, symbol)
-        BOT_POSITIONS[key] = {"side": side_raw, "qty": final_qty, "entry_price": entry_price_dec}
+        # Local cache for speed
+        BOT_POSITIONS[(bot_id, symbol)] = {
+            "side": side_raw,
+            "qty": final_qty,
+            "entry_price": entry_price_dec,
+        }
 
-        if entry_price_dec is not None and final_qty > 0:
-            try:
-                record_entry(
-                    bot_id=bot_id,
-                    symbol=symbol,
-                    side=side_raw,
-                    qty=final_qty,
-                    price=entry_price_dec,
-                    reason="strategy_entry_fill",
-                )
-            except Exception as e:
-                print("[PNL] record_entry error:", e)
-
-        # Ladder SL/lock state (bot-side only; no exchange protective orders)
-        direction = "LONG" if side_raw == "BUY" else "SHORT"
-        if _bot_uses_ladder(bot_id, direction) and entry_price_dec is not None and final_qty > 0:
-            try:
-                cfg = _get_ladder_cfg(bot_id, direction)
-                base_sl = (cfg or {}).get("base_sl_pct")
-                if isinstance(base_sl, Decimal) and base_sl > 0:
-                    set_lock_level_pct(bot_id, symbol, direction, -base_sl)
-            except Exception as e:
-                print("[LADDER] set base lock failed:", e)
-
-        resp = {
+        return jsonify({
             "status": "ok",
             "mode": "entry",
             "bot_id": bot_id,
             "symbol": symbol,
             "side": side_raw,
             "qty": str(final_qty),
-            "entry_price": str(entry_price_dec) if entry_price_dec else None,
-            "requested_qty": size_str,
-            "order_status": status,
-            "cancel_reason": cancel_reason,
-            "order_id": order_id,
-            "client_order_id": client_order_id,
+            "entry_price": str(entry_price_dec),
+            "forced_flip": forced_flip,
+            **(flip_summary or {}),
             "signal_id": sig_id,
-        }
-
-        if forced_flip:
-            resp["forced_flip"] = True
-            if isinstance(flip_summary, dict) and flip_summary:
-                resp.update(flip_summary)
-
-        return jsonify(resp), 200
-
+        }), 200
 
     # -------------------------
-    # EXIT（策略出场 / TV 出场）
+    # EXIT
     # -------------------------
-    if mode == "exit":
-        # ✅ Guard marker: block immediate CLOSE->OPEN on the same symbol
+    else:
+        # Mark this symbol as just-exited (for CLOSE->OPEN guard)
         _mark_symbol_exit(symbol, tv_client_id=str(tv_client_id or ""))
-        payload = _execute_exit_order(
-            bot_id,
-            symbol,
+
+        # Determine direction hint from side if provided
+        direction_hint = ""
+        if side_raw == "BUY":
+            direction_hint = "SHORT"  # buy to close short
+        elif side_raw == "SELL":
+            direction_hint = "LONG"   # sell to close long
+
+        res = _execute_exit_order(
+            bot_id=bot_id,
+            symbol=symbol,
+            force_direction=direction_hint,
             ignore_cooldown=False,
             reason="strategy_exit",
             sig_id=sig_id,
         )
-        return jsonify(payload), 200
-
-    return "unsupported mode", 400
+        res["signal_id"] = sig_id
+        return jsonify(res), 200
 
 
 if __name__ == "__main__":
-    _ensure_monitor_thread()
-    port = int(os.getenv("PORT", "8080"))
-    app.run(host="0.0.0.0", port=port)
+    # Local dev only; production should use gunicorn
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
