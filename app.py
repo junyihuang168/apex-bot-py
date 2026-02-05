@@ -35,6 +35,10 @@ from pnl_store import (
     clear_lock_level_pct,
     is_signal_processed,
     mark_signal_processed,
+    record_trade_event,
+    list_trade_events,
+    realized_pnl_by_window,
+
 )
 
 app = Flask(__name__)
@@ -340,6 +344,29 @@ def _get_ladder_cfg(bot_id: str, direction: str) -> Optional[dict]:
         if d == "SHORT" and b in cfg["short_bots"]:
             return cfg
     return None
+
+
+def _serialize_ladder_cfg(cfg: Optional[dict]) -> Optional[dict]:
+    if not cfg:
+        return None
+    out = {
+        "name": cfg.get("name"),
+        "mode": str(cfg.get("mode", "ladder")),
+        "base_sl_pct": str(cfg.get("base_sl_pct")) if cfg.get("base_sl_pct") is not None else None,
+    }
+    levels = cfg.get("levels") or []
+    out["levels"] = [[str(p), str(l)] for (p, l) in levels]
+    # cycle23 extras (optional)
+    for k in (
+        "stage1_profit", "stage1_lock", "cycle_stage2_start", "cycle_stage3_start", "cycle_step",
+        "stage2_lock_ratio", "stage3_trail_gap",
+    ):
+        if k in cfg:
+            try:
+                out[k] = str(cfg.get(k))
+            except Exception:
+                out[k] = cfg.get(k)
+    return out
 
 
 def _all_ladder_bots() -> Set[str]:
@@ -970,7 +997,7 @@ def _execute_exit_order(
         return {"status": "fill_unavailable", "mode": "exit", "bot_id": bot_id, "symbol": symbol, "signal_id": sig_id}
 
     try:
-        record_exit_fifo(
+        out = record_exit_fifo(
             bot_id=bot_id,
             symbol=symbol,
             entry_side=entry_side,
@@ -978,6 +1005,21 @@ def _execute_exit_order(
             exit_price=exit_price,
             reason=reason,
         )
+        try:
+            direction = "LONG" if str(entry_side).upper() == "BUY" else "SHORT"
+            realized_sum = Decimal(str((out or {}).get("realized_sum", "0")))
+            record_trade_event(
+                bot_id=bot_id,
+                symbol=symbol,
+                direction=direction,
+                event_type="EXIT",
+                qty=filled_qty,
+                exit_price=exit_price,
+                realized_pnl=realized_sum,
+                reason=reason,
+            )
+        except Exception as _e:
+            print("[DASH] record_trade_event EXIT error:", _e)
     except Exception as e:
         print("[PNL] record_exit_fifo error:", e)
 
@@ -1283,7 +1325,7 @@ def _ladder_close_position(bot_id: str, symbol: str, direction: str, qty: Decima
         return
 
     try:
-        record_exit_fifo(
+        out = record_exit_fifo(
             bot_id=bot_id,
             symbol=symbol,
             entry_side=entry_side,
@@ -1291,6 +1333,20 @@ def _ladder_close_position(bot_id: str, symbol: str, direction: str, qty: Decima
             exit_price=exit_price,
             reason=reason,
         )
+        try:
+            realized_sum = Decimal(str((out or {}).get("realized_sum", "0")))
+            record_trade_event(
+                bot_id=bot_id,
+                symbol=symbol,
+                direction=direction,
+                event_type="EXIT",
+                qty=filled_qty,
+                exit_price=exit_price,
+                realized_pnl=realized_sum,
+                reason=reason,
+            )
+        except Exception as _e:
+            print("[DASH] record_trade_event LADDER EXIT error:", _e)
     except Exception as e:
         print("[LADDER] record_exit_fifo error:", e)
 
@@ -1346,10 +1402,37 @@ def _risk_loop():
                         continue
 
                     profit_pct = _compute_profit_pct(direction, entry, ref_price)
+                    old_lock = None
+                    try:
+                        old_lock = get_lock_level_pct(bot_id, symbol, direction)
+                    except Exception:
+                        old_lock = None
+
                     lock_pct = _maybe_raise_lock(bot_id, symbol, direction, profit_pct)
                     if lock_pct is None:
                         continue
                     stop_price = _compute_stop_price(direction, entry, Decimal(str(lock_pct)))
+
+                    # Dashboard event on lock change
+                    try:
+                        new_lock = Decimal(str(lock_pct))
+                        old_lock_dec = Decimal(str(old_lock)) if old_lock is not None else None
+                        if old_lock_dec is None or new_lock != old_lock_dec:
+                            record_trade_event(
+                                bot_id=bot_id,
+                                symbol=symbol,
+                                direction=direction,
+                                event_type="STOP_UPDATE",
+                                qty=qty,
+                                entry_price=entry,
+                                stop_price=stop_price,
+                                lock_level_pct=new_lock,
+                                reason="lock_update",
+                            )
+                    except Exception as _e:
+                        if LADDER_DEBUG:
+                            print("[DASH] record_trade_event STOP_UPDATE error:", _e)
+
 
                     if LADDER_DEBUG:
                         try:
@@ -1511,6 +1594,147 @@ def api_pnl():
     out.sort(key=_rt, reverse=True)
     return jsonify({"ts": int(time.time()), "bots": out}), 200
 
+@app.route("/api/live", methods=["GET"])
+def api_live():
+    if not _require_token():
+        return jsonify({"error": "forbidden"}), 403
+
+    _ensure_monitor_thread()
+
+    bot_id = request.args.get("bot_id")
+    limit = int(request.args.get("limit") or 50)
+    days = int(request.args.get("days") or 7)
+
+    try:
+        events = list_trade_events(
+            bot_id=_canon_bot_id(bot_id) if bot_id else None,
+            limit=limit,
+            days=days,
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({"ts": int(time.time()), "events": events}), 200
+
+
+@app.route("/api/pnl_detail", methods=["GET"])
+def api_pnl_detail():
+    if not _require_token():
+        return jsonify({"error": "forbidden"}), 403
+
+    _ensure_monitor_thread()
+
+    bot_id = request.args.get("bot_id")
+    window = str(request.args.get("window") or "7d").lower().strip()
+    windows = {
+        "24h": 24 * 3600,
+        "1d": 24 * 3600,
+        "3d": 3 * 24 * 3600,
+        "7d": 7 * 24 * 3600,
+        "30d": 30 * 24 * 3600,
+    }
+    sec = windows.get(window, 7 * 24 * 3600)
+
+    try:
+        out = realized_pnl_by_window(sec, bot_id=_canon_bot_id(bot_id) if bot_id else None)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({"ts": int(time.time()), **out}), 200
+
+
+@app.route("/api/risk_config", methods=["GET"])
+def api_risk_config():
+    if not _require_token():
+        return jsonify({"error": "forbidden"}), 403
+
+    _ensure_monitor_thread()
+
+    rows = []
+    for i in range(1, 41):
+        b = f"BOT_{i}"
+        long_cfg = _get_ladder_cfg(b, "LONG")
+        short_cfg = _get_ladder_cfg(b, "SHORT")
+        rows.append({
+            "bot_id": b,
+            "long": _serialize_ladder_cfg(long_cfg) if long_cfg else None,
+            "short": _serialize_ladder_cfg(short_cfg) if short_cfg else None,
+        })
+
+    return jsonify({"ts": int(time.time()), "bots": rows}), 200
+
+@app.route("/api/live", methods=["GET"])
+def api_live():
+    if not _require_token():
+        return jsonify({"error": "forbidden"}), 403
+
+    _ensure_monitor_thread()
+
+    bot_id = request.args.get("bot_id")
+    limit = int(request.args.get("limit") or 50)
+    days = int(request.args.get("days") or 7)
+
+    try:
+        events = list_trade_events(bot_id=_canon_bot_id(bot_id) if bot_id else None, limit=limit, days=days)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({"ts": int(time.time()), "events": events}), 200
+
+
+@app.route("/api/pnl_detail", methods=["GET"])
+def api_pnl_detail():
+    if not _require_token():
+        return jsonify({"error": "forbidden"}), 403
+
+    _ensure_monitor_thread()
+
+    bot_id = request.args.get("bot_id")
+    window = str(request.args.get("window") or "7d").lower().strip()
+    win_map = {"24h": 86400, "1d": 86400, "3d": 3*86400, "7d": 7*86400, "30d": 30*86400}
+    window_sec = win_map.get(window, 7*86400)
+
+    try:
+        out = realized_pnl_by_window(window_sec, bot_id=_canon_bot_id(bot_id) if bot_id else None)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({"ts": int(time.time()), **out}), 200
+
+
+@app.route("/api/risk_config", methods=["GET"])
+def api_risk_config():
+    if not _require_token():
+        return jsonify({"error": "forbidden"}), 403
+
+    _ensure_monitor_thread()
+
+    bots = []
+    for i in range(1, 41):
+        bot = f"BOT_{i}"
+        long_cfg = _get_ladder_cfg(bot, "LONG")
+        short_cfg = _get_ladder_cfg(bot, "SHORT")
+
+        def _fmt_cfg(cfg):
+            if not cfg:
+                return None
+            levels = cfg.get("levels") or []
+            return {
+                "name": cfg.get("name"),
+                "mode": cfg.get("mode", "ladder"),
+                "base_sl_pct": str(cfg.get("base_sl_pct", "0")),
+                "levels": [[str(a), str(b)] for (a, b) in levels],
+            }
+
+        bots.append({
+            "bot_id": bot,
+            "long": _fmt_cfg(long_cfg),
+            "short": _fmt_cfg(short_cfg),
+        })
+
+    return jsonify({"ts": int(time.time()), "bots": bots}), 200
+
+
 
 @app.route("/dashboard", methods=["GET"])
 def dashboard():
@@ -1633,6 +1857,81 @@ def dashboard():
         </div>
       </div>
 
+      <div class="grid">
+        <div class="card">
+          <div class="row" style="align-items:center; justify-content:space-between">
+            <div style="font-weight:700">Live feed (last 7d)</div>
+            <div class="sub">Shows ENTRY / STOP_UPDATE / EXIT. Newest on top.</div>
+          </div>
+          <div class="tableWrap" style="margin-top:8px;">
+            <table style="min-width:860px;">
+              <thead>
+                <tr>
+                  <th>time (PT)</th>
+                  <th>bot</th>
+                  <th>symbol</th>
+                  <th>dir</th>
+                  <th>event</th>
+                  <th>entry</th>
+                  <th>stop</th>
+                  <th>exit</th>
+                  <th>realized</th>
+                  <th>reason</th>
+                </tr>
+              </thead>
+              <tbody id="live_body">
+                <tr><td colspan="10" class="sub">Loading…</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="row" style="align-items:center; justify-content:space-between">
+            <div style="font-weight:700">PnL detail</div>
+            <div class="row" style="gap:10px; align-items:center">
+              <label class="sub" style="margin:0">Window</label>
+              <select id="window" class="small" style="width:110px">
+                <option value="24h">24h</option>
+                <option value="3d">3d</option>
+                <option value="7d" selected>7d</option>
+                <option value="30d">30d</option>
+              </select>
+            </div>
+          </div>
+          <div style="display:flex; gap:14px; margin-top:10px; flex-wrap:wrap">
+            <div class="card" style="flex:1; min-width:220px">
+              <div class="k">Realized (window)</div>
+              <div class="v" id="d_realized">—</div>
+            </div>
+            <div class="card" style="flex:1; min-width:220px">
+              <div class="k">Trades (window)</div>
+              <div class="v" id="d_trades">—</div>
+            </div>
+          </div>
+
+          <div style="height:12px"></div>
+
+          <details>
+            <summary>Risk config (which bots have SL / ladder)</summary>
+            <div class="tableWrap" style="margin-top:10px;">
+              <table style="min-width:860px;">
+                <thead>
+                  <tr>
+                    <th>bot</th>
+                    <th>long</th>
+                    <th>short</th>
+                  </tr>
+                </thead>
+                <tbody id="risk_body">
+                  <tr><td colspan="3" class="sub">Loading…</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </details>
+        </div>
+      </div>
+
       <div class="card">
         <details>
           <summary>Quick links</summary>
@@ -1731,6 +2030,11 @@ def dashboard():
           : `HTTP ${res.status}`;
         setErr(hint + (data ? ('\\n' + JSON.stringify(data, null, 2)) : ''));
         return;
+      // update extra panels
+      fetchLive();
+      fetchDetail();
+      fetchRisk();
+
       }
 
       const bots = (data && data.bots) ? data.bots : [];
@@ -1809,6 +2113,125 @@ def dashboard():
     }
 
     function setAutoRefresh() {
+
+    const ptTime = (ts) => {
+      if (!ts) return '';
+      try {
+        return new Date(Number(ts) * 1000).toLocaleString([], { timeZone: 'America/Los_Angeles' });
+      } catch(e) {
+        return new Date(Number(ts) * 1000).toLocaleString();
+      }
+    };
+
+    async function fetchLive() {
+      const token = (tokenEl.value || '').trim();
+      const bot = (botEl.value || '').trim();
+      const url = new URL('/api/live', location.origin);
+      url.searchParams.set('days', '7');
+      url.searchParams.set('limit', '50');
+      if (bot) url.searchParams.set('bot_id', bot);
+      if (token) url.searchParams.set('token', token);
+
+      const tbody = el('live_body');
+      try {
+        const res = await fetch(url.toString(), { method: 'GET' });
+        const data = await res.json();
+        if (!res.ok) throw new Error(JSON.stringify(data));
+
+        const events = Array.isArray(data.events) ? data.events : [];
+        tbody.innerHTML = '';
+        if (!events.length) {
+          const tr = document.createElement('tr');
+          tr.innerHTML = `<td colspan="10" class="sub">No events in range.</td>`;
+          tbody.appendChild(tr);
+          return;
+        }
+
+        for (const ev of events) {
+          const tr = document.createElement('tr');
+          const realized = ev.realized_pnl === null || ev.realized_pnl === undefined ? '' : fmt(ev.realized_pnl);
+          tr.innerHTML = `
+            <td>${ptTime(ev.ts)}</td>
+            <td>${ev.bot_id || ''}</td>
+            <td>${ev.symbol || ''}</td>
+            <td>${ev.direction || ''}</td>
+            <td>${ev.event_type || ''}</td>
+            <td>${ev.entry_price || ''}</td>
+            <td>${ev.stop_price || ''}</td>
+            <td>${ev.exit_price || ''}</td>
+            <td class="${clsPNL(ev.realized_pnl)}">${realized}</td>
+            <td>${ev.reason || ''}</td>
+          `;
+          tbody.appendChild(tr);
+        }
+      } catch(e) {
+        tbody.innerHTML = `<tr><td colspan="10" class="sub">Live feed error: ${String(e)}</td></tr>`;
+      }
+    }
+
+    async function fetchDetail() {
+      const token = (tokenEl.value || '').trim();
+      const bot = (botEl.value || '').trim();
+      const windowSel = el('window');
+      const win = windowSel ? (windowSel.value || '7d') : '7d';
+
+      const url = new URL('/api/pnl_detail', location.origin);
+      url.searchParams.set('window', win);
+      if (bot) url.searchParams.set('bot_id', bot);
+      if (token) url.searchParams.set('token', token);
+
+      try {
+        const res = await fetch(url.toString(), { method: 'GET' });
+        const data = await res.json();
+        if (!res.ok) throw new Error(JSON.stringify(data));
+
+        el('d_realized').textContent = fmt(data.realized || 0);
+        el('d_realized').className = 'v ' + clsPNL(data.realized || 0);
+        el('d_trades').textContent = String(data.trades ?? 0);
+      } catch(e) {
+        el('d_realized').textContent = '—';
+        el('d_trades').textContent = '—';
+      }
+    }
+
+    async function fetchRisk() {
+      const token = (tokenEl.value || '').trim();
+      const url = new URL('/api/risk_config', location.origin);
+      if (token) url.searchParams.set('token', token);
+
+      const tbody = el('risk_body');
+      try {
+        const res = await fetch(url.toString(), { method: 'GET' });
+        const data = await res.json();
+        if (!res.ok) throw new Error(JSON.stringify(data));
+
+        const bots = Array.isArray(data.bots) ? data.bots : [];
+        tbody.innerHTML = '';
+
+        const describe = (cfg) => {
+          if (!cfg) return '<span class="sub">none</span>';
+          const levels = Array.isArray(cfg.levels) ? cfg.levels.length : 0;
+          const base = cfg.base_sl_pct === null || cfg.base_sl_pct === undefined ? '' : `${cfg.base_sl_pct}%`;
+          return `<span class="pill">${cfg.name || 'cfg'}</span> <span class="sub">mode=${cfg.mode} baseSL=${base} levels=${levels}</span>`;
+        };
+
+        for (const b of bots) {
+          const tr = document.createElement('tr');
+          tr.innerHTML = `
+            <td>${b.bot_id || ''}</td>
+            <td>${describe(b.long)}</td>
+            <td>${describe(b.short)}</td>
+          `;
+          tbody.appendChild(tr);
+        }
+      } catch(e) {
+        tbody.innerHTML = `<tr><td colspan="3" class="sub">Risk config error: ${String(e)}</td></tr>`;
+      }
+    }
+
+    const windowEl = el('window');
+    if (windowEl) windowEl.addEventListener('change', () => { fetchDetail(); });
+
       if (timer) { clearInterval(timer); timer = null; }
       const sec = Number(refreshEl.value || 0);
       if (sec > 0) timer = setInterval(fetchPnL, sec * 1000);
@@ -2222,6 +2645,31 @@ def tv_webhook():
             )
         except Exception as e:
             print("[PNL] record_entry error:", e)
+
+        # Record dashboard event (ENTRY)
+        try:
+            direction = "LONG" if side_raw == "BUY" else "SHORT"
+            cfg = _get_ladder_cfg(bot_id, direction)
+            lock_pct = None
+            stop_price = None
+            if cfg and cfg.get("base_sl_pct") is not None:
+                base_sl = Decimal(str(cfg.get("base_sl_pct")))
+                lock_pct = -base_sl
+                stop_price = _compute_stop_price(direction, entry_price_dec, lock_pct)
+
+            record_trade_event(
+                bot_id=bot_id,
+                symbol=symbol,
+                direction=direction,
+                event_type="ENTRY",
+                qty=final_qty,
+                entry_price=entry_price_dec,
+                stop_price=stop_price,
+                lock_level_pct=lock_pct,
+                reason="webhook_entry",
+            )
+        except Exception as e:
+            print("[DASH] record_trade_event ENTRY error:", e)
 
         # Local cache for speed
         BOT_POSITIONS[(bot_id, symbol)] = {
