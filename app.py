@@ -1714,7 +1714,13 @@ def dashboard():
     details { border:1px solid var(--line); border-radius:12px; padding:10px; background:#0f1730; }
     summary { cursor:pointer; font-weight: 700; }
     .pill { display:inline-block; padding:2px 8px; border-radius: 999px; border:1px solid var(--line); color:var(--muted); font-size:12px; }
-  </style>
+  
+    .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:700;letter-spacing:.2px}
+    .badgeLadder{background:rgba(62,240,176,.08);color:#3ef0b0;border:1px solid rgba(62,240,176,.25)}
+    .badgeFixed{background:rgba(255,212,94,.08);color:#ffd45e;border:1px solid rgba(255,212,94,.25)}
+    .badgeCycle{background:rgba(215,166,255,.08);color:#d7a6ff;border:1px solid rgba(215,166,255,.25)}
+    .badgeNone{background:rgba(255,255,255,.06);color:var(--muted);border:1px solid rgba(255,255,255,.10)}
+</style>
 </head>
 <body>
   <div class="wrap">
@@ -1845,16 +1851,22 @@ def dashboard():
           <details>
             <summary>Risk config (which bots have SL / ladder)</summary>
             <div class="tableWrap" style="margin-top:10px;">
-              <table style="min-width:860px;">
+              <table style="min-width:1100px;">
                 <thead>
                   <tr>
                     <th>bot</th>
-                    <th>long</th>
-                    <th>short</th>
+                    <th>LONG type</th>
+                    <th>LONG initial SL</th>
+                    <th>LONG rules</th>
+                    <th>LONG infinite</th>
+                    <th>SHORT type</th>
+                    <th>SHORT initial SL</th>
+                    <th>SHORT rules</th>
+                    <th>SHORT infinite</th>
                   </tr>
                 </thead>
                 <tbody id="risk_body">
-                  <tr><td colspan="3" class="sub">Loading…</td></tr>
+                  <tr><td colspan="9" class="sub">Loading…</td></tr>
                 </tbody>
               </table>
             </div>
@@ -2130,6 +2142,79 @@ def dashboard():
       if (token) url.searchParams.set('token', token);
 
       const tbody = el('risk_body');
+
+      const pct = (x) => {
+        if (x === null || x === undefined || x === '') return '';
+        const n = Number(x);
+        if (Number.isNaN(n)) return String(x) + '%';
+        return n.toFixed(2) + '%';
+      };
+
+      const renderCfg = (cfg) => {
+        if (!cfg) {
+          return {
+            typeHtml: `<span class="badge badgeNone">NONE</span>`,
+            initial: '—',
+            rules: '—',
+            infinite: '—'
+          };
+        }
+
+        const mode = String(cfg.mode || 'ladder').toLowerCase();
+        const name = String(cfg.name || '').trim();
+        const base = pct(cfg.base_sl_pct);
+        const levels = Array.isArray(cfg.levels) ? cfg.levels : [];
+
+        const lvlPairs = levels
+          .map(p => Array.isArray(p) ? p : [])
+          .filter(p => p.length >= 2)
+          .map(p => [Number(p[0]), Number(p[1])])
+          .filter(p => !Number.isNaN(p[0]) && !Number.isNaN(p[1]))
+          .sort((a,b) => a[0]-b[0]);
+
+        let typeHtml = '';
+        if (mode === 'fixed') typeHtml = `<span class="badge badgeFixed">FIXED</span>`;
+        else if (mode === 'cycle23') typeHtml = `<span class="badge badgeCycle">CYCLE</span>`;
+        else typeHtml = `<span class="badge badgeLadder">LADDER</span>`;
+
+        let rules = '';
+        if (mode === 'fixed') {
+          rules = `Hard stop only`;
+        } else if (mode === 'cycle23') {
+          const s1 = lvlPairs[0];
+          const s2 = lvlPairs[1];
+          const s3 = lvlPairs[2];
+          const a = s1 ? `${s1[0].toFixed(2)}→${s1[1].toFixed(2)}` : '—';
+          const b = s2 ? `${s2[0].toFixed(2)}→${s2[1].toFixed(2)}` : '—';
+          const c = s3 ? `${s3[0].toFixed(2)}→${s3[1].toFixed(2)}` : '—';
+          rules = `Stage1 ${a}; Stage2 ${b}; Stage3 ${c} (repeat)`;
+        } else {
+          rules = lvlPairs.length
+            ? lvlPairs.map(x => `${x[0].toFixed(2)}→${x[1].toFixed(2)}`).join(', ')
+            : '—';
+        }
+
+        let infinite = '—';
+        if (mode === 'cycle23') {
+          infinite = '🔁 cycle';
+        } else if (mode === 'fixed') {
+          infinite = 'no';
+        } else if (lvlPairs.length >= 1) {
+          const last = lvlPairs[lvlPairs.length - 1];
+          const gap = last[0] - last[1];
+          infinite = (!Number.isNaN(gap) && gap > 0)
+            ? `yes (lock=profit-${gap.toFixed(2)}%)`
+            : 'yes';
+        }
+
+        return {
+          typeHtml: `${typeHtml}${name ? ` <span class="sub">(${name})</span>` : ''}`,
+          initial: base ? `-${base}` : '—',
+          rules: `<span class="mono">${rules}</span>`,
+          infinite
+        };
+      };
+
       try {
         const res = await fetch(url.toString(), { method: 'GET' });
         const data = await res.json();
@@ -2138,24 +2223,33 @@ def dashboard():
         const bots = Array.isArray(data.bots) ? data.bots : [];
         tbody.innerHTML = '';
 
-        const describe = (cfg) => {
-          if (!cfg) return '<span class="sub">none</span>';
-          const levels = Array.isArray(cfg.levels) ? cfg.levels.length : 0;
-          const base = cfg.base_sl_pct === null || cfg.base_sl_pct === undefined ? '' : `${cfg.base_sl_pct}%`;
-          return `<span class="pill">${cfg.name || 'cfg'}</span> <span class="sub">mode=${cfg.mode} baseSL=${base} levels=${levels}</span>`;
-        };
+        if (!bots.length) {
+          tbody.innerHTML = `<tr><td colspan="9" class="sub">No risk config returned.</td></tr>`;
+          return;
+        }
 
         for (const b of bots) {
+          const L = renderCfg(b.long);
+          const S = renderCfg(b.short);
+
           const tr = document.createElement('tr');
           tr.innerHTML = `
-            <td>${b.bot_id || ''}</td>
-            <td>${describe(b.long)}</td>
-            <td>${describe(b.short)}</td>
+            <td class="mono">${b.bot_id || ''}</td>
+
+            <td>${L.typeHtml}</td>
+            <td class="mono">${L.initial}</td>
+            <td>${L.rules}</td>
+            <td class="mono">${L.infinite}</td>
+
+            <td>${S.typeHtml}</td>
+            <td class="mono">${S.initial}</td>
+            <td>${S.rules}</td>
+            <td class="mono">${S.infinite}</td>
           `;
           tbody.appendChild(tr);
         }
       } catch(e) {
-        tbody.innerHTML = `<tr><td colspan="3" class="sub">Risk config error: ${String(e)}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="9" class="sub">Risk config error: ${String(e)}</td></tr>`;
       }
     }
 
