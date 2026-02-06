@@ -1663,6 +1663,76 @@ def api_risk_config():
 
     return jsonify({"ts": int(time.time()), "bots": rows}), 200
 
+@app.route("/api/live", methods=["GET"])
+def api_live():
+    if not _require_token():
+        return jsonify({"error": "forbidden"}), 403
+
+    _ensure_monitor_thread()
+
+    bot_id = request.args.get("bot_id")
+    limit = int(request.args.get("limit") or 50)
+    days = int(request.args.get("days") or 7)
+
+    try:
+        events = list_trade_events(bot_id=_canon_bot_id(bot_id) if bot_id else None, limit=limit, days=days)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({"ts": int(time.time()), "events": events}), 200
+
+
+@app.route("/api/pnl_detail", methods=["GET"])
+def api_pnl_detail():
+    if not _require_token():
+        return jsonify({"error": "forbidden"}), 403
+
+    _ensure_monitor_thread()
+
+    bot_id = request.args.get("bot_id")
+    window = str(request.args.get("window") or "7d").lower().strip()
+    win_map = {"24h": 86400, "1d": 86400, "3d": 3*86400, "7d": 7*86400, "30d": 30*86400}
+    window_sec = win_map.get(window, 7*86400)
+
+    try:
+        out = realized_pnl_by_window(window_sec, bot_id=_canon_bot_id(bot_id) if bot_id else None)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({"ts": int(time.time()), **out}), 200
+
+
+@app.route("/api/risk_config", methods=["GET"])
+def api_risk_config():
+    if not _require_token():
+        return jsonify({"error": "forbidden"}), 403
+
+    _ensure_monitor_thread()
+
+    bots = []
+    for i in range(1, 41):
+        bot = f"BOT_{i}"
+        long_cfg = _get_ladder_cfg(bot, "LONG")
+        short_cfg = _get_ladder_cfg(bot, "SHORT")
+
+        def _fmt_cfg(cfg):
+            if not cfg:
+                return None
+            levels = cfg.get("levels") or []
+            return {
+                "name": cfg.get("name"),
+                "mode": cfg.get("mode", "ladder"),
+                "base_sl_pct": str(cfg.get("base_sl_pct", "0")),
+                "levels": [[str(a), str(b)] for (a, b) in levels],
+            }
+
+        bots.append({
+            "bot_id": bot,
+            "long": _fmt_cfg(long_cfg),
+            "short": _fmt_cfg(short_cfg),
+        })
+
+    return jsonify({"ts": int(time.time()), "bots": bots}), 200
 
 
 
@@ -2568,11 +2638,10 @@ def tv_webhook():
             record_entry(
                 bot_id=bot_id,
                 symbol=symbol,
-                entry_side=side_raw,
+                side=side_raw,
                 qty=final_qty,
-                entry_price=entry_price_dec,
-                client_order_id=client_order_id or entry_client_id,
-            )
+                price=entry_price_dec,
+)
         except Exception as e:
             print("[PNL] record_entry error:", e)
 
