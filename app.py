@@ -1666,6 +1666,179 @@ def api_risk_config():
 
 
 
+
+@app.route("/risk", methods=["GET"])
+def risk_page():
+    # Full-page Risk Overview (table) for quick inspection.
+    # Uses the same DASHBOARD_TOKEN protection as other /api/* endpoints when configured.
+    html = r"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Bot Risk Overview</title>
+  <style>
+    :root{
+      --bg:#070b14; --card:#0c1222; --card2:#0e1730; --txt:#e7e9ee; --sub:#98a2b3;
+      --line:rgba(255,255,255,.08); --good:#22c55e; --warn:#f59e0b; --bad:#ef4444; --pri:#3b82f6;
+    }
+    *{ box-sizing:border-box; }
+    body{ margin:0; font-family: ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial; background: radial-gradient(1200px 600px at 10% 10%, #0f1a3a 0%, var(--bg) 55%); color:var(--txt); }
+    a{ color:inherit; }
+    .wrap{ max-width:1200px; margin:22px auto; padding:0 14px; }
+    .top{ display:flex; gap:10px; align-items:center; justify-content:space-between; margin-bottom:14px; }
+    .title{ font-weight:800; letter-spacing:.2px; font-size:18px; }
+    .bar{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; padding:10px; border:1px solid var(--line); background:rgba(12,18,34,.75); border-radius:14px; }
+    .bar label{ font-size:12px; color:var(--sub); display:block; margin-bottom:4px;}
+    .bar input{ width:260px; padding:10px 12px; border-radius:12px; border:1px solid var(--line); background:rgba(0,0,0,.35); color:var(--txt); outline:none; }
+    .btn{ padding:10px 12px; border-radius:12px; border:1px solid var(--line); background:rgba(0,0,0,.25); color:var(--txt); cursor:pointer; font-weight:700; }
+    .btn.primary{ background:rgba(59,130,246,.18); border-color:rgba(59,130,246,.35); }
+    .btn.ghost{ background:transparent; }
+    .hint{ color:var(--sub); font-size:12px; }
+    .card{ margin-top:14px; padding:14px; border:1px solid var(--line); background:rgba(12,18,34,.65); border-radius:16px; overflow:auto; }
+    table{ width:100%; border-collapse:separate; border-spacing:0; min-width:980px; }
+    th, td{ padding:10px 10px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }
+    th{ position:sticky; top:0; background:rgba(10,16,32,.95); z-index:2; font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:var(--sub); }
+    tr:hover td{ background:rgba(255,255,255,.03); }
+    .pill{ display:inline-flex; align-items:center; gap:6px; padding:4px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); background:rgba(0,0,0,.2); }
+    .pill.good{ border-color:rgba(34,197,94,.35); background:rgba(34,197,94,.12); }
+    .pill.warn{ border-color:rgba(245,158,11,.35); background:rgba(245,158,11,.12); }
+    .pill.bad{ border-color:rgba(239,68,68,.35); background:rgba(239,68,68,.10); }
+    .mono{ font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,'Liberation Mono','Courier New',monospace; font-size:12px; color:#c9d1e8; }
+    .sub{ color:var(--sub); font-size:12px; }
+    .right{ display:flex; gap:10px; align-items:center; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <div>
+        <div class="title">Bot Risk Overview</div>
+        <div class="hint">Shows each bot's fixed SL and ladder/trailing rules. Token is required if DASHBOARD_TOKEN is set.</div>
+      </div>
+      <div class="right">
+        <button class="btn ghost" id="back">← Back</button>
+        <button class="btn primary" id="reload">Reload</button>
+      </div>
+    </div>
+
+    <div class="bar">
+      <div>
+        <label>Token (optional; required if DASHBOARD_TOKEN is set)</label>
+        <input id="token" placeholder="paste DASHBOARD_TOKEN" />
+      </div>
+      <div class="sub" id="status">Idle.</div>
+    </div>
+
+    <div class="card">
+      <table>
+        <thead>
+          <tr>
+            <th>Bot</th>
+            <th>Long SL</th>
+            <th>Long Ladder / Rule</th>
+            <th>Short SL</th>
+            <th>Short Ladder / Rule</th>
+          </tr>
+        </thead>
+        <tbody id="rows">
+          <tr><td colspan="5" class="sub">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+<script>
+  const TOKEN_KEY = 'apex_pnl_token';
+  const el = (id)=>document.getElementById(id);
+
+  function saveToken(t){ try{ localStorage.setItem(TOKEN_KEY, t||''); }catch(e){} }
+  function loadToken(){ try{ return localStorage.getItem(TOKEN_KEY)||''; }catch(e){ return ''; } }
+
+  function pill(kind, text){
+    const cls = kind==='ladder' ? 'good' : (kind==='cycle' ? 'warn' : (kind==='fixed' ? 'sub' : 'bad'));
+    return `<span class="pill ${cls}">${text}</span>`;
+  }
+
+  function summarize(cfg){
+    if(!cfg) return {sl:'—', rule:'—', kind:'none'};
+    const mode = (cfg.mode || 'ladder');
+    const base = cfg.base_sl_pct ? `-${cfg.base_sl_pct}%` : '—';
+    if(mode==='fixed'){
+      return {sl: base, rule: 'Fixed SL only', kind:'fixed'};
+    }
+    if(mode==='cycle23'){
+      // show known cycle style (your design)
+      return {sl: base, rule: 'Cycle23: 0.8→BE, 2.0→+1.2, 4.0→trail(0.5%) (loop)', kind:'cycle'};
+    }
+    // ladder
+    const lv = Array.isArray(cfg.levels) ? cfg.levels : [];
+    const parts = lv.map(p=> `${p[0]}→${p[1]}`).join(' / ');
+    const last = (lv.length>=1) ? lv[lv.length-1] : null;
+    let inf = '';
+    if(last){
+      const gap = (Number(last[0]) - Number(last[1]));
+      if(!Number.isNaN(gap) && gap>0) inf = ` (∞ tail: lock=profit-${gap.toFixed(2)} )`;
+    }
+    return {sl: base, rule: (parts||'Ladder') + inf, kind:'ladder'};
+  }
+
+  async function fetchRisk(){
+    const tok = (el('token').value||'').trim() || loadToken();
+    if(tok) saveToken(tok);
+    const url = new URL(window.location.origin + '/api/risk_config');
+    if(tok) url.searchParams.set('token', tok);
+    el('status').textContent = 'Loading...';
+    let res;
+    try{ res = await fetch(url.toString(), {method:'GET'}); }catch(e){
+      el('status').textContent = 'Network error';
+      el('rows').innerHTML = `<tr><td colspan="5" class="sub">${String(e)}</td></tr>`;
+      return;
+    }
+    let data=null;
+    try{ data = await res.json(); }catch(e){}
+    if(!res.ok){
+      const msg = (res.status===403) ? '403 Forbidden (Token required)' : (`HTTP ${res.status}`);
+      el('status').textContent = msg;
+      el('rows').innerHTML = `<tr><td colspan="5" class="sub">${msg}</td></tr>`;
+      return;
+    }
+
+    const bots = (data && data.bots) ? data.bots : [];
+    const rows = bots.map(b=>{
+      const bot = b.bot_id;
+      const l = summarize(b.long);
+      const s = summarize(b.short);
+      return `
+        <tr>
+          <td class="mono">${bot}</td>
+          <td>${l.sl}</td>
+          <td>${l.kind==='none' ? '—' : pill(l.kind, l.rule)}</td>
+          <td>${s.sl}</td>
+          <td>${s.kind==='none' ? '—' : pill(s.kind, s.rule)}</td>
+        </tr>`;
+    }).join('');
+    el('rows').innerHTML = rows || `<tr><td colspan="5" class="sub">No data.</td></tr>`;
+    el('status').textContent = `Loaded ${bots.length} bots.`;
+  }
+
+  el('reload').addEventListener('click', fetchRisk);
+  el('back').addEventListener('click', ()=>{ window.location.href='/dashboard' + (loadToken()?`?token=${encodeURIComponent(loadToken())}`:''); });
+
+  // init token from query or localStorage
+  const qs = new URLSearchParams(window.location.search||'');
+  const qtok = (qs.get('token')||'').trim();
+  if(qtok){ el('token').value = qtok; saveToken(qtok); }
+  else { const st=loadToken(); if(st) el('token').value = st; }
+
+  fetchRisk();
+</script>
+</body>
+</html>"""
+    return Response(html, mimetype="text/html")
+
+
+
 @app.route("/dashboard", methods=["GET"])
 def dashboard():
     # ✅ Mobile-friendly dashboard (HTML)
@@ -1754,6 +1927,7 @@ def dashboard():
             <button class="primary" id="load">Load</button>
             <button id="save">Save Token</button>
             <button class="danger" id="clear">Clear Token</button>
+            <button class="primary" id="openRisk">Risk Table</button>
           </div>
           <div style="flex:1"></div>
           <div class="sub" id="status">Idle.</div>
@@ -2264,6 +2438,12 @@ def dashboard():
     el('load').addEventListener('click', () => { fetchPnL(); });
     el('save').addEventListener('click', () => { saveToken((tokenEl.value||'').trim()); setStatus('Token saved.', true); });
     el('clear').addEventListener('click', () => { tokenEl.value=''; clearToken(); setStatus('Token cleared.', true); });
+    el('openRisk').addEventListener('click', () => {
+      const tok = ((tokenEl.value||'').trim()) || (loadToken()||'');
+      const url = new URL(window.location.origin + '/risk');
+      if (tok) url.searchParams.set('token', tok);
+      window.open(url.toString(), '_blank');
+    });
     refreshEl.addEventListener('change', setAutoRefresh);
 
     setAutoRefresh();
