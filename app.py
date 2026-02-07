@@ -1,6 +1,5 @@
 # app.py
 import os
-import json
 import time
 import threading
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
@@ -1173,12 +1172,27 @@ def _maybe_raise_lock(bot_id: str, symbol: str, direction: str, profit_pct: Deci
         cur = None
 
     base_sl_pct: Decimal = Decimal(str(cfg.get("base_sl_pct", "0")))
-    if cur is None:
+
+    # IMPORTANT:
+    # get_lock_level_pct() historically returned 0 when no row existed.
+    # For a fresh position we MUST start at -base_sl_pct, otherwise SHORTs can instantly stop at entry (lock=0).
+    levels_prefetch: List[Tuple[Decimal, Decimal]] = cfg.get("levels") or []
+    first_trigger: Decimal = Decimal("999999")
+    if mode == "cycle23":
+        first_trigger = Decimal(str(cfg.get("stage1_profit", "0")))  # typically 0.8
+    else:
+        if levels_prefetch:
+            first_trigger = Decimal(str(levels_prefetch[0][0]))
+
+    init_needed = (cur is None) or (base_sl_pct > 0 and cur == 0 and profit_pct < first_trigger)
+    if init_needed:
         cur = -base_sl_pct
         try:
             set_lock_level_pct(bot_id, symbol, direction, cur)
         except Exception:
             return cur
+
+    desired: Optional[Decimal] = None
 
     desired: Optional[Decimal] = None
 
@@ -1218,7 +1232,7 @@ def _maybe_raise_lock(bot_id: str, symbol: str, direction: str, profit_pct: Deci
 
     else:
         # Default ladder mode
-        levels: List[Tuple[Decimal, Decimal]] = cfg.get("levels") or []
+        levels: List[Tuple[Decimal, Decimal]] = levels_prefetch or []
         tail_gap = _ladder_trailing_gap_pct(levels)
         last_profit = levels[-1][0] if levels else None
 
@@ -1644,6 +1658,92 @@ def api_pnl_detail():
     return jsonify({"ts": int(time.time()), **out}), 200
 
 
+
+
+@app.route("/api/risk_summary", methods=["GET"])
+def api_risk_summary():
+    """Compact, human-readable risk overview grouped by bot ranges (5 bots per group).
+
+    This is what you asked for: 'bot1-5 long SL?, ladder?' etc.
+    """
+    if not _require_token():
+        return jsonify({"error": "forbidden"}), 403
+
+    _ensure_monitor_thread()
+
+    # Groups follow your deployment convention (every 5 bots share the same config).
+    groups = [
+        ("BOT_1-5",   "LONG",  "BOT_1"),
+        ("BOT_11-15", "SHORT", "BOT_11"),
+        ("BOT_6-10",  "LONG",  "BOT_6"),
+        ("BOT_16-20", "SHORT", "BOT_16"),
+        ("BOT_21-25", "LONG",  "BOT_21"),
+        ("BOT_31-35", "SHORT", "BOT_31"),
+        ("BOT_26-30", "LONG",  "BOT_26"),
+        ("BOT_36-40", "SHORT", "BOT_36"),
+    ]
+
+    def fmt_rules(cfg: dict) -> Tuple[str, str, str, str]:
+        # returns (initial_sl_pct, mode, rules, infinite)
+        if not cfg:
+            return ("", "", "disabled", "")
+        mode = str(cfg.get("mode", "ladder")).lower().strip()
+
+        base = Decimal(str(cfg.get("base_sl_pct", "0")))
+        initial_sl = f"-{base:.2f}%" if base else "0.00%"
+
+        if mode == "cycle23":
+            # Stage1 + repeating stage2/stage3 description
+            st1_p = cfg.get("stage1_profit", Decimal("0.8"))
+            st1_l = cfg.get("stage1_lock", Decimal("0.0"))
+            step = cfg.get("cycle_step", Decimal("4.0"))
+            s2 = cfg.get("cycle_stage2_start", Decimal("2.0"))
+            s3 = cfg.get("cycle_stage3_start", Decimal("4.0"))
+            ratio = cfg.get("stage2_lock_ratio", Decimal("0.60"))
+            gap = cfg.get("stage3_trail_gap", Decimal("0.5"))
+            rules = f"Stage1: profit≥{st1_p}% → lock={st1_l}% ; then repeat forever: Stage2 profit≥({s2}+{step}k)% → lock={ratio}×profit ; Stage3 profit≥({s3}+{step}k)% → lock=profit−{gap}%"
+            return (initial_sl, "cycle23", rules, "yes (repeat forever)")
+
+        # ladder mode
+        levels = cfg.get("levels") or []
+        if not levels:
+            return (initial_sl, "ladder", "No levels (fixed SL only)", "no")
+
+        # Show first few ladder steps
+        parts = []
+        for i, (p, l) in enumerate(levels[:6], start=1):
+            parts.append(f"{p}%→{l}%")
+        if len(levels) > 6:
+            parts.append("...")
+        rules = " , ".join(parts)
+
+        tail_gap = _ladder_trailing_gap_pct(levels)
+        infinite = f"yes (trail by {tail_gap:.2f}%)" if tail_gap is not None else "no"
+        return (initial_sl, "ladder", rules, infinite)
+
+    rows = []
+    for group_name, direction, sample_bot in groups:
+        cfg = _get_ladder_cfg(sample_bot, direction)
+        initial_sl, mode, rules, infinite = fmt_rules(cfg or {})
+        # Keep as numeric pct for client formatting where possible
+        init_num = None
+        try:
+            if initial_sl.startswith("-") and initial_sl.endswith("%"):
+                init_num = float(initial_sl[1:-1]) * -1.0
+        except Exception:
+            init_num = None
+        rows.append({
+            "group": group_name,
+            "direction": direction,
+            "sample_bot": sample_bot,
+            "initial_sl_pct": init_num,
+            "mode": mode,
+            "rules": rules,
+            "infinite": infinite,
+        })
+
+    return jsonify({"ts": int(time.time()), "rows": rows}), 200
+
 @app.route("/api/risk_config", methods=["GET"])
 def api_risk_config():
     if not _require_token():
@@ -1666,85 +1766,6 @@ def api_risk_config():
 
 
 
-
-
-
-@app.route("/api/risk_overview", methods=["GET"])
-def api_risk_overview():
-    """Human-friendly risk overview grouped by BOT ranges (1-5, 6-10, ...)."""
-    if not _require_token():
-        return jsonify({"error": "forbidden"}), 403
-
-    rows = []
-
-    def _cfg_key(cfg: Optional[dict]) -> str:
-        if not cfg:
-            return "none"
-        # stable json key
-        try:
-            return json.dumps(cfg, sort_keys=True, ensure_ascii=True)
-        except Exception:
-            return str(cfg)
-
-    def _summ(cfg: Optional[dict]) -> dict:
-        if not cfg:
-            return {"type": "none", "initial_sl": "—", "rule": "—"}
-        mode = (cfg.get("mode") or "ladder")
-        base = cfg.get("base_sl_pct")
-        initial_sl = f"-{base:.2f}%" if isinstance(base, (int, float)) else (f"-{base}%" if base is not None else "—")
-        if mode == "fixed":
-            return {"type": "fixed", "initial_sl": initial_sl, "rule": "Fixed SL only"}
-        if mode == "cycle23":
-            return {"type": "cycle", "initial_sl": initial_sl, "rule": "Cycle23: 0.8→BE, 2.0→+1.2, 4.0→trail(0.5%) (loop)"}
-        # ladder
-        lv = cfg.get("levels") or []
-        parts = []
-        for p in lv:
-            try:
-                parts.append(f"{float(p[0]):.2f}→{float(p[1]):.2f}")
-            except Exception:
-                try:
-                    parts.append(f"{p[0]}→{p[1]}")
-                except Exception:
-                    pass
-        rule = " / ".join(parts) if parts else "Ladder"
-        if lv:
-            try:
-                gap = float(lv[-1][0]) - float(lv[-1][1])
-                if gap > 0:
-                    rule += f" (∞ tail: lock=profit-{gap:.2f}%)"
-            except Exception:
-                pass
-        return {"type": "ladder", "initial_sl": initial_sl, "rule": rule}
-
-    # group bots by ranges of 5
-    for g_start in range(1, 41, 5):
-        g_end = min(g_start + 4, 40)
-        bots = [f"BOT_{i}" for i in range(g_start, g_end + 1)]
-        group_label = f"BOT_{g_start}-{g_end}"
-        for direction in ["LONG", "SHORT"]:
-            cfgs = [_get_ladder_cfg(b, direction) for b in bots]
-            keys = [_cfg_key(c) for c in cfgs]
-            mixed = len(set(keys)) > 1
-            base_cfg = cfgs[0] if cfgs else None
-            s = _summ(base_cfg)
-            if mixed:
-                # if mixed, include per-bot summary in rule
-                per = []
-                for b, c in zip(bots, cfgs):
-                    ss = _summ(c)
-                    per.append(f"{b}:{ss['initial_sl']} {ss['type']} {ss['rule']}")
-                s["rule"] = "MIXED: " + " | ".join(per)
-            rows.append({
-                "group": group_label,
-                "bots": bots,
-                "dir": direction,
-                "type": s["type"],
-                "initial_sl": s["initial_sl"],
-                "rule": s["rule"],
-            })
-
-    return jsonify({"ts": int(time.time()), "rows": rows}), 200
 
 
 @app.route("/risk", methods=["GET"])
@@ -1912,6 +1933,7 @@ def risk_page():
   else { const st=loadToken(); if(st) el('token').value = st; }
 
   fetchRisk();
+      fetchRiskSummary();
 </script>
 </body>
 </html>"""
@@ -1952,16 +1974,6 @@ def dashboard():
     button.primary { background:#1b2a55; }
     button.danger { background:#3a1530; }
     .grid { display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap:12px; }
-
-    .grid3 { display:grid; grid-template-columns: repeat(1, minmax(0, 1fr)); gap:12px; }
-    @media (min-width: 980px) { .grid3 { grid-template-columns: 1.4fr 1fr 1.2fr; } }
-    .tableWrap { overflow:auto; border:1px solid var(--line); border-radius:14px; }
-    .mini th, .mini td { padding:8px 10px; }
-    .tag { display:inline-block; padding:2px 8px; border-radius:999px; border:1px solid var(--line); font-size:12px; }
-    .tag.ladder { border-color: rgba(34,197,94,.35); background: rgba(34,197,94,.12); }
-    .tag.fixed  { border-color: rgba(245,158,11,.35); background: rgba(245,158,11,.12); }
-    .tag.cycle  { border-color: rgba(168,85,247,.35); background: rgba(168,85,247,.12); }
-
     @media (min-width: 860px) { .grid { grid-template-columns: repeat(5, minmax(0, 1fr)); } }
     .k { color:var(--muted); font-size: 12px; }
     .v { font-size: 18px; font-weight: 700; margin-top: 6px; }
@@ -2057,36 +2069,8 @@ def dashboard():
         </div>
       </div>
 
-      <div class="grid3">
-        <div class="card">
-          <div class="row" style="align-items:center; justify-content:space-between">
-            <div style="font-weight:700">Live feed (last 7d)</div>
-            <div class="sub">Shows ENTRY / STOP_UPDATE / EXIT. Newest on top.</div>
-          </div>
-          <div class="tableWrap" style="margin-top:8px;">
-            <table style="min-width:860px;">
-              <thead>
-                <tr>
-                  <th>time (PT)</th>
-                  <th>bot</th>
-                  <th>symbol</th>
-                  <th>dir</th>
-                  <th>event</th>
-                  <th>entry</th>
-                  <th>stop</th>
-                  <th>exit</th>
-                  <th>realized</th>
-                  <th>reason</th>
-                </tr>
-              </thead>
-              <tbody id="live_body">
-                <tr><td colspan="10" class="sub">Loading…</td></tr>
-              </tbody>
-            </table>
-          </div>
-        </div>
-
-        <div class="card">
+      <div class="grid">
+<div class="card" style="grid-column: span 2;">
           <div class="row" style="align-items:center; justify-content:space-between">
             <div style="font-weight:700">PnL detail</div>
             <div class="row" style="gap:10px; align-items:center">
@@ -2136,32 +2120,62 @@ def dashboard():
             </div>
           </details>
         </div>
+      
 
-        <div class="card">
+        <div class="card" style="grid-column: span 3;">
           <div class="row" style="align-items:center; justify-content:space-between">
-            <div style="font-weight:700">Stop-loss overview (by bot group)</div>
-            <div class="sub">Fixed SL + ladder/trailing rules. Not dependent on PnL DB.</div>
+            <div style="font-weight:700">Stop-loss / Ladder overview</div>
+            <div class="sub">Grouped view (you said every 5 bots share the same config). Shows initial SL and ladder/trailing rules.</div>
           </div>
-          <div style="height:10px"></div>
-          <div class="tableWrap">
-            <table class="mini" style="min-width:720px;">
+          <div class="tableWrap" style="margin-top:10px;">
+            <table style="min-width:900px;">
               <thead>
                 <tr>
                   <th>group</th>
-                  <th>dir</th>
-                  <th>type</th>
+                  <th>direction</th>
                   <th>initial SL</th>
-                  <th>ladder / rule</th>
+                  <th>mode</th>
+                  <th>rules</th>
+                  <th>infinite tail</th>
                 </tr>
               </thead>
-              <tbody id="risk_body">
-                <tr><td colspan="5" class="sub">Loading…</td></tr>
+              <tbody id="risk_summary_body">
+                <tr><td colspan="6" class="sub">Loading…</td></tr>
               </tbody>
             </table>
           </div>
-          <div class="sub" style="margin-top:8px" id="risk_hint"></div>
+          <div class="sub" style="margin-top:8px">Tip: click “Risk Table” (top right) for the full BOT_1..BOT_40 matrix.</div>
         </div>
 
+<div class="card" style="grid-column: 1 / -1;">
+          <div class="row" style="align-items:center; justify-content:space-between">
+            <div style="font-weight:700">Live feed (last 7d)</div>
+            <div class="sub">Shows ENTRY / STOP_UPDATE / EXIT. Newest on top.</div>
+          </div>
+          <div class="tableWrap" style="margin-top:8px;">
+            <table style="min-width:860px;">
+              <thead>
+                <tr>
+                  <th>time (PT)</th>
+                  <th>bot</th>
+                  <th>symbol</th>
+                  <th>dir</th>
+                  <th>event</th>
+                  <th>entry</th>
+                  <th>stop</th>
+                  <th>exit</th>
+                  <th>realized</th>
+                  <th>reason</th>
+                </tr>
+              </thead>
+              <tbody id="live_body">
+                <tr><td colspan="10" class="sub">Loading…</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        
       </div>
 
       <div class="card">
@@ -2260,14 +2274,15 @@ def dashboard():
         const hint = (res.status === 403)
           ? '403 Forbidden. If you set DASHBOARD_TOKEN, paste it above (or open /dashboard?token=...).'
           : `HTTP ${res.status}`;
-        setErr(hint + (data ? ('\\n' + JSON.stringify(data, null, 2)) : ''));
+        setErr(hint + (data ? ('
+' + JSON.stringify(data, null, 2)) : ''));
         return;
+      }
+
       // update extra panels
       fetchLive();
       fetchDetail();
       fetchRisk();
-
-      }
 
       const bots = (data && data.bots) ? data.bots : [];
 
@@ -2543,7 +2558,51 @@ def dashboard():
       }
     }
 
-    const windowEl = el('window');
+    
+    async function fetchRiskSummary() {
+      const token = (tokenEl.value || '').trim();
+      const url = new URL('/api/risk_summary', location.origin);
+      if (token) url.searchParams.set('token', token);
+
+      const tbody = el('risk_summary_body');
+      if (!tbody) return;
+
+      const pct = (x) => {
+        if (x === null || x === undefined || x === '') return '';
+        const n = Number(x);
+        if (Number.isNaN(n)) return String(x);
+        return n.toFixed(2) + '%';
+      };
+
+      try {
+        const res = await fetch(url.toString(), { method: 'GET' });
+        const data = await res.json().catch(() => null);
+        if (!res.ok) {
+          const msg = data ? JSON.stringify(data) : ('HTTP ' + res.status);
+          tbody.innerHTML = `<tr><td colspan="6" class="sub">Risk summary error: ${msg}</td></tr>`;
+          return;
+        }
+        const rows = (data && data.rows) ? data.rows : [];
+        if (!rows.length) {
+          tbody.innerHTML = `<tr><td colspan="6" class="sub">No risk config rows returned.</td></tr>`;
+          return;
+        }
+        tbody.innerHTML = rows.map(r => {
+          return `<tr>
+            <td><b>${r.group}</b></td>
+            <td>${r.direction}</td>
+            <td>${pct(r.initial_sl_pct)}</td>
+            <td>${r.mode || ''}</td>
+            <td style="white-space:normal">${r.rules || ''}</td>
+            <td>${r.infinite || ''}</td>
+          </tr>`;
+        }).join('');
+      } catch (e) {
+        tbody.innerHTML = `<tr><td colspan="6" class="sub">Risk summary error: ${String(e)}</td></tr>`;
+      }
+    }
+
+const windowEl = el('window');
     if (windowEl) windowEl.addEventListener('change', () => { fetchDetail(); });
 
       if (timer) { clearInterval(timer); timer = null; }
@@ -2562,56 +2621,9 @@ def dashboard():
     });
     refreshEl.addEventListener('change', setAutoRefresh);
 
-
-    async function fetchRiskOverview(){
-      const tok = ((tokenEl.value||'').trim()) || (loadToken()||'');
-      const url = new URL(window.location.origin + '/api/risk_overview');
-      if (tok) url.searchParams.set('token', tok);
-      let res;
-      try{ res = await fetch(url.toString(), {method:'GET'}); }catch(e){
-        const body = document.getElementById('risk_body');
-        if(body) body.innerHTML = `<tr><td colspan="5" class="sub">Network error: ${String(e)}</td></tr>`;
-        const hint = document.getElementById('risk_hint');
-        if(hint) hint.textContent = '';
-        return;
-      }
-      let data=null;
-      try{ data = await res.json(); }catch(e){}
-      const body = document.getElementById('risk_body');
-      const hint = document.getElementById('risk_hint');
-      if(!body) return;
-      if(!res.ok){
-        const msg = (res.status===403) ? '403 Forbidden (Token required)' : (`HTTP ${res.status}`);
-        body.innerHTML = `<tr><td colspan="5" class="sub">${msg}</td></tr>`;
-        if(hint) hint.textContent = 'Tip: paste DASHBOARD_TOKEN then click Load.';
-        return;
-      }
-      const rows = (data && data.rows) ? data.rows : [];
-      const tag = (t)=>{
-        if(t==='ladder') return '<span class="tag ladder">LADDER</span>';
-        if(t==='fixed')  return '<span class="tag fixed">FIXED</span>';
-        if(t==='cycle')  return '<span class="tag cycle">CYCLE</span>';
-        return '<span class="tag">NONE</span>';
-      };
-      body.innerHTML = rows.map(r=>{
-        const dir = r.dir==='LONG' ? 'LONG' : 'SHORT';
-        const grp = r.group;
-        const rule = r.rule || '—';
-        return `<tr>
-          <td class="mono">${grp}</td>
-          <td>${dir}</td>
-          <td>${tag(r.type)}</td>
-          <td class="mono">${r.initial_sl}</td>
-          <td class="mono">${rule}</td>
-        </tr>`;
-      }).join('') || `<tr><td colspan="5" class="sub">No data.</td></tr>`;
-      if(hint) hint.textContent = 'Grouped by 5 bots. Each row shows initial SL and ladder / trailing rule.';
-    }
-
     setAutoRefresh();
     // auto-load once on open
     fetchPnL();
-    fetchRiskOverview();
   </script>
 </body>
 </html>"""
