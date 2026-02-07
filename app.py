@@ -2855,10 +2855,24 @@ def tv_webhook():
             cfg = _get_ladder_cfg(bot_id, direction)
             lock_pct = None
             stop_price = None
+
+            # ✅ CRITICAL:
+            # Reset per-position lock% at entry. Otherwise an old lock (often 0.0) can remain in DB
+            # and cause an immediate stop-out right after entry (especially for SHORT where lock=0 => stop=entry).
             if cfg and cfg.get("base_sl_pct") is not None:
                 base_sl = Decimal(str(cfg.get("base_sl_pct")))
                 lock_pct = -base_sl
                 stop_price = _compute_stop_price(direction, entry_price_dec, lock_pct)
+                try:
+                    set_lock_level_pct(bot_id, symbol, direction, lock_pct)
+                except Exception:
+                    pass
+            else:
+                # If this bot has no ladder config, clear any stale lock record.
+                try:
+                    clear_lock_level_pct(bot_id, symbol, direction)
+                except Exception:
+                    pass
 
             record_trade_event(
                 bot_id=bot_id,
