@@ -1,5 +1,6 @@
 # app.py
 import os
+import json
 import time
 import threading
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
@@ -1667,6 +1668,85 @@ def api_risk_config():
 
 
 
+
+@app.route("/api/risk_overview", methods=["GET"])
+def api_risk_overview():
+    """Human-friendly risk overview grouped by BOT ranges (1-5, 6-10, ...)."""
+    if not _require_token():
+        return jsonify({"error": "forbidden"}), 403
+
+    rows = []
+
+    def _cfg_key(cfg: Optional[dict]) -> str:
+        if not cfg:
+            return "none"
+        # stable json key
+        try:
+            return json.dumps(cfg, sort_keys=True, ensure_ascii=True)
+        except Exception:
+            return str(cfg)
+
+    def _summ(cfg: Optional[dict]) -> dict:
+        if not cfg:
+            return {"type": "none", "initial_sl": "—", "rule": "—"}
+        mode = (cfg.get("mode") or "ladder")
+        base = cfg.get("base_sl_pct")
+        initial_sl = f"-{base:.2f}%" if isinstance(base, (int, float)) else (f"-{base}%" if base is not None else "—")
+        if mode == "fixed":
+            return {"type": "fixed", "initial_sl": initial_sl, "rule": "Fixed SL only"}
+        if mode == "cycle23":
+            return {"type": "cycle", "initial_sl": initial_sl, "rule": "Cycle23: 0.8→BE, 2.0→+1.2, 4.0→trail(0.5%) (loop)"}
+        # ladder
+        lv = cfg.get("levels") or []
+        parts = []
+        for p in lv:
+            try:
+                parts.append(f"{float(p[0]):.2f}→{float(p[1]):.2f}")
+            except Exception:
+                try:
+                    parts.append(f"{p[0]}→{p[1]}")
+                except Exception:
+                    pass
+        rule = " / ".join(parts) if parts else "Ladder"
+        if lv:
+            try:
+                gap = float(lv[-1][0]) - float(lv[-1][1])
+                if gap > 0:
+                    rule += f" (∞ tail: lock=profit-{gap:.2f}%)"
+            except Exception:
+                pass
+        return {"type": "ladder", "initial_sl": initial_sl, "rule": rule}
+
+    # group bots by ranges of 5
+    for g_start in range(1, 41, 5):
+        g_end = min(g_start + 4, 40)
+        bots = [f"BOT_{i}" for i in range(g_start, g_end + 1)]
+        group_label = f"BOT_{g_start}-{g_end}"
+        for direction in ["LONG", "SHORT"]:
+            cfgs = [_get_ladder_cfg(b, direction) for b in bots]
+            keys = [_cfg_key(c) for c in cfgs]
+            mixed = len(set(keys)) > 1
+            base_cfg = cfgs[0] if cfgs else None
+            s = _summ(base_cfg)
+            if mixed:
+                # if mixed, include per-bot summary in rule
+                per = []
+                for b, c in zip(bots, cfgs):
+                    ss = _summ(c)
+                    per.append(f"{b}:{ss['initial_sl']} {ss['type']} {ss['rule']}")
+                s["rule"] = "MIXED: " + " | ".join(per)
+            rows.append({
+                "group": group_label,
+                "bots": bots,
+                "dir": direction,
+                "type": s["type"],
+                "initial_sl": s["initial_sl"],
+                "rule": s["rule"],
+            })
+
+    return jsonify({"ts": int(time.time()), "rows": rows}), 200
+
+
 @app.route("/risk", methods=["GET"])
 def risk_page():
     # Full-page Risk Overview (table) for quick inspection.
@@ -1872,6 +1952,16 @@ def dashboard():
     button.primary { background:#1b2a55; }
     button.danger { background:#3a1530; }
     .grid { display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap:12px; }
+
+    .grid3 { display:grid; grid-template-columns: repeat(1, minmax(0, 1fr)); gap:12px; }
+    @media (min-width: 980px) { .grid3 { grid-template-columns: 1.4fr 1fr 1.2fr; } }
+    .tableWrap { overflow:auto; border:1px solid var(--line); border-radius:14px; }
+    .mini th, .mini td { padding:8px 10px; }
+    .tag { display:inline-block; padding:2px 8px; border-radius:999px; border:1px solid var(--line); font-size:12px; }
+    .tag.ladder { border-color: rgba(34,197,94,.35); background: rgba(34,197,94,.12); }
+    .tag.fixed  { border-color: rgba(245,158,11,.35); background: rgba(245,158,11,.12); }
+    .tag.cycle  { border-color: rgba(168,85,247,.35); background: rgba(168,85,247,.12); }
+
     @media (min-width: 860px) { .grid { grid-template-columns: repeat(5, minmax(0, 1fr)); } }
     .k { color:var(--muted); font-size: 12px; }
     .v { font-size: 18px; font-weight: 700; margin-top: 6px; }
@@ -1967,7 +2057,7 @@ def dashboard():
         </div>
       </div>
 
-      <div class="grid">
+      <div class="grid3">
         <div class="card">
           <div class="row" style="align-items:center; justify-content:space-between">
             <div style="font-weight:700">Live feed (last 7d)</div>
@@ -2046,6 +2136,32 @@ def dashboard():
             </div>
           </details>
         </div>
+
+        <div class="card">
+          <div class="row" style="align-items:center; justify-content:space-between">
+            <div style="font-weight:700">Stop-loss overview (by bot group)</div>
+            <div class="sub">Fixed SL + ladder/trailing rules. Not dependent on PnL DB.</div>
+          </div>
+          <div style="height:10px"></div>
+          <div class="tableWrap">
+            <table class="mini" style="min-width:720px;">
+              <thead>
+                <tr>
+                  <th>group</th>
+                  <th>dir</th>
+                  <th>type</th>
+                  <th>initial SL</th>
+                  <th>ladder / rule</th>
+                </tr>
+              </thead>
+              <tbody id="risk_body">
+                <tr><td colspan="5" class="sub">Loading…</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="sub" style="margin-top:8px" id="risk_hint"></div>
+        </div>
+
       </div>
 
       <div class="card">
@@ -2446,9 +2562,56 @@ def dashboard():
     });
     refreshEl.addEventListener('change', setAutoRefresh);
 
+
+    async function fetchRiskOverview(){
+      const tok = ((tokenEl.value||'').trim()) || (loadToken()||'');
+      const url = new URL(window.location.origin + '/api/risk_overview');
+      if (tok) url.searchParams.set('token', tok);
+      let res;
+      try{ res = await fetch(url.toString(), {method:'GET'}); }catch(e){
+        const body = document.getElementById('risk_body');
+        if(body) body.innerHTML = `<tr><td colspan="5" class="sub">Network error: ${String(e)}</td></tr>`;
+        const hint = document.getElementById('risk_hint');
+        if(hint) hint.textContent = '';
+        return;
+      }
+      let data=null;
+      try{ data = await res.json(); }catch(e){}
+      const body = document.getElementById('risk_body');
+      const hint = document.getElementById('risk_hint');
+      if(!body) return;
+      if(!res.ok){
+        const msg = (res.status===403) ? '403 Forbidden (Token required)' : (`HTTP ${res.status}`);
+        body.innerHTML = `<tr><td colspan="5" class="sub">${msg}</td></tr>`;
+        if(hint) hint.textContent = 'Tip: paste DASHBOARD_TOKEN then click Load.';
+        return;
+      }
+      const rows = (data && data.rows) ? data.rows : [];
+      const tag = (t)=>{
+        if(t==='ladder') return '<span class="tag ladder">LADDER</span>';
+        if(t==='fixed')  return '<span class="tag fixed">FIXED</span>';
+        if(t==='cycle')  return '<span class="tag cycle">CYCLE</span>';
+        return '<span class="tag">NONE</span>';
+      };
+      body.innerHTML = rows.map(r=>{
+        const dir = r.dir==='LONG' ? 'LONG' : 'SHORT';
+        const grp = r.group;
+        const rule = r.rule || '—';
+        return `<tr>
+          <td class="mono">${grp}</td>
+          <td>${dir}</td>
+          <td>${tag(r.type)}</td>
+          <td class="mono">${r.initial_sl}</td>
+          <td class="mono">${rule}</td>
+        </tr>`;
+      }).join('') || `<tr><td colspan="5" class="sub">No data.</td></tr>`;
+      if(hint) hint.textContent = 'Grouped by 5 bots. Each row shows initial SL and ladder / trailing rule.';
+    }
+
     setAutoRefresh();
     // auto-load once on open
     fetchPnL();
+    fetchRiskOverview();
   </script>
 </body>
 </html>"""
@@ -2855,24 +3018,10 @@ def tv_webhook():
             cfg = _get_ladder_cfg(bot_id, direction)
             lock_pct = None
             stop_price = None
-
-            # ✅ CRITICAL:
-            # Reset per-position lock% at entry. Otherwise an old lock (often 0.0) can remain in DB
-            # and cause an immediate stop-out right after entry (especially for SHORT where lock=0 => stop=entry).
             if cfg and cfg.get("base_sl_pct") is not None:
                 base_sl = Decimal(str(cfg.get("base_sl_pct")))
                 lock_pct = -base_sl
                 stop_price = _compute_stop_price(direction, entry_price_dec, lock_pct)
-                try:
-                    set_lock_level_pct(bot_id, symbol, direction, lock_pct)
-                except Exception:
-                    pass
-            else:
-                # If this bot has no ladder config, clear any stale lock record.
-                try:
-                    clear_lock_level_pct(bot_id, symbol, direction)
-                except Exception:
-                    pass
 
             record_trade_event(
                 bot_id=bot_id,
