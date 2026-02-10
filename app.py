@@ -265,11 +265,17 @@ _LADDER_CFG_A = {
 
 
 _LADDER_CFG_B_FIXED = {
-    "name": "B_FIXED_1PCT",  # ✅ Scheme B removed: keep ONLY a fixed -1.0% stop (no ladder)
-    # BOT_6-10 (LONG) & BOT_16-20 (SHORT): Fixed SL = -1.0% (bot-side)
-    "base_sl_pct": Decimal("1.0"),
-    # No ladder levels: lock% will stay at -1.0% forever (pure hard stop).
-    "levels": _ladder_levels(),
+    "name": "B",
+    # ✅ BOT_6-10 (LONG) & BOT_16-20 (SHORT):
+    #    Initial SL = -0.85%
+    #    Profit >= 1.2% -> lock 0.1%
+    #    Profit >= 2.3% -> lock 1.2%
+    #    Infinite tail: gap = 2.3 - 1.2 = 1.1  => lock = profit - 1.1 (after profit >= 2.3)
+    "base_sl_pct": Decimal("0.85"),
+    "levels": _ladder_levels(
+        ("1.2", "0.1"),
+        ("2.3", "1.2"),
+    ),
     "long_bots": {f"BOT_{i}" for i in range(6, 11)},
     "short_bots": {f"BOT_{i}" for i in range(16, 21)},
 }
