@@ -233,8 +233,8 @@ SHORT_PNL_ONLY_BOTS = _parse_bot_list(
 #   - LONG:  BOT_21~BOT_25
 #   - SHORT: BOT_31~BOT_35
 #
-# 方案 D（阶梯 + 无限）：Initial SL -0.85%
-#   2.0→0.4, 2.4→0.8，然后按最后 gap=1.6 无限上调（lock=profit-1.6）
+# 方案 D（单次抬止损，无限关闭）：Initial SL -0.85%
+#   Profit>=1.9% -> lock=0.3%（只抬一次，不再无限跟随）
 #   - LONG:  BOT_26~BOT_30
 #   - SHORT: BOT_36~BOT_40
 # ----------------------------
@@ -310,14 +310,12 @@ _LADDER_CFG_C = {
 _LADDER_CFG_D = {
     "name": "D",
     # ✅ BOT_26-30 (LONG) & BOT_36-40 (SHORT): Initial SL = -0.85%
+    # ✅ Updated (no infinite tail): one-time lift
+    #   Profit >= 1.9% -> lock 0.3%  (then hold; no further trailing)
     "base_sl_pct": Decimal("0.85"),
-    # Ladder:
-    #   Profit >= 2.0% -> lock 0.4%
-    #   Profit >= 2.4% -> lock 0.8%
-    # Infinite tail uses last gap: 2.4 - 0.8 = 1.6  => lock = profit - 1.6 (for profit >= 2.4)
+    "infinite_tail": False,
     "levels": _ladder_levels(
-        ("2.0", "0.4"),
-        ("2.4", "0.8"),
+        ("1.9", "0.3"),
     ),
     "long_bots": {f"BOT_{i}" for i in range(26, 31)},
     "short_bots": {f"BOT_{i}" for i in range(36, 41)},
@@ -1239,7 +1237,7 @@ def _maybe_raise_lock(bot_id: str, symbol: str, direction: str, profit_pct: Deci
     else:
         # Default ladder mode
         levels: List[Tuple[Decimal, Decimal]] = levels_prefetch or []
-        tail_gap = _ladder_trailing_gap_pct(levels)
+        tail_gap = _ladder_trailing_gap_pct(levels) if bool(cfg.get("infinite_tail", True)) else None
         last_profit = levels[-1][0] if levels else None
 
         desired = _ladder_desired_lock_pct(levels, profit_pct)
@@ -1269,7 +1267,7 @@ def _maybe_raise_lock(bot_id: str, symbol: str, direction: str, profit_pct: Deci
         desired = _ladder_desired_lock_pct(levels, profit_pct)
 
         # Infinite tail: once profit is beyond the last ladder threshold, keep trailing by the last gap.
-        tail_gap = _ladder_trailing_gap_pct(levels)
+        tail_gap = _ladder_trailing_gap_pct(levels) if bool(cfg.get("infinite_tail", True)) else None
         last_profit = levels[-1][0] if levels else None
         if tail_gap is not None and last_profit is not None and profit_pct >= last_profit:
             tail_lock = profit_pct - tail_gap
@@ -1723,7 +1721,7 @@ def api_risk_summary():
             parts.append("...")
         rules = " , ".join(parts)
 
-        tail_gap = _ladder_trailing_gap_pct(levels)
+        tail_gap = _ladder_trailing_gap_pct(levels) if bool(cfg.get("infinite_tail", True)) else None
         infinite = f"yes (trail by {tail_gap:.2f}%)" if tail_gap is not None else "no"
         return (initial_sl, "ladder", rules, infinite)
 
