@@ -181,8 +181,8 @@ def _to_decimal(x: Any, default: Decimal = Decimal("0")) -> Decimal:
 # - BOT_31~BOT_35
 # ----------------------------
 
-_ALLOWED_LONG_TPSL = {f"BOT_{i}" for i in range(1, 11)} | {f"BOT_{i}" for i in range(21, 26)}
-_ALLOWED_SHORT_TPSL = {f"BOT_{i}" for i in range(11, 21)} | {f"BOT_{i}" for i in range(31, 36)}
+_ALLOWED_LONG_TPSL = {f"BOT_{i}" for i in range(1, 6)} | {f"BOT_{i}" for i in range(11, 16)} | {f"BOT_{i}" for i in range(21, 26)}
+_ALLOWED_SHORT_TPSL = {f"BOT_{i}" for i in range(6, 11)} | {f"BOT_{i}" for i in range(16, 21)} | {f"BOT_{i}" for i in range(26, 31)}
 
 # “TPSL bots” here means: bots that are allowed to have bot-side Ladder Stop enabled.
 # You can override via env LONG_TPSL_BOTS / SHORT_TPSL_BOTS, but we always intersect with the allowed sets.
@@ -233,8 +233,8 @@ SHORT_PNL_ONLY_BOTS = _parse_bot_list(
 #   - LONG:  BOT_21~BOT_25
 #   - SHORT: BOT_31~BOT_35
 #
-# 方案 D（单次抬止损，无限关闭）：Initial SL -0.85%
-#   Profit>=1.9% -> lock=0.3%（只抬一次，不再无限跟随）
+# 方案 D（阶梯 + 无限）：Initial SL -0.85%
+#   2.0→0.4, 2.4→0.8，然后按最后 gap=1.6 无限上调（lock=profit-1.6）
 #   - LONG:  BOT_26~BOT_30
 #   - SHORT: BOT_36~BOT_40
 # ----------------------------
@@ -250,79 +250,73 @@ def _ladder_levels(*pairs: Tuple[str, str]) -> List[Tuple[Decimal, Decimal]]:
 
 _LADDER_CFG_A = {
     "name": "A",
-    # ✅ BOT_1-5 (LONG) & BOT_11-15 (SHORT): Initial SL = -1.0% (bot-side)
-    "base_sl_pct": Decimal("1.0"),
+    "mode": "ladder",
+    # ✅ 5分钟（模型A）：Initial SL = -1.5%（bot-side）
+    "base_sl_pct": Decimal("1.5"),
+    # 5m 推荐阶梯（可后续再调；无限尾巴按最后 gap 延伸）
     "levels": _ladder_levels(
-        ("1.0", "0.0"),
-        ("2.0", "1.0"),
-        ("3.0", "2.0"),
-        ("5.0", "3.5"),
+        ("1.8", "0.0"),
+        ("3.5", "1.5"),
+        ("5.5", "3.0"),
     ),
-    # Infinite tail: gap = 5.0 - 3.5 = 1.5  => lock = profit - 1.5 (after profit >= 5.0)
+    # Bots:
+    # - BOT_1~BOT_5: LONG
+    # - BOT_6~BOT_10: SHORT
     "long_bots": {f"BOT_{i}" for i in range(1, 6)},
-    "short_bots": {f"BOT_{i}" for i in range(11, 16)},
-}
-
-
-_LADDER_CFG_B_FIXED = {
-    "name": "B",
-    # ✅ BOT_6-10 (LONG) & BOT_16-20 (SHORT):
-    #    Initial SL = -0.85%
-    #    Profit >= 1.2% -> lock 0.1%
-    #    Profit >= 2.3% -> lock 1.2%
-    #    Infinite tail: gap = 2.3 - 1.2 = 1.1  => lock = profit - 1.1 (after profit >= 2.3)
-    "base_sl_pct": Decimal("0.85"),
-    "levels": _ladder_levels(
-        ("1.2", "0.1"),
-        ("2.3", "1.2"),
-    ),
-    "long_bots": {f"BOT_{i}" for i in range(6, 11)},
-    "short_bots": {f"BOT_{i}" for i in range(16, 21)},
+    "short_bots": {f"BOT_{i}" for i in range(6, 11)},
 }
 
 _LADDER_CFG_C = {
     "name": "C",
-    "mode": "cycle23",  # stage1 once, then stage2+stage3 repeat to infinity (monotonic SL only)
-    # ✅ BOT_21-25 (LONG) & BOT_31-35 (SHORT): Initial SL = -0.8%
-    "base_sl_pct": Decimal("0.8"),
-    # Stage 1 (one-time): Profit >= 0.8% -> lock to 0.0% (breakeven)
-    "stage1_profit": Decimal("0.8"),
-    "stage1_lock": Decimal("0.0"),
-    # Cycle step: every 4.0% profit we repeat stage2 then stage3
-    # Stage 2 trigger: Profit >= (2.0% + 4.0% * k) -> lock = 60% * threshold
-    "cycle_stage2_start": Decimal("2.0"),
-    "cycle_stage3_start": Decimal("4.0"),
-    "cycle_step": Decimal("4.0"),
-    "stage2_lock_ratio": Decimal("0.60"),
-    # Stage 3 trigger: Profit >= (4.0% + 4.0% * k) -> lock = threshold - 0.5%
-    "stage3_trail_gap": Decimal("0.5"),
-    # Dummy levels retained for compatibility (not used in cycle23 mode)
-    "levels": _ladder_levels(
-        ("0.8", "0.0"),
-        ("2.0", "1.2"),
-        ("4.0", "3.5"),
+    "mode": "burst",
+    # ✅ 5分钟（模型C）：Initial SL = -1.5%（bot-side）
+    "base_sl_pct": Decimal("1.5"),
+    # Burst 逻辑：
+    # - profit>=2.0% -> lock=0.0%（保本）
+    # - profit>=4.0% -> 开始 trailing（gap 分段收紧）
+    "be_profit": Decimal("2.0"),
+    "trail_start_profit": Decimal("4.0"),
+    # gap 分段（profit% >= threshold -> gap%），lock = profit - gap（且只会抬高，不会下降）
+    "trail_gaps": _ladder_levels(
+        ("4.0", "0.9"),
+        ("6.0", "0.7"),
+        ("8.0", "0.5"),
     ),
+    # Dummy levels retained for compatibility / dashboard display (burst 模式不使用 levels 来计算)
+    "levels": _ladder_levels(
+        ("2.0", "0.0"),
+        ("4.0", "3.1"),
+        ("8.0", "7.5"),
+    ),
+    # Bots:
+    # - BOT_11~BOT_15: LONG
+    # - BOT_16~BOT_20: SHORT
+    "long_bots": {f"BOT_{i}" for i in range(11, 16)},
+    "short_bots": {f"BOT_{i}" for i in range(16, 21)},
+}
+
+_LADDER_CFG_E = {
+    "name": "E",
+    "mode": "atr",
+    # ✅ 5分钟（模型E）：Initial SL = -1.5%（bot-side）
+    "base_sl_pct": Decimal("1.5"),
+    # ATR% proxy：RMA(|ΔP|/P*100, atr_len)
+    "atr_len": int(os.getenv("E_ATR_LEN", "14")),
+    "atr_mult": Decimal(os.getenv("E_ATR_MULT", "1.50")),
+    "atr_start_profit": Decimal(os.getenv("E_ATR_START_PROFIT", "1.20")),  # profit>=1.2% 开始用 atr trailing
+    "atr_min_gap": Decimal(os.getenv("E_ATR_MIN_GAP", "0.60")),            # gap 下限（不贴太近）
+    # Dummy levels retained for compatibility / dashboard display
+    "levels": _ladder_levels(),
+    # Bots:
+    # - BOT_21~BOT_25: LONG
+    # - BOT_26~BOT_30: SHORT
     "long_bots": {f"BOT_{i}" for i in range(21, 26)},
-    "short_bots": {f"BOT_{i}" for i in range(31, 36)},
+    "short_bots": {f"BOT_{i}" for i in range(26, 31)},
 }
 
+# ✅ 只保留 A / C / E（按你要求：把原本止损系列全部删掉）
+LADDER_CONFIGS = [_LADDER_CFG_A, _LADDER_CFG_C, _LADDER_CFG_E]
 
-_LADDER_CFG_D = {
-    "name": "D",
-    # ✅ BOT_26-30 (LONG) & BOT_36-40 (SHORT): Initial SL = -0.85%
-    # ✅ Updated (no infinite tail): one-time lift
-    #   Profit >= 1.9% -> lock 0.3%  (then hold; no further trailing)
-    "base_sl_pct": Decimal("0.85"),
-    "infinite_tail": False,
-    "levels": _ladder_levels(
-        ("1.9", "0.3"),
-    ),
-    "long_bots": {f"BOT_{i}" for i in range(26, 31)},
-    "short_bots": {f"BOT_{i}" for i in range(36, 41)},
-}
-
-
-LADDER_CONFIGS = [_LADDER_CFG_A, _LADDER_CFG_B_FIXED, _LADDER_CFG_C, _LADDER_CFG_D]
 
 
 def _ladder_trailing_gap_pct(levels: List[Tuple[Decimal, Decimal]]) -> Optional[Decimal]:
@@ -1237,7 +1231,7 @@ def _maybe_raise_lock(bot_id: str, symbol: str, direction: str, profit_pct: Deci
     else:
         # Default ladder mode
         levels: List[Tuple[Decimal, Decimal]] = levels_prefetch or []
-        tail_gap = _ladder_trailing_gap_pct(levels) if bool(cfg.get("infinite_tail", True)) else None
+        tail_gap = _ladder_trailing_gap_pct(levels)
         last_profit = levels[-1][0] if levels else None
 
         desired = _ladder_desired_lock_pct(levels, profit_pct)
@@ -1267,7 +1261,7 @@ def _maybe_raise_lock(bot_id: str, symbol: str, direction: str, profit_pct: Deci
         desired = _ladder_desired_lock_pct(levels, profit_pct)
 
         # Infinite tail: once profit is beyond the last ladder threshold, keep trailing by the last gap.
-        tail_gap = _ladder_trailing_gap_pct(levels) if bool(cfg.get("infinite_tail", True)) else None
+        tail_gap = _ladder_trailing_gap_pct(levels)
         last_profit = levels[-1][0] if levels else None
         if tail_gap is not None and last_profit is not None and profit_pct >= last_profit:
             tail_lock = profit_pct - tail_gap
@@ -1678,50 +1672,53 @@ def api_risk_summary():
     # Groups follow your deployment convention (every 5 bots share the same config).
     groups = [
         ("BOT_1-5",   "LONG",  "BOT_1"),
-        ("BOT_11-15", "SHORT", "BOT_11"),
-        ("BOT_6-10",  "LONG",  "BOT_6"),
+        ("BOT_6-10",  "SHORT", "BOT_6"),
+        ("BOT_11-15", "LONG",  "BOT_11"),
         ("BOT_16-20", "SHORT", "BOT_16"),
         ("BOT_21-25", "LONG",  "BOT_21"),
-        ("BOT_31-35", "SHORT", "BOT_31"),
-        ("BOT_26-30", "LONG",  "BOT_26"),
-        ("BOT_36-40", "SHORT", "BOT_36"),
+        ("BOT_26-30", "SHORT", "BOT_26"),
     ]
 
     def fmt_rules(cfg: dict) -> Tuple[str, str, str, str]:
         # returns (initial_sl_pct, mode, rules, infinite)
         if not cfg:
             return ("", "", "disabled", "")
-        mode = str(cfg.get("mode", "ladder")).lower().strip()
 
+        mode = str(cfg.get("mode", "ladder")).lower().strip()
         base = Decimal(str(cfg.get("base_sl_pct", "0")))
         initial_sl = f"-{base:.2f}%" if base else "0.00%"
 
-        if mode == "cycle23":
-            # Stage1 + repeating stage2/stage3 description
-            st1_p = cfg.get("stage1_profit", Decimal("0.8"))
-            st1_l = cfg.get("stage1_lock", Decimal("0.0"))
-            step = cfg.get("cycle_step", Decimal("4.0"))
-            s2 = cfg.get("cycle_stage2_start", Decimal("2.0"))
-            s3 = cfg.get("cycle_stage3_start", Decimal("4.0"))
-            ratio = cfg.get("stage2_lock_ratio", Decimal("0.60"))
-            gap = cfg.get("stage3_trail_gap", Decimal("0.5"))
-            rules = f"Stage1: profit≥{st1_p}% → lock={st1_l}% ; then repeat forever: Stage2 profit≥({s2}+{step}k)% → lock={ratio}×profit ; Stage3 profit≥({s3}+{step}k)% → lock=profit−{gap}%"
-            return (initial_sl, "cycle23", rules, "yes (repeat forever)")
+        if mode == "burst":
+            be_p = Decimal(str(cfg.get("be_profit", "2.0")))
+            ts = Decimal(str(cfg.get("trail_start_profit", "4.0")))
+            gaps = cfg.get("trail_gaps") or []
+            parts = []
+            for p, g in gaps[:6]:
+                parts.append(f"profit≥{p}% → gap={g}% (lock=profit−gap)")
+            rules = f"BE: profit≥{be_p}% → lock=0.0% ; Trail start: profit≥{ts}% ; " + (" ; ".join(parts) if parts else "gap rules: n/a")
+            return (initial_sl, "burst", rules, "yes (piecewise gap)")
 
-        # ladder mode
+        if mode == "atr":
+            L = cfg.get("atr_len", 14)
+            mult = Decimal(str(cfg.get("atr_mult", "1.5")))
+            startp = Decimal(str(cfg.get("atr_start_profit", "1.2")))
+            ming = Decimal(str(cfg.get("atr_min_gap", "0.6")))
+            rules = f"profit≥{startp}% → gap=max({ming}%, {mult}×ATR%proxy); lock=profit−gap (monotonic)"
+            return (initial_sl, "atr", rules, "yes (dynamic gap)")
+
+        # ladder mode (default)
         levels = cfg.get("levels") or []
         if not levels:
             return (initial_sl, "ladder", "No levels (fixed SL only)", "no")
 
-        # Show first few ladder steps
         parts = []
         for i, (p, l) in enumerate(levels[:6], start=1):
             parts.append(f"{p}%→{l}%")
         if len(levels) > 6:
             parts.append("...")
-        rules = " , ".join(parts)
 
-        tail_gap = _ladder_trailing_gap_pct(levels) if bool(cfg.get("infinite_tail", True)) else None
+        rules = " , ".join(parts)
+        tail_gap = _ladder_trailing_gap_pct(levels)
         infinite = f"yes (trail by {tail_gap:.2f}%)" if tail_gap is not None else "no"
         return (initial_sl, "ladder", rules, infinite)
 
@@ -1869,14 +1866,20 @@ def risk_page():
     if(!cfg) return {sl:'—', rule:'—', kind:'none'};
     const mode = (cfg.mode || 'ladder');
     const base = cfg.base_sl_pct ? `-${cfg.base_sl_pct}%` : '—';
-    if(mode==='fixed'){
-      return {sl: base, rule: 'Fixed SL only', kind:'fixed'};
+
+    if(mode==='burst'){
+      const be = cfg.be_profit ?? '2.0';
+      const ts = cfg.trail_start_profit ?? '4.0';
+      return {sl: base, rule: `burst: BE≥${be}→lock=0.0 ; trail≥${ts} (piecewise gap)`, kind:'cycle'};
     }
-    if(mode==='cycle23'){
-      // show known cycle style (your design)
-      return {sl: base, rule: 'Cycle23: 0.8→BE, 2.0→+1.2, 4.0→trail(0.5%) (loop)', kind:'cycle'};
+    if(mode==='atr'){
+      const sp = cfg.atr_start_profit ?? '1.2';
+      const mult = cfg.atr_mult ?? '1.5';
+      const mg = cfg.atr_min_gap ?? '0.6';
+      return {sl: base, rule: `atr: profit≥${sp} gap=max(${mg}, ${mult}×ATR%proxy)`, kind:'cycle'};
     }
-    // ladder
+
+    // ladder (default)
     const lv = Array.isArray(cfg.levels) ? cfg.levels : [];
     const parts = lv.map(p=> `${p[0]}→${p[1]}`).join(' / ');
     const last = (lv.length>=1) ? lv[lv.length-1] : null;
@@ -1887,6 +1890,7 @@ def risk_page():
     }
     return {sl: base, rule: (parts||'Ladder') + inf, kind:'ladder'};
   }
+
 
   async function fetchRisk(){
     const tok = (el('token').value||'').trim() || loadToken();
