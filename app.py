@@ -2182,29 +2182,30 @@ def dashboard():
 
           <div style="height:12px"></div>
 
-          <details>
-            <summary>Risk config (which bots have SL / ladder)</summary>
-            <div class="tableWrap" style="margin-top:10px;">
-              <table style="min-width:1100px;">
-                <thead>
-                  <tr>
-                    <th>bot</th>
-                    <th>LONG type</th>
-                    <th>LONG initial SL</th>
-                    <th>LONG rules</th>
-                    <th>LONG infinite</th>
-                    <th>SHORT type</th>
-                    <th>SHORT initial SL</th>
-                    <th>SHORT rules</th>
-                    <th>SHORT infinite</th>
-                  </tr>
-                </thead>
-                <tbody id="risk_body">
-                  <tr><td colspan="9" class="sub">Loading…</td></tr>
-                </tbody>
-              </table>
-            </div>
-          </details>
+          <div class="row" style="align-items:center; justify-content:space-between">
+            <div style="font-weight:700">Risk config (BOT_1..BOT_40)</div>
+            <div class="sub">Direct view (no collapse). If token is enabled, enter it at the top.</div>
+          </div>
+          <div class="tableWrap" style="margin-top:10px;">
+            <table style="min-width:1100px;">
+              <thead>
+                <tr>
+                  <th>bot</th>
+                  <th>LONG type</th>
+                  <th>LONG initial SL</th>
+                  <th>LONG rules</th>
+                  <th>LONG infinite</th>
+                  <th>SHORT type</th>
+                  <th>SHORT initial SL</th>
+                  <th>SHORT rules</th>
+                  <th>SHORT infinite</th>
+                </tr>
+              </thead>
+              <tbody id="risk_body">
+                <tr><td colspan="9" class="sub">Loading…</td></tr>
+              </tbody>
+            </table>
+          </div>
         </div>
       
 
