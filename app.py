@@ -1080,6 +1080,40 @@ def _get_signal_id(body: dict, mode: str, bot_id: str, symbol: str) -> str:
 # ----------------------------
 # ✅ Ladder risk loop (bot-side close via reduceOnly market)
 # ----------------------------
+
+# ATR% proxy cache for ATR-trailing mode (E):
+# - Approximate ATR in percent using an RMA of absolute percent price changes from the same reference price used in risk checks.
+# - Stored per symbol.
+_ATR_PCT_CACHE: Dict[str, Tuple[Decimal, Decimal]] = {}  # symbol -> (atr_pct, last_price)
+_ATR_PCT_LOCK = threading.Lock()
+
+
+def _update_atr_pct_proxy(symbol: str, price: Decimal, length: int) -> Optional[Decimal]:
+    """Return updated ATR% proxy for symbol using RMA(|ΔP|/P*100, length)."""
+    if price is None or price <= 0 or length <= 0:
+        return None
+    symbol = str(symbol).upper().strip()
+    with _ATR_PCT_LOCK:
+        prev = _ATR_PCT_CACHE.get(symbol)
+        if not prev:
+            _ATR_PCT_CACHE[symbol] = (Decimal("0"), price)
+            return Decimal("0")
+        atr_pct, last_price = prev
+        if last_price is None or last_price <= 0:
+            _ATR_PCT_CACHE[symbol] = (atr_pct, price)
+            return atr_pct
+        try:
+            chg = (price - last_price).copy_abs()
+            pct = (chg / last_price) * Decimal("100")
+        except Exception:
+            pct = Decimal("0")
+        try:
+            atr_new = atr_pct + (pct - atr_pct) / Decimal(str(length))
+        except Exception:
+            atr_new = atr_pct
+        _ATR_PCT_CACHE[symbol] = (atr_new, price)
+        return atr_new
+
 _RISK_THREAD_STARTED = False
 _RISK_LOCK = threading.Lock()
 
@@ -1140,7 +1174,7 @@ def _cycle23_desired_lock_pct(cfg: dict, profit_pct: Decimal) -> Optional[Decima
     return desired
 
 
-def _maybe_raise_lock(bot_id: str, symbol: str, direction: str, profit_pct: Decimal):
+def _maybe_raise_lock(bot_id: str, symbol: str, direction: str, profit_pct: Decimal, ref_price: Optional[Decimal] = None):
     """Update and return current lock% for (bot,symbol,direction).
 
     Two modes:
@@ -1192,8 +1226,6 @@ def _maybe_raise_lock(bot_id: str, symbol: str, direction: str, profit_pct: Deci
 
     desired: Optional[Decimal] = None
 
-    desired: Optional[Decimal] = None
-
     if mode == "cycle23":
         # Stage 1 (one-time)
         st1_p: Decimal = cfg.get("stage1_profit", Decimal("0"))
@@ -1228,15 +1260,61 @@ def _maybe_raise_lock(bot_id: str, symbol: str, direction: str, profit_pct: Deci
             if desired is None or cand3 > desired:
                 desired = cand3
 
+    elif mode == "burst":
+        # Burst mode (C): BE then piecewise gap trailing (infinite by last gap)
+        be_p: Decimal = Decimal(str(cfg.get("be_profit", "2.0")))
+        ts: Decimal = Decimal(str(cfg.get("trail_start_profit", "4.0")))
+        gaps: List[Tuple[Decimal, Decimal]] = cfg.get("trail_gaps") or []
+
+        if profit_pct >= be_p:
+            desired = Decimal("0.0")
+
+        if profit_pct >= ts:
+            gap_des: Optional[Decimal] = None
+            for p_th, g in gaps:
+                if profit_pct >= p_th:
+                    gap_des = g
+                else:
+                    break
+            if gap_des is None and gaps:
+                gap_des = gaps[0][1]
+            if gap_des is not None:
+                trail_lock = profit_pct - gap_des
+                if desired is None or trail_lock > desired:
+                    desired = trail_lock
+
+    elif mode == "atr":
+        # ATR mode (E): profit≥start -> gap=max(min_gap, mult*ATR%proxy), lock=profit-gap
+        try:
+            atr_len = int(cfg.get("atr_len", 14))
+        except Exception:
+            atr_len = 14
+        mult: Decimal = Decimal(str(cfg.get("atr_mult", "1.5")))
+        startp: Decimal = Decimal(str(cfg.get("atr_start_profit", "1.2")))
+        ming: Decimal = Decimal(str(cfg.get("atr_min_gap", "0.6")))
+
+        atr_pct: Optional[Decimal] = None
+        if ref_price is not None:
+            atr_pct = _update_atr_pct_proxy(symbol, ref_price, atr_len)
+
+        if profit_pct >= startp and atr_pct is not None:
+            try:
+                gap = (mult * atr_pct)
+            except Exception:
+                gap = Decimal("0")
+            if gap < ming:
+                gap = ming
+            trail_lock = profit_pct - gap
+            desired = trail_lock if desired is None or trail_lock > desired else desired
+
     else:
-        # Default ladder mode
+        # Ladder mode (A): discrete steps + infinite tail by last gap
         levels: List[Tuple[Decimal, Decimal]] = levels_prefetch or []
         tail_gap = _ladder_trailing_gap_pct(levels)
         last_profit = levels[-1][0] if levels else None
 
         desired = _ladder_desired_lock_pct(levels, profit_pct)
 
-        # Infinite tail: once profit is beyond the last ladder threshold, keep trailing by the last gap.
         if tail_gap is not None and last_profit is not None and profit_pct >= last_profit:
             tail_lock = profit_pct - tail_gap
             if desired is None or tail_lock > desired:
@@ -1421,7 +1499,7 @@ def _risk_loop():
                     except Exception:
                         old_lock = None
 
-                    lock_pct = _maybe_raise_lock(bot_id, symbol, direction, profit_pct)
+                    lock_pct = _maybe_raise_lock(bot_id, symbol, direction, profit_pct, ref_price)
                     if lock_pct is None:
                         continue
                     stop_price = _compute_stop_price(direction, entry, Decimal(str(lock_pct)))
