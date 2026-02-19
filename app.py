@@ -181,8 +181,8 @@ def _to_decimal(x: Any, default: Decimal = Decimal("0")) -> Decimal:
 # - BOT_31~BOT_35
 # ----------------------------
 
-_ALLOWED_LONG_TPSL = {f"BOT_{i}" for i in range(1, 6)} | {f"BOT_{i}" for i in range(11, 16)} | {f"BOT_{i}" for i in range(21, 26)}
-_ALLOWED_SHORT_TPSL = {f"BOT_{i}" for i in range(6, 11)} | {f"BOT_{i}" for i in range(16, 21)} | {f"BOT_{i}" for i in range(26, 31)}
+_ALLOWED_LONG_TPSL = {f"BOT_{i}" for i in range(1, 6)} | {f"BOT_{i}" for i in range(11, 16)} | {f"BOT_{i}" for i in range(21, 26)} | {f"BOT_{i}" for i in range(31, 36)}
+_ALLOWED_SHORT_TPSL = {f"BOT_{i}" for i in range(6, 11)} | {f"BOT_{i}" for i in range(16, 21)} | {f"BOT_{i}" for i in range(26, 31)} | {f"BOT_{i}" for i in range(36, 41)}
 
 # “TPSL bots” here means: bots that are allowed to have bot-side Ladder Stop enabled.
 # You can override via env LONG_TPSL_BOTS / SHORT_TPSL_BOTS, but we always intersect with the allowed sets.
@@ -314,8 +314,27 @@ _LADDER_CFG_E = {
     "short_bots": {f"BOT_{i}" for i in range(26, 31)},
 }
 
-# ✅ 只保留 A / C / E（按你要求：把原本止损系列全部删掉）
-LADDER_CONFIGS = [_LADDER_CFG_A, _LADDER_CFG_C, _LADDER_CFG_E]
+_LADDER_CFG_F = {
+    "name": "F",
+    "mode": "ladder",
+    # ✅ 5分钟（模型F）：Initial SL = -1.0%（bot-side）
+    "base_sl_pct": Decimal("1.0"),
+    # 阶梯（按你要求无限延伸：超过最后一档后按最后 gap=1.2% 继续上调，lock=profit-1.2）
+    "levels": _ladder_levels(
+        ("1.2", "0.15"),
+        ("2.4", "1.2"),
+        ("3.6", "2.4"),
+        ("4.8", "3.6"),
+    ),
+    # Bots:
+    # - BOT_31~BOT_35: LONG
+    # - BOT_36~BOT_40: SHORT
+    "long_bots": {f"BOT_{i}" for i in range(31, 36)},
+    "short_bots": {f"BOT_{i}" for i in range(36, 41)},
+}
+
+# ✅ 已启用 A / C / E / F（按你要求：原本止损系列已删掉）
+LADDER_CONFIGS = [_LADDER_CFG_A, _LADDER_CFG_C, _LADDER_CFG_E, _LADDER_CFG_F]
 
 
 
@@ -1755,6 +1774,8 @@ def api_risk_summary():
         ("BOT_16-20", "SHORT", "BOT_16"),
         ("BOT_21-25", "LONG",  "BOT_21"),
         ("BOT_26-30", "SHORT", "BOT_26"),
+        ("BOT_31-35", "LONG",  "BOT_31"),
+        ("BOT_36-40", "SHORT", "BOT_36"),
     ]
 
     def fmt_rules(cfg: dict) -> Tuple[str, str, str, str]:
