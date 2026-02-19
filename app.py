@@ -225,17 +225,20 @@ SHORT_PNL_ONLY_BOTS = _parse_bot_list(
 #   - LONG:  BOT_6~BOT_10
 #   - SHORT: BOT_16~BOT_20
 #
-# 方案 C（cycle23 无限循环）：Initial SL -0.8%
-#   Stage1: profit>=0.8% -> lock=0.0%
-#   Then repeat forever (k=0,1,2...):
-#     Stage2: profit>=(2.0+4.0k)% -> lock=0.60*(2.0+4.0k)%
-#     Stage3: profit>=(4.0+4.0k)% -> lock=(4.0+4.0k)-0.5
-#   - LONG:  BOT_21~BOT_25
-#   - SHORT: BOT_31~BOT_35
+# 方案 C（burst trailing）：Initial SL -1.5%
+#   - profit>=2.0% -> lock=0.0 (Breakeven)
+#   - profit>=4.0% -> 开始 trailing：lock=profit-gap（gap 随 profit 分段收紧）
+#   - LONG:  BOT_11~BOT_15
+#   - SHORT: BOT_16~BOT_20
 #
-# 方案 D（阶梯 + 无限）：Initial SL -0.85%
-#   2.0→0.4, 2.4→0.8，然后按最后 gap=1.6 无限上调（lock=profit-1.6）
-#   - LONG:  BOT_26~BOT_30
+# 方案 E（ATR trailing）：Initial SL -1.5%
+#   - profit>=1.2% -> 用 ATR% proxy 做 trailing gap（下限 atr_min_gap）
+#   - LONG:  BOT_21~BOT_25
+#   - SHORT: BOT_26~BOT_30
+#
+# 方案 F（阶梯 + 无限）：Initial SL -1.0%
+#   1.2→0.15, 2.4→1.2, 3.6→2.4, 4.8→3.6，然后按最后 gap=1.2% 无限上调（lock=profit-1.2）
+#   - LONG:  BOT_31~BOT_35
 #   - SHORT: BOT_36~BOT_40
 # ----------------------------
 
