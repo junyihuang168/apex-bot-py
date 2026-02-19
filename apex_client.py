@@ -938,12 +938,24 @@ def _create_order_v3_compat(
             except TypeError as e:
                 last = e
                 msg = str(e)
+
+                # 1) unexpected keyword -> prune and retry
                 m = re.search(r"unexpected keyword argument ['\"]([^'\"]+)['\"]", msg)
                 if m:
                     bad = m.group(1)
                     if bad in p:
                         p.pop(bad, None)
                         continue
+
+                # 2) duplicate positional+keyword (common with SDK wrappers)
+                #    e.g. "got multiple values for argument 'side'"
+                m2 = re.search(r"multiple values for argument ['\"]([^'\"]+)['\"]", msg)
+                if m2:
+                    bad2 = m2.group(1)
+                    if bad2 in p:
+                        p.pop(bad2, None)
+                        continue
+
                 raise
         if last:
             raise last
