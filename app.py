@@ -254,13 +254,13 @@ def _ladder_levels(*pairs: Tuple[str, str]) -> List[Tuple[Decimal, Decimal]]:
 _LADDER_CFG_A = {
     "name": "A",
     "mode": "ladder",
-    # ✅ 5分钟（模型A）：Initial SL = -1.5%（bot-side）
-    "base_sl_pct": Decimal("1.5"),
-    # 5m 推荐阶梯（可后续再调；无限尾巴按最后 gap 延伸）
+    # 初始止损 -1%
+    "base_sl_pct": Decimal("1.0"),
+    # 阶梯：1.6→0.0, 3.2→1.6, 4.8→3.2；之后按最后 gap=1.6% 无限延伸（lock=profit-1.6）
     "levels": _ladder_levels(
-        ("1.8", "0.0"),
-        ("3.5", "1.5"),
-        ("5.5", "3.0"),
+        ("1.6", "0.0"),
+        ("3.2", "1.6"),
+        ("4.8", "3.2"),
     ),
     # Bots:
     # - BOT_1~BOT_5: LONG
@@ -269,27 +269,15 @@ _LADDER_CFG_A = {
     "short_bots": {f"BOT_{i}" for i in range(6, 11)},
 }
 
-_LADDER_CFG_C = {
-    "name": "C",
-    "mode": "burst",
-    # ✅ 5分钟（模型C）：Initial SL = -1.5%（bot-side）
-    "base_sl_pct": Decimal("1.5"),
-    # Burst 逻辑：
-    # - profit>=2.0% -> lock=0.0%（保本）
-    # - profit>=4.0% -> 开始 trailing（gap 分段收紧）
-    "be_profit": Decimal("2.0"),
-    "trail_start_profit": Decimal("4.0"),
-    # gap 分段（profit% >= threshold -> gap%），lock = profit - gap（且只会抬高，不会下降）
-    "trail_gaps": _ladder_levels(
-        ("4.0", "0.9"),
-        ("6.0", "0.7"),
-        ("8.0", "0.5"),
-    ),
-    # Dummy levels retained for compatibility / dashboard display (burst 模式不使用 levels 来计算)
+_LADDER_CFG_B = {
+    "name": "B",
+    "mode": "ladder",
+    # 初始止损 -1%
+    "base_sl_pct": Decimal("1.0"),
+    # 阶梯：2.0→0.0, 4.0→2.0；之后按最后 gap=2.0% 无限延伸（lock=profit-2.0）
     "levels": _ladder_levels(
         ("2.0", "0.0"),
-        ("4.0", "3.1"),
-        ("8.0", "7.5"),
+        ("4.0", "2.0"),
     ),
     # Bots:
     # - BOT_11~BOT_15: LONG
@@ -298,46 +286,10 @@ _LADDER_CFG_C = {
     "short_bots": {f"BOT_{i}" for i in range(16, 21)},
 }
 
-_LADDER_CFG_E = {
-    "name": "E",
-    "mode": "atr",
-    # ✅ 5分钟（模型E）：Initial SL = -1.5%（bot-side）
-    "base_sl_pct": Decimal("1.5"),
-    # ATR% proxy：RMA(|ΔP|/P*100, atr_len)
-    "atr_len": int(os.getenv("E_ATR_LEN", "14")),
-    "atr_mult": Decimal(os.getenv("E_ATR_MULT", "1.50")),
-    "atr_start_profit": Decimal(os.getenv("E_ATR_START_PROFIT", "1.20")),  # profit>=1.2% 开始用 atr trailing
-    "atr_min_gap": Decimal(os.getenv("E_ATR_MIN_GAP", "0.60")),            # gap 下限（不贴太近）
-    # Dummy levels retained for compatibility / dashboard display
-    "levels": _ladder_levels(),
-    # Bots:
-    # - BOT_21~BOT_25: LONG
-    # - BOT_26~BOT_30: SHORT
-    "long_bots": {f"BOT_{i}" for i in range(21, 26)},
-    "short_bots": {f"BOT_{i}" for i in range(26, 31)},
-}
+# ✅ 只启用 A / B（按你最新需求：删掉旧的止损系列，重新干净落地）
+LADDER_CONFIGS = [_LADDER_CFG_A, _LADDER_CFG_B]
 
-_LADDER_CFG_F = {
-    "name": "F",
-    "mode": "ladder",
-    # ✅ 5分钟（模型F）：Initial SL = -1.0%（bot-side）
-    "base_sl_pct": Decimal("1.0"),
-    # 阶梯（按你要求无限延伸：超过最后一档后按最后 gap=1.2% 继续上调，lock=profit-1.2）
-    "levels": _ladder_levels(
-        ("1.2", "0.15"),
-        ("2.4", "1.2"),
-        ("3.6", "2.4"),
-        ("4.8", "3.6"),
-    ),
-    # Bots:
-    # - BOT_31~BOT_35: LONG
-    # - BOT_36~BOT_40: SHORT
-    "long_bots": {f"BOT_{i}" for i in range(31, 36)},
-    "short_bots": {f"BOT_{i}" for i in range(36, 41)},
-}
 
-# ✅ 已启用 A / C / E / F（按你要求：原本止损系列已删掉）
-LADDER_CONFIGS = [_LADDER_CFG_A, _LADDER_CFG_C, _LADDER_CFG_E, _LADDER_CFG_F]
 
 
 
